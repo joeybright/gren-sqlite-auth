@@ -1,0 +1,21 @@
+module Auth.Simple
+
+{-|-}
+
+
+{-|-}
+test : String
+test =
+    Debug.todo ""
+    
+
+{-|-}
+migration : String
+migration =
+    Debug.todo ""
+
+
+{-|-}
+loginWithUsernameAndPassword : String
+loginWithUsernameAndPassword =
+    Debug.todo ""
