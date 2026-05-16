@@ -1,0 +1,20 @@
+{
+    "type": "package",
+    "platform": "node",
+    "name": "joeybright/gren-sqlite-auth",
+    "summary": "Simple authentication primitives for SQLite-backed Gren apps.",
+    "license": "BSD-3-Clause",
+    "version": "1.0.0",
+    "exposed-modules": [
+        "Sqlite.Auth.User",
+        "Sqlite.Auth.Username",
+        "Sqlite.Auth.Password",
+        "Sqlite.Auth.Session"
+    ],
+    "gren-version": "0.6.0 <= v < 0.7.0",
+    "dependencies": {
+        "blaix/gren-base64": "2.0.2 <= v < 3.0.0",
+        "gren-lang/core": "7.6.0 <= v < 8.0.0",
+        "gren-lang/node": "6.2.0 <= v < 7.0.0"
+    }
+}

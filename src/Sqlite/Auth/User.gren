@@ -1,0 +1,220 @@
+module Sqlite.Auth.User exposing
+    ( User, Verified
+    , migrationV1
+    , new
+    , get
+    , id, verifiedId
+    , delete
+    )
+
+{-| Add and get users from the database.
+
+## User types
+
+@docs User, Verified
+
+## Migrations
+
+All migrations are meant to be plug-and-play with the `gren-sqlite-migrate` 
+package:
+
+    Sqlite.Migrate.migrate database
+        { secureContext = secureContext }
+        (Sqlite.Auth.User.migrationV1 ++ yourOtherMigrations)
+
+If you are using a different method of migration, the individual SQL statements 
+can be extracted from each migration's `statements` field.
+
+@docs migrationV1
+
+## Working with users
+
+@docs new
+@docs get
+@docs id, verifiedId
+@docs delete
+
+-}
+
+import Crypto
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Decode
+import Sqlite.Decode.Row
+import Sqlite.Encode
+import Sqlite.Encode.Row
+import Task exposing ( Task )
+import Utils.Time
+
+
+{-| A user that exists in the database. This does not mean the user has been
+verified via credentials. It is simply a user that exists.
+
+This value is produced by functions that create or look up a user, such as 
+[`new`](#new), [`get`](#get), or 
+[`Sqlite.Auth.Username.user`](Sqlite.Auth.Username#user).
+
+This value is consumed by functions that read a user's id, attach a username
+to a user, or check a password for a given user, such as [`id`](#id), 
+[`Sqlite.Auth.Username.list`](Sqlite.Auth.Username#list), or
+[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate).
+
+This value wraps an internal type that cannot be constructed by functions
+outside of this package. If you want to get access to the underlying user
+id this type holds, use the [`id`](#id) function.
+-}
+type alias User =
+    Internal.User
+
+
+{-| A user that exists in the database and has been proven, via a credential
+check or a live session, that they are the user they say they are. Unlike the
+`User` type, which only proves a user exists, this proves the user has been
+authenticated.
+
+This value is produced by a credential check or a live-session verification, such 
+as [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate), 
+[`Sqlite.Auth.Password.reset`](Sqlite.Auth.Password#reset), or
+[`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify).
+
+This value is consumed by privileged account operations, such as [`delete`](#delete),
+[`Sqlite.Auth.Password.change`](Sqlite.Auth.Password#change), 
+or [`Sqlite.Auth.Session.issue`](Sqlite.Auth.Session#issue).
+
+This value wraps an internal type that cannot be constructed by functions
+outside of this package. If you want to get access to the underlying user
+id this type holds, use the [`verifiedId`](#verifiedId) function.
+-}
+type alias Verified =
+    Internal.Verified
+
+
+{-| Initial migration required for functions in this module to operate.
+
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+
+The `users` table is used as a foreign key reference for _all_ other modules in this 
+package. As such, it is required for most, if not all, of the functions in this package
+to operate successfully.
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Sqlite.Auth.User.migrationV1` - Add users table"
+    , statements =
+        [ addUsersTableMigrationSQL
+        ]
+    }
+
+
+{-| SQL to add the `users` table to the database.
+-}
+addUsersTableMigrationSQL : String
+addUsersTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    """
+
+
+{-| Create a new user with a randomly generated UUID v4 identifier.
+
+It's _highly_ recommended that you immediately create a 
+[username](Sqlite.Auth.Username) for the new user in the same SQLite
+transaction. After a user is created, the only method of retrieving
+it from the database is by its id (via the [get](#get) function) or by
+the user's created username. If you plan on using this package for user-facing
+authentication, user ids are not the most friendly way to remember how
+to log into an account!
+-}
+new : Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error User
+new database secureContext =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Crypto.randomUuidV4 secureContext
+                    |> Task.andThen
+                        (\userId ->
+                            Sqlite.execute database
+                                { statement =
+                                    """
+                                    INSERT INTO users (id, created_at, updated_at)
+                                    VALUES (:id, :created_at, :updated_at)
+                                    """
+                                , parameters =
+                                    [ Sqlite.Encode.Row.column "id" (Sqlite.Encode.string userId)
+                                    , Sqlite.Encode.Row.column "created_at" (Sqlite.Encode.int now)
+                                    , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
+                                    ]
+                                }
+                                |> Task.map (\_ -> Internal.User { userId = userId })
+                        )
+            )
+
+
+{-| Look up a user by id, returning the `User` for the row. The task
+fails when there's no user with the given id.
+-}
+get : Sqlite.Database -> { id : String } -> Task Sqlite.Error User
+get database input =
+    Sqlite.getOne database
+        { query =
+            """
+            SELECT id
+            FROM users
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "id" (Sqlite.Encode.string input.id)
+            ]
+        , rowDecoder =
+            Sqlite.Decode.Row.column "id" Sqlite.Decode.string <| \userId -> Sqlite.Decode.Row.succeed (Internal.User { userId = userId })
+        }
+
+
+{-| Get the id of the given `User`.
+-}
+id : User -> String
+id (Internal.User { userId }) =
+    userId
+
+
+{-| Get the id of a given `Verified` user.
+-}
+verifiedId : Verified -> String
+verifiedId (Internal.Verified { userId }) =
+    userId
+
+
+{-| Delete a user. This also deletes everything that references them including 
+usernames, passwords, password reset tokens, and sessions, assuming the given
+database has foreign keys enabled and you've used the migrations in this package
+which contain `ON DELETE CASCADE` statements.
+
+This operation requires a [`Verified`](Sqlite.Auth.User#Verified) user. A user
+can be verified by validating their password 
+([`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate)) or their 
+current session ([`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify)).
+
+Deleting a user who does not exist succeeds with no changes to the underlying
+database.
+-}
+delete : Sqlite.Database -> Verified -> Task Sqlite.Error {}
+delete database (Internal.Verified { userId }) =
+    Sqlite.execute database
+        { statement =
+            """
+            DELETE FROM users
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "id" (Sqlite.Encode.string userId)
+            ]
+        }
+        |> Task.map (\_ -> {})

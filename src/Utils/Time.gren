@@ -1,0 +1,19 @@
+module Utils.Time exposing ( nowMillis )
+
+{-| Time helpers.
+
+@docs nowMillis
+
+-}
+
+import Task exposing ( Task )
+import Time
+
+
+{-| The current time in milliseconds since the epoch — the form every
+timestamp column stores.
+-}
+nowMillis : Task x Int
+nowMillis =
+    Time.now
+        |> Task.map Time.posixToMillis

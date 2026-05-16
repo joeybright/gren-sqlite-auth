@@ -1,0 +1,25 @@
+module Sqlite.Auth.Internal exposing ( User(..), Verified(..) )
+
+{-| The internal home of the witness types that keep a `Sqlite.Auth` pipeline
+honest. This module is not exposed by the package, so only modules inside it
+can mint a witness; consumers can merely pass them along.
+
+@docs User, Verified
+
+-}
+
+
+{-| Proof that a `users` row exists. Minted by [`Sqlite.Auth.User.new`](Sqlite.Auth.User#new) (and, in
+future slices, by lookups that resolve an identifier to its user).
+-}
+type User
+    = User { userId : String }
+
+
+{-| Proof that the caller authenticated as a user — by a credential check
+([`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate), [`Sqlite.Auth.Password.reset`](Sqlite.Auth.Password#reset)) or by holding
+a live session ([`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify)). Demanded by
+[`Sqlite.Auth.Session.issue`](Sqlite.Auth.Session#issue) and the credential- and identifier-changing steps.
+-}
+type Verified
+    = Verified { userId : String }

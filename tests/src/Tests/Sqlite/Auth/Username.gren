@@ -1,0 +1,486 @@
+module Tests.Sqlite.Auth.Username exposing ( tests )
+
+{-|-}
+
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.User as User
+import Sqlite.Auth.Username as Username
+import Sqlite.Migrate
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
+
+
+{-|-}
+normalizeUsername : String -> (Username.Username Username.Normalized -> Test.Runner.Effectful.Test) -> Test.Runner.Effectful.Test
+normalizeUsername string toTest =
+    await
+        ("fixture username should normalize: " ++ string)
+        (Username.normalize (Username.fromString string))
+        toTest
+
+
+{-|-}
+tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests fsPermission secureContext =
+    let
+        migrations : Array Sqlite.Migrate.Migration
+        migrations =
+            [ User.migrationV1
+            , Username.migrationV1
+            ]
+    in
+    await
+        "Open the on-disk test database (Sqlite.Auth.Username)"
+        (Sqlite.open fsPermission Sqlite.defaultOptions (Sqlite.File (FileSystem.Path.fromPosixString "test-sqlite-auth-username.sqlite")))
+        (\database ->
+            await
+                "Apply migrations (Sqlite.Auth.Username)"
+                (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
+                (\_ ->
+                    await
+                        "Generate a unique username suffix (Sqlite.Auth.Username)"
+                        (Crypto.randomUuidV4 secureContext)
+                        (\suffix ->
+                            concat
+                                [ pureTests
+                                , userLookupTests database secureContext suffix
+                                , newDuplicateTests database secureContext suffix
+                                , changeRenameTests database secureContext suffix
+                                , changeMultipleTests database secureContext suffix
+                                , changeScopingTests database secureContext suffix
+                                , changeTakenTests database secureContext suffix
+                                , changeWithoutUsernameTests database secureContext suffix
+                                , listTests database secureContext suffix
+                                , deleteTests database secureContext suffix
+                                ]
+                        )
+                )
+        )
+
+
+{-|-}
+pureTests : Test.Runner.Effectful.Test
+pureTests =
+    concat
+        [ await "normalize \"  Alice  \""
+            (Username.normalize (Username.fromString "  Alice  "))
+            (\username ->
+                test "normalize trims surrounding whitespace and lowercases"
+                    (\_ -> Expect.equal "alice" (Username.toString username))
+            )
+        , await "normalize \"ALICE\""
+            (Username.normalize (Username.fromString "ALICE"))
+            (\upper ->
+                await "normalize \" alice \""
+                    (Username.normalize (Username.fromString " alice "))
+                    (\lower ->
+                        test "differently-cased and -spaced names normalize to the same value"
+                            (\_ -> Expect.equal (Username.toString upper) (Username.toString lower))
+                    )
+            )
+        , awaitError "normalize \"\""
+            (Username.normalize (Username.fromString ""))
+            (\_ ->
+                test "an empty string does not normalize"
+                    (\_ -> Expect.pass)
+            )
+        , awaitError "normalize \"   \""
+            (Username.normalize (Username.fromString "   "))
+            (\_ ->
+                test "a whitespace-only username does not normalize"
+                    (\_ -> Expect.pass)
+            )
+        , await "normalize \"é\""
+            (Username.normalize (Username.fromString "é"))
+            (\composed ->
+                await "normalize \"e\u{0301}\""
+                    (Username.normalize (Username.fromString "e\u{0301}"))
+                    (\decomposed ->
+                        test "no Unicode normalization: precomposed and decomposed forms stay distinct"
+                            (\_ -> Expect.notEqual (Username.toString composed) (Username.toString decomposed))
+                    )
+            )
+        , test "toString returns the raw string of a fromString value"
+            (\_ ->
+                Username.toString (Username.fromString "RawValue")
+                    |> Expect.equal "RawValue"
+            )
+        ]
+
+
+{-|-}
+userLookupTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+userLookupTests database secureContext suffix =
+    normalizeUsername ("lookup-" ++ suffix)
+        (\username ->
+            normalizeUsername ("ghost-" ++ suffix)
+                (\ghost ->
+                    await
+                        "Create a user (lookup)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the username"
+                                (Username.new database username user)
+                                (\_ ->
+                                    await
+                                        "Look up the inserted username"
+                                        (Username.user database username)
+                                        (\maybeOwner ->
+                                            concat
+                                                [ test "user resolves an inserted username to its owner"
+                                                    (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeOwner))
+                                                , await
+                                                    "Look up the unowned username"
+                                                    (Username.user database ghost)
+                                                    (\maybeGhost ->
+                                                        test "user resolves an unowned username to Nothing"
+                                                            (\_ -> Expect.equal Nothing (Maybe.map User.id maybeGhost))
+                                                    )
+                                                ]
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-|-}
+newDuplicateTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+newDuplicateTests database secureContext suffix =
+    normalizeUsername ("dupe-" ++ suffix)
+        (\username ->
+            await
+                "Create a user (duplicate)"
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        "Insert the username"
+                        (Username.new database username user)
+                        (\_ ->
+                            awaitError
+                                "Insert the same username again"
+                                (Username.new database username user)
+                                (\_ ->
+                                    test "inserting a duplicate username fails on the primary key"
+                                        (\_ -> Expect.pass)
+                                )
+                        )
+                )
+        )
+
+
+{-|-}
+changeRenameTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeRenameTests database secureContext suffix =
+    normalizeUsername ("rename-from-" ++ suffix)
+        (\from ->
+            normalizeUsername ("rename-to-" ++ suffix)
+                (\to ->
+                    await
+                        "Create a user (rename)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the original username"
+                                (Username.new database from user)
+                                (\_ ->
+                                    await
+                                        "Rename with the owner's proof"
+                                        (Username.change database { from = from, to = to } (Internal.Verified { userId = User.id user }))
+                                        (\_ ->
+                                            await
+                                                "Look up the old username after renaming"
+                                                (Username.user database from)
+                                                (\maybeOld ->
+                                                    await
+                                                        "Look up the new username after renaming"
+                                                        (Username.user database to)
+                                                        (\maybeNew ->
+                                                            concat
+                                                                [ test "after change the old username no longer resolves"
+                                                                    (\_ -> Expect.equal Nothing (Maybe.map User.id maybeOld))
+                                                                , test "after change the new username resolves to the same user"
+                                                                    (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeNew))
+                                                                ]
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-|-}
+changeScopingTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeScopingTests database secureContext suffix =
+    normalizeUsername ("scope-a-" ++ suffix)
+        (\from ->
+            normalizeUsername ("scope-b-" ++ suffix)
+                (\to ->
+                    await
+                        "Create the original owner (scoping)"
+                        (User.new database secureContext)
+                        (\userA ->
+                            await
+                                "Create the mismatched user (scoping)"
+                                (User.new database secureContext)
+                                (\userB ->
+                                    await
+                                        "Insert the original username for the first user"
+                                        (Username.new database from userA)
+                                        (\_ ->
+                                            await
+                                                "Rename with a mismatched proof"
+                                                (Username.change database { from = from, to = to } (Internal.Verified { userId = User.id userB }))
+                                                (\_ ->
+                                                    await
+                                                        "Look up the original username after the mismatched rename"
+                                                        (Username.user database from)
+                                                        (\maybeFrom ->
+                                                            await
+                                                                "Look up the target username after the mismatched rename"
+                                                                (Username.user database to)
+                                                                (\maybeTo ->
+                                                                    concat
+                                                                        [ test "a mismatched proof leaves the original owner unchanged"
+                                                                            (\_ -> Expect.equal (Just (User.id userA)) (Maybe.map User.id maybeFrom))
+                                                                        , test "a mismatched proof does not create the target username"
+                                                                            (\_ -> Expect.equal Nothing (Maybe.map User.id maybeTo))
+                                                                        ]
+                                                                )
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-|-}
+changeMultipleTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeMultipleTests database secureContext suffix =
+    normalizeUsername ("multi-a-" ++ suffix)
+        (\one ->
+            normalizeUsername ("multi-b-" ++ suffix)
+                (\two ->
+                    normalizeUsername ("multi-c-" ++ suffix)
+                        (\three ->
+                            await
+                                "Create a user (multiple)"
+                                (User.new database secureContext)
+                                (\user ->
+                                    await
+                                        "Insert the first username"
+                                        (Username.new database one user)
+                                        (\_ ->
+                                            await
+                                                "Insert the second username"
+                                                (Username.new database two user)
+                                                (\_ ->
+                                                    await
+                                                        "Rename the second username"
+                                                        (Username.change database { from = two, to = three } (Internal.Verified { userId = User.id user }))
+                                                        (\_ ->
+                                                            concat
+                                                                [ await
+                                                                    "Look up the first username after the rename"
+                                                                    (Username.user database one)
+                                                                    (\maybeOne ->
+                                                                        test "the first username is untouched"
+                                                                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeOne))
+                                                                    )
+                                                                , await
+                                                                    "Look up the renamed-from username"
+                                                                    (Username.user database two)
+                                                                    (\maybeTwo ->
+                                                                        test "the renamed-from username no longer resolves"
+                                                                            (\_ -> Expect.equal Nothing (Maybe.map User.id maybeTwo))
+                                                                    )
+                                                                , await
+                                                                    "Look up the new username"
+                                                                    (Username.user database three)
+                                                                    (\maybeThree ->
+                                                                        test "the new username resolves to the user"
+                                                                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeThree))
+                                                                    )
+                                                                ]
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-|-}
+changeWithoutUsernameTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeWithoutUsernameTests database secureContext suffix =
+    normalizeUsername ("orphan-from-" ++ suffix)
+        (\from ->
+            normalizeUsername ("orphan-to-" ++ suffix)
+                (\target ->
+                    await
+                        "Create a user with no username (no-op)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Rename the user who has no username row"
+                                (Username.change database { from = from, to = target } (Internal.Verified { userId = User.id user }))
+                                (\_ ->
+                                    await
+                                        "Look up the target username after the no-op rename"
+                                        (Username.user database target)
+                                        (\maybeOwner ->
+                                            test "renaming without a username row creates nothing"
+                                                (\_ -> Expect.equal Nothing (Maybe.map User.id maybeOwner))
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-|-}
+changeTakenTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeTakenTests database secureContext suffix =
+    normalizeUsername ("taken-one-" ++ suffix)
+        (\one ->
+            normalizeUsername ("taken-two-" ++ suffix)
+                (\two ->
+                    await
+                        "Create a user (taken)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the first username"
+                                (Username.new database one user)
+                                (\_ ->
+                                    await
+                                        "Insert the second username"
+                                        (Username.new database two user)
+                                        (\_ ->
+                                            awaitError
+                                                "Rename the second username to the first"
+                                                (Username.change database { from = two, to = one } (Internal.Verified { userId = User.id user }))
+                                                (\_ ->
+                                                    test "renaming to a taken username fails on the primary key"
+                                                        (\_ -> Expect.pass)
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-|-}
+listTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+listTests database secureContext suffix =
+    normalizeUsername ("list-a-" ++ suffix)
+        (\one ->
+            normalizeUsername ("list-b-" ++ suffix)
+                (\two ->
+                    await
+                        "Create a user (list)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "List a user who has no usernames"
+                                (Username.list database user)
+                                (\empty ->
+                                    concat
+                                        [ test "a user with no usernames lists as empty"
+                                            (\_ -> Expect.equal [] empty)
+                                        , await
+                                            "Insert the first username"
+                                            (Username.new database one user)
+                                            (\_ ->
+                                                await
+                                                    "Insert the second username"
+                                                    (Username.new database two user)
+                                                    (\_ ->
+                                                        await
+                                                            "List the user's usernames"
+                                                            (Username.list database user)
+                                                            (\listed ->
+                                                                test "list returns both usernames, normalized and ordered"
+                                                                    (\_ ->
+                                                                        Expect.equal
+                                                                            [ Username.toString one, Username.toString two ]
+                                                                            (Array.map Username.toString listed)
+                                                                    )
+                                                            )
+                                                    )
+                                            )
+                                        ]
+                                )
+                        )
+                )
+        )
+
+
+{-|-}
+deleteTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+deleteTests database secureContext suffix =
+    normalizeUsername ("del-a-" ++ suffix)
+        (\one ->
+            normalizeUsername ("del-b-" ++ suffix)
+                (\two ->
+                    await
+                        "Create a user (delete)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the first username"
+                                (Username.new database one user)
+                                (\_ ->
+                                    await
+                                        "Insert the second username"
+                                        (Username.new database two user)
+                                        (\_ ->
+                                            await
+                                                "Delete one username with the owner's proof"
+                                                (Username.delete database one (Internal.Verified { userId = User.id user }))
+                                                (\_ ->
+                                                    concat
+                                                        [ await
+                                                            "Look up the deleted username"
+                                                            (Username.user database one)
+                                                            (\maybeDeleted ->
+                                                                test "the deleted username no longer resolves"
+                                                                    (\_ -> Expect.equal Nothing (Maybe.map User.id maybeDeleted))
+                                                            )
+                                                        , await
+                                                            "Look up the remaining username"
+                                                            (Username.user database two)
+                                                            (\maybeRemaining ->
+                                                                test "the remaining username still resolves"
+                                                                    (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeRemaining))
+                                                            )
+                                                        , await
+                                                            "Delete the remaining username with a mismatched proof"
+                                                            (Username.delete database two (Internal.Verified { userId = "someone-else" }))
+                                                            (\_ ->
+                                                                await
+                                                                    "Look up the remaining username after the mismatched delete"
+                                                                    (Username.user database two)
+                                                                    (\maybeStill ->
+                                                                        test "a mismatched proof deletes nothing"
+                                                                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeStill))
+                                                                    )
+                                                            )
+                                                        ]
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )

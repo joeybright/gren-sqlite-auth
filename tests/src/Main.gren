@@ -1,0 +1,57 @@
+module Main exposing (main)
+
+{-|-}
+
+import Crypto
+import FileSystem
+import FileSystem.Path
+import Init
+import Node
+import Task exposing ( Task )
+import Test.Runner.Effectful exposing ( await, concat, initialize, run )
+import Tests.Sqlite.Auth.Password.PhcString
+import Tests.Sqlite.Auth.Password
+import Tests.Sqlite.Auth.Session
+import Tests.Sqlite.Auth.User
+import Tests.Sqlite.Auth.Username
+
+
+{-|-}
+main : Node.SimpleProgram {}
+main =
+    Node.defineSimpleProgram <| \env ->
+    initialize env <| \config ->
+    Init.await FileSystem.initialize <| \fsPermission ->
+        await "Get secure context for Crypto functions" Crypto.getSecureContext
+            (\secureContext ->
+                await "Remove test databases left by a previous run" (removeTestDatabases fsPermission)
+                    (\_ ->
+                        concat
+                            [ Test.Runner.Effectful.wrap Tests.Sqlite.Auth.Password.PhcString.tests
+                            , Tests.Sqlite.Auth.User.tests fsPermission secureContext
+                            , Tests.Sqlite.Auth.Password.tests fsPermission secureContext
+                            , Tests.Sqlite.Auth.Username.tests fsPermission secureContext
+                            , Tests.Sqlite.Auth.Session.tests fsPermission secureContext
+                            ]
+                    )
+            )
+            |> run config
+            |> Node.endSimpleProgram
+
+
+{-|-}
+removeTestDatabases : FileSystem.Permission -> Task x {}
+removeTestDatabases fsPermission =
+    [ "test-sqlite-auth-user.sqlite"
+    , "test-sqlite-auth-username.sqlite"
+    , "test-sqlite-auth-password.sqlite"
+    , "test-sqlite-auth-session.sqlite"
+    ]
+        |> Array.map
+            (\name ->
+                FileSystem.remove fsPermission { recursive = False } (FileSystem.Path.fromPosixString name)
+                    |> Task.map (\_ -> {})
+                    |> Task.onError (\_ -> Task.succeed {})
+            )
+        |> Task.sequence
+        |> Task.map (\_ -> {})

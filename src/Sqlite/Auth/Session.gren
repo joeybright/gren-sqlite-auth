@@ -1,0 +1,460 @@
+module Sqlite.Auth.Session exposing
+    ( migrationV1
+    , Session
+    , Options
+    , defaultOptions
+    , issue
+    , verify
+    , VerifyError(..)
+    , list
+    , revoke
+    , revokeAll
+    )
+
+{-| Issue, verify, and revoke users' login sessions.
+
+A session is a login token tied to a user. The raw token is handed to the
+client once, when the session is issued. Only its SHA-256 hash is stored, so a
+stolen database cannot be replayed as live sessions.
+
+## Migrations
+
+All migrations are meant to be plug-and-play with the gren-sqlite-migrate package:
+
+    Sqlite.Migrate.migrate database
+        { secureContext = secureContext }
+        (Sqlite.Auth.Session.migrationV1 ++ yourOtherMigrations)
+
+If you are using a different method of migration, the individual SQL statements 
+can be extracted from each migration's `statements` field.
+
+@docs migrationV1
+
+## Working with sessions
+
+@docs Session
+
+@docs Options, defaultOptions
+
+@docs issue
+
+@docs verify, VerifyError
+
+@docs list
+
+@docs revoke
+
+@docs revokeAll
+
+-}
+
+import Bytes
+import Crypto
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.User as User
+import Sqlite.Decode
+import Sqlite.Decode.Row
+import Sqlite.Encode
+import Sqlite.Encode.Row
+import Task exposing ( Task )
+import Utils.Base64
+import Utils.Crypto
+import Utils.Time
+
+
+{-| Initial migration required for functions in this module to operate.
+
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_token TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        last_used_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+- `session_token` is the primary key and stores the SHA-256 hash of the token.
+- `user_id` references the user's id.
+- `created_at` is a posix timestamp, and `expires_at` is the posix timestamp the
+session stops being valid.
+- `last_used_at` is a posix timestamp of the last successful verification, used
+to enforce the idle timeout.
+- `revoked_at` is the posix timestamp the session was revoked, or null while live.
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Sqlite.Auth.Session.migrationV1` - Add sessions table"
+    , statements =
+        [ addSessionsTableMigrationSQL
+        ]
+    }
+
+
+{-|-}
+addSessionsTableMigrationSQL : String
+addSessionsTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_token TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        last_used_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    """
+
+
+{-| A row from the `sessions` table.
+-}
+type alias Session =
+    { sessionToken : String
+    , userId : String
+    , createdAt : Int
+    , expiresAt : Int
+    , lastUsedAt : Int
+    , revokedAt : Maybe Int
+    }
+
+
+{-| Options for sessions. `lifetimeMillis` is the maximum length the token is
+valid for before expiring. `idleTimeoutMillis` is the maximum length the token
+can exist without being used before expiring.
+-}
+type alias Options =
+    { lifetimeMillis : Int
+    , idleTimeoutMillis : Int
+    }
+
+
+{-| The default, recommended, options for sessions.
+
+    { lifetimeMillis = 30 * 24 * 60 * 60 * 1000 -- 30 days
+    , idleTimeoutMillis = 7 * 24 * 60 * 60 * 1000 -- 7 days
+    }
+-}
+defaultOptions : Options
+defaultOptions =
+    { lifetimeMillis = 30 * 24 * 60 * 60 * 1000
+    , idleTimeoutMillis = 7 * 24 * 60 * 60 * 1000
+    }
+
+
+{-| Issue a session for a [`Verified`](Sqlite.Auth.User#Verified) user. You can 
+obtain a `Verified` with a credential check such as what
+[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) produces.
+
+This function returns two things: the session and the token.
+
+The session is the row saved to the database representing the session. This 
+includes the hashed session token. This value is returned to be inspected, never 
+to be sent to the client.
+
+The token value is the raw token (not hashed). This value should be sent safely
+to the user's browser. It's _highly_ recommended you send the token to the client 
+as a cookie that is HttpOnly, Secure, and has SameSite=Lax rules. Without these 
+rules, or if the raw token is saved via IndexedDB, localStorage, or other methods, 
+it's vulnerable to being stolen by attacks.
+-}
+issue : Sqlite.Database -> Crypto.SecureContext -> Options -> User.Verified -> Task Sqlite.Error { session : Session, token : String }
+issue database secureContext options (Internal.Verified { userId }) =
+    sweep database options
+        |> Task.andThen
+            (\_ ->
+                Crypto.getRandomUInt8Values 32
+                    |> Task.andThen
+                        (\tokenBytes ->
+                            Utils.Time.nowMillis
+                                |> Task.andThen
+                                    (\now ->
+                                        let
+                                            token : String
+                                            token =
+                                                Utils.Base64.encodeBytes tokenBytes
+                                        in
+                                        Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
+                                            |> Task.andThen
+                                                (\hashedToken ->
+                                                    let
+                                                        session : Session
+                                                        session =
+                                                            { sessionToken = hashedToken
+                                                            , userId = userId
+                                                            , createdAt = now
+                                                            , expiresAt = now + options.lifetimeMillis
+                                                            , lastUsedAt = now
+                                                            , revokedAt = Nothing
+                                                            }
+                                                    in
+                                                    insert database session
+                                                        |> Task.map (\_ -> { session = session, token = token })
+                                                )
+                                    )
+                        )
+            )
+
+
+{-| Why a presented token failed to verify.
+
+- `StorageError` is an underlying error in the Sqlite database.
+- `TokenNotFound` is when the token matches no session row at all.
+- `Revoked` is when the session has been revoked.
+- `Expired` is when the session is past its absolute lifetime.
+- `IdleTimeout` is when the session went unused for longer than `idleTimeoutMillis`.
+
+-}
+type VerifyError
+    = StorageError Sqlite.Error
+    | TokenNotFound
+    | Revoked
+    | Expired
+    | IdleTimeout
+
+
+{-| Verify a presented token, succeeding with the [`Session`](#Session) and
+the user whose session has been verified. A revoked, expired, or idle session, 
+or a token matching no session at all — fails the task with the matching 
+[`VerifyError`](#VerifyError).
+
+The returned, `Verified`, user lets a live session authorize actions without 
+re-checking a credential:
+
+    Session.verify database secureContext options { token = token }
+        |> Task.andThen .verified
+        |> Task.andThen (Username.change database { from = old, to = new })
+
+It's recommended session tokens are verified for each authenticated request, ensuring 
+the user performing a specific action is able and allowed to do so.
+-}
+verify : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task VerifyError { session : Session, verified : User.Verified }
+verify database secureContext options input =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                getByToken database secureContext input
+                    |> Task.mapError StorageError
+                    |> Task.andThen
+                        (\maybeSession ->
+                            when maybeSession is
+                                Nothing ->
+                                    Task.fail TokenNotFound
+
+                                Just session ->
+                                    when session.revokedAt is
+                                        Just _ ->
+                                            Task.fail Revoked
+
+                                        Nothing ->
+                                            if session.expiresAt <= now then
+                                                Task.fail Expired
+
+                                            else if session.lastUsedAt + options.idleTimeoutMillis <= now then
+                                                Task.fail IdleTimeout
+
+                                            else
+                                                touch database options { sessionToken = session.sessionToken, now = now }
+                                                    |> Task.mapError StorageError
+                                                    |> Task.andThen
+                                                        (\summary ->
+                                                            if summary.changes == 0 then
+                                                                Task.fail Revoked
+
+                                                            else
+                                                                Task.succeed
+                                                                    { session = { session | lastUsedAt = now }
+                                                                    , verified = Internal.Verified { userId = session.userId }
+                                                                    }
+                                                        )
+                        )
+            )
+
+
+{-| List all of a given user's live sessions. Live is defined as sessions that
+have not yet been revoked or are beyond their lifetimes.
+-}
+list : Sqlite.Database -> { userId : String } -> Task Sqlite.Error (Array Session)
+list database { userId } =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.getAll database
+                    { query =
+                        """
+                        SELECT session_token, user_id, created_at, expires_at, last_used_at, revoked_at
+                        FROM sessions
+                        WHERE user_id = :user_id
+                            AND revoked_at IS NULL
+                            AND expires_at > :now
+                        ORDER BY created_at
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+                        , Sqlite.Encode.Row.column "now" (Sqlite.Encode.int now)
+                        ]
+                    , rowDecoder = decoder
+                    }
+            )
+
+
+{-| Revoke a session by its raw token. If the given token does not exist, the 
+`Task` will succeed, but no changes will be made to the database.
+-}
+revoke : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task Sqlite.Error {}
+revoke database secureContext options { token } =
+    Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
+        |> Task.andThen
+            (\hashedToken ->
+                Utils.Time.nowMillis
+                    |> Task.andThen
+                        (\now ->
+                            Sqlite.execute database
+                                { statement =
+                                    """
+                                    UPDATE sessions
+                                    SET revoked_at = :revoked_at
+                                    WHERE session_token = :session_token
+                                    """
+                                , parameters =
+                                    [ Sqlite.Encode.Row.column "revoked_at" (Sqlite.Encode.int now)
+                                    , Sqlite.Encode.Row.column "session_token" (Sqlite.Encode.string hashedToken)
+                                    ]
+                                }
+                        )
+            )
+        |> Task.andThen (\_ -> sweep database options)
+
+
+{-| Revoke every live session a user holds.
+-}
+revokeAll : Sqlite.Database -> { userId : String } -> Task Sqlite.Error {}
+revokeAll database { userId } =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        UPDATE sessions
+                        SET revoked_at = :revoked_at
+                        WHERE user_id = :user_id AND revoked_at IS NULL
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.Row.column "revoked_at" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+                        ]
+                    }
+            )
+        |> Task.map (\_ -> {})
+
+
+{-| Decode a single `sessions` row into a [`Session`](#Session).
+-}
+decoder : Sqlite.Decode.Row.Decoder Session
+decoder =
+    Sqlite.Decode.Row.column "session_token" Sqlite.Decode.string <| \sessionToken ->
+    Sqlite.Decode.Row.column "user_id" Sqlite.Decode.string <| \userId ->
+    Sqlite.Decode.Row.column "created_at" Sqlite.Decode.int <| \createdAt ->
+    Sqlite.Decode.Row.column "expires_at" Sqlite.Decode.int <| \expiresAt ->
+    Sqlite.Decode.Row.column "last_used_at" Sqlite.Decode.int <| \lastUsedAt ->
+    Sqlite.Decode.Row.column "revoked_at" (Sqlite.Decode.maybe Sqlite.Decode.int) <| \revokedAt ->
+        Sqlite.Decode.Row.succeed
+            { sessionToken = sessionToken
+            , userId = userId
+            , createdAt = createdAt
+            , expiresAt = expiresAt
+            , lastUsedAt = lastUsedAt
+            , revokedAt = revokedAt
+            }
+
+
+{-| Insert a session row into the `sessions` table.
+-}
+insert : Sqlite.Database -> Session -> Task Sqlite.Error Sqlite.ExecutionSummary
+insert database { sessionToken, userId, createdAt, expiresAt, lastUsedAt, revokedAt } =
+    Sqlite.execute database
+        { statement =
+            """
+            INSERT INTO sessions (session_token, user_id, created_at, expires_at, last_used_at, revoked_at)
+            VALUES (:session_token, :user_id, :created_at, :expires_at, :last_used_at, :revoked_at)
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "session_token" (Sqlite.Encode.string sessionToken)
+            , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+            , Sqlite.Encode.Row.column "created_at" (Sqlite.Encode.int createdAt)
+            , Sqlite.Encode.Row.column "expires_at" (Sqlite.Encode.int expiresAt)
+            , Sqlite.Encode.Row.column "last_used_at" (Sqlite.Encode.int lastUsedAt)
+            , Sqlite.Encode.Row.column "revoked_at" (Sqlite.Encode.maybe Sqlite.Encode.int revokedAt)
+            ]
+        }
+
+
+{-| Read a single session by its presented token, returning `Nothing` when
+no row matches. The token string is hashed to the stored value before
+matching.
+-}
+getByToken : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task Sqlite.Error (Maybe Session)
+getByToken database secureContext { token } =
+    Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
+        |> Task.andThen
+            (\hashedToken ->
+                Sqlite.getMaybeOne database
+                    { query =
+                        """
+                        SELECT session_token, user_id, created_at, expires_at, last_used_at, revoked_at
+                        FROM sessions
+                        WHERE session_token = :session_token
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.Row.column "session_token" (Sqlite.Encode.string hashedToken)
+                        ]
+                    , rowDecoder = decoder
+                    }
+            )
+
+
+{-| Bump a session row's `last_used_at`.
+-}
+touch : Sqlite.Database -> Options -> { sessionToken : String, now : Int } -> Task Sqlite.Error Sqlite.ExecutionSummary
+touch database options { sessionToken, now } =
+    Sqlite.execute database
+        { statement =
+            """
+            UPDATE sessions
+            SET last_used_at = :now
+            WHERE session_token = :session_token
+                AND revoked_at IS NULL
+                AND expires_at > :now
+                AND last_used_at > :idle_cutoff
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "now" (Sqlite.Encode.int now)
+            , Sqlite.Encode.Row.column "session_token" (Sqlite.Encode.string sessionToken)
+            , Sqlite.Encode.Row.column "idle_cutoff" (Sqlite.Encode.int (now - options.idleTimeoutMillis))
+            ]
+        }
+
+
+{-| Delete every dead session row: revoked, expired, or idle past
+`idleTimeoutMillis` as of now.
+-}
+sweep : Sqlite.Database -> Options -> Task Sqlite.Error {}
+sweep database options =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        DELETE FROM sessions
+                        WHERE revoked_at IS NOT NULL OR expires_at <= :now OR last_used_at <= :idle_cutoff
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.Row.column "now" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "idle_cutoff" (Sqlite.Encode.int (now - options.idleTimeoutMillis))
+                        ]
+                    }
+            )
+        |> Task.map (\_ -> {})

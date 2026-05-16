@@ -1,0 +1,18 @@
+module Utils.Base64 exposing ( encodeBytes )
+
+{-| Base64 encoding helpers.
+
+@docs encodeBytes
+
+-}
+
+import Base64.Encode
+import Bytes exposing ( Bytes )
+
+
+{-| Encode bytes as a standard base64 string.
+-}
+encodeBytes : Bytes -> String
+encodeBytes bytes =
+    Base64.Encode.bytes bytes
+        |> Base64.Encode.encode

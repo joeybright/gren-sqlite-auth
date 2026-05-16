@@ -1,0 +1,314 @@
+module Sqlite.Auth.Username exposing
+    ( migrationV1
+    , Username
+    , Raw
+    , Normalized
+    , fromString
+    , normalize
+    , toString
+    , new
+    , change
+    , user
+    , list
+    , delete
+    , deleteAll
+    )
+
+{-| Manage usernames for users in the database.
+
+## Migrations
+
+All migrations are meant to be plug-and-play with the `gren-sqlite-migrate` 
+package:
+
+    Sqlite.Migrate.migrate database
+        { secureContext = secureContext }
+        (Sqlite.Auth.Username.migrationV1 ++ yourOtherMigrations)
+
+If you are using a different method of migration, the individual SQL statements 
+can be extracted from each migration's `statements` field.
+
+@docs migrationV1
+
+## Creating a username
+
+You must construct a `Username` before being able to save it for a user or
+find a user by that username. These functions ensure usernames are properly
+formatted before being saved to or searched within the database.
+
+If you want to manipulate a username in any way, you must do so to the raw
+`String` before calling [`fromString`](#fromString). That includes any content
+policies of your application (removing specific characters, enforcing character 
+limits, checking for off-limit names or phrases, etc.). The 
+[`normalize`](#normalize) function only trims, rejects empty strings, and 
+lowercases the username.
+
+@docs Username, Raw, Normalized
+@docs fromString
+@docs normalize
+@docs toString
+
+## Working with usernames
+
+@docs new
+@docs change
+@docs user
+@docs list
+@docs delete
+@docs deleteAll
+
+-}
+
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.User as User
+import Sqlite.Decode
+import Sqlite.Decode.Row
+import Sqlite.Encode
+import Sqlite.Encode.Row
+import Task exposing ( Task )
+import Utils.Time
+
+
+{-| Initial migration required for functions in this module to operate.
+
+    CREATE TABLE IF NOT EXISTS usernames (
+        username TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+
+`username` is, of course, the username of the user as a `String`. `user_id` 
+references the user (in the [Sqlite.Auth.User](Sqlite.Auth.User) module). Both 
+`created_at` and `updated_at` are posix timestamp values. `updated_at` is
+updated appropriately whenever a username is [changed](#change).
+
+This schema allows each user to have many usernames. If that's not desirable
+for your application, you can add an additional migration to add a unique index.
+
+    CREATE UNIQUE INDEX IF NOT EXISTS usernames_user_id_unique
+        ON usernames (user_id);
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Sqlite.Auth.Username.migrationV1` - Add usernames table"
+    , statements =
+        [ addUsernamesTableMigrationSQL
+        ]
+    }
+
+
+{-|-}
+addUsernamesTableMigrationSQL : String
+addUsernamesTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS usernames (
+        username TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+    """
+
+
+{-| A raw, non-normalized username.
+-}
+type Raw
+    = Raw
+
+
+{-| A normalized username that is ready to be saved to the database.
+-}
+type Normalized
+    = Normalized
+
+
+{-| A username, with a phantom type state of either `Raw` or `Normalized`.
+-}
+type Username state
+    = Username String
+
+
+{-| Turn a `String` into a raw [`Username`](#Username), ready to
+[`normalize`](#normalize).
+-}
+fromString : String -> Username Raw
+fromString =
+    Username
+
+
+{-| Ensures the username has been trimmed, is not empty, and all characters
+are lowercase. This function does not remove internal spaces.
+-}
+normalize : Username Raw -> Task {} (Username Normalized)
+normalize (Username string) =
+    let
+        trimmed : String
+        trimmed =
+            String.toLower (String.trim string)
+    in
+    if String.isEmpty trimmed then
+        Task.fail {}
+
+    else
+        Task.succeed (Username trimmed)
+
+
+{-| Get the underlying username `String`.
+-}
+toString : Username state -> String
+toString (Username string) =
+    string
+
+
+{-| Add a username to the given [`User`](Sqlite.Auth.User#User), returning 
+the user for further pipeline steps. The passed username must be normalized 
+using the [`normalize`](#normalize) function.
+-}
+new : Sqlite.Database -> Username Normalized -> User.User -> Task Sqlite.Error User.User
+new database username ((Internal.User { userId }) as userWitness) =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        INSERT INTO usernames (username, user_id, created_at, updated_at)
+                        VALUES (:username, :user_id, :created_at, :updated_at)
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.Row.column "username" (Sqlite.Encode.string (toString username))
+                        , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+                        , Sqlite.Encode.Row.column "created_at" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
+                        ]
+                    }
+                    |> Task.map (\_ -> userWitness)
+            )
+
+
+{-| Change one of a user's usernames to a new one. `from` names the username
+being replaced and `to` the replacement. With the default schema, a user 
+may hold several usernames, so only the row matching both the user and `from`
+changes.
+
+This operation requires a [`Verified`](Sqlite.Auth.User#Verified) user. A user
+can be verified by validating their password 
+([`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate)) or their 
+current session ([`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify)).
+-}
+change : Sqlite.Database -> { from : Username Normalized, to : Username Normalized } -> User.Verified -> Task Sqlite.Error User.Verified
+change database { from, to } ((Internal.Verified { userId }) as verified) =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        UPDATE usernames
+                        SET username = :to, updated_at = :updated_at
+                        WHERE user_id = :user_id AND username = :from
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.Row.column "to" (Sqlite.Encode.string (toString to))
+                        , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+                        , Sqlite.Encode.Row.column "from" (Sqlite.Encode.string (toString from))
+                        ]
+                    }
+                    |> Task.map (\_ -> verified)
+            )
+
+
+{-| Get the user who owns the given username. Returns `Nothing` if the given
+username is not associated with any user.
+-}
+user : Sqlite.Database -> Username Normalized -> Task Sqlite.Error (Maybe User.User)
+user database username =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT user_id
+            FROM usernames
+            WHERE username = :username
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "username" (Sqlite.Encode.string (toString username))
+            ]
+        , rowDecoder =
+            Sqlite.Decode.Row.column "user_id" Sqlite.Decode.string <| \userId -> Sqlite.Decode.Row.succeed (Internal.User { userId = userId })
+        }
+
+
+{-| Get all the usernames associated with a user.
+-}
+list : Sqlite.Database -> User.User -> Task Sqlite.Error (Array (Username Normalized))
+list database (Internal.User { userId }) =
+    Sqlite.getAll database
+        { query =
+            """
+            SELECT username
+            FROM usernames
+            WHERE user_id = :user_id
+            ORDER BY username
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+            ]
+        , rowDecoder =
+            Sqlite.Decode.Row.column "username" Sqlite.Decode.string <| \username -> Sqlite.Decode.Row.succeed (Username username)
+        }
+
+
+{-| Remove one username of a user.
+
+This operation requires a [`Verified`](Sqlite.Auth.User#Verified) user. A user
+can be verified by validating their password 
+([`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate)) or their 
+current session ([`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify)).
+-}
+delete : Sqlite.Database -> Username Normalized -> User.Verified -> Task Sqlite.Error {}
+delete database username (Internal.Verified { userId }) =
+    Sqlite.execute database
+        { statement =
+            """
+            DELETE FROM usernames
+            WHERE user_id = :user_id AND username = :username
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+            , Sqlite.Encode.Row.column "username" (Sqlite.Encode.string (toString username))
+            ]
+        }
+        |> Task.map (\_ -> {})
+
+
+{-| Remove all of a user's usernames. This may leave the user in a less-than-ideal
+scenario if usernames are the only method of identifying themselves when logging
+in. Use with caution!
+
+This operation requires a [`Verified`](Sqlite.Auth.User#Verified) user. A user
+can be verified by validating their password 
+([`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate)) or their 
+current session ([`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify)).
+-}
+deleteAll : Sqlite.Database -> User.Verified -> Task Sqlite.Error {}
+deleteAll database (Internal.Verified { userId }) =
+    Sqlite.execute database
+        { statement =
+            """
+            DELETE FROM usernames
+            WHERE user_id = :user_id
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+            ]
+        }
+        |> Task.map (\_ -> {})

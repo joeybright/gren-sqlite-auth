@@ -1,0 +1,194 @@
+module Tests.Sqlite.Auth.User exposing ( tests )
+
+{-|-}
+
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.User as User
+import Sqlite.Decode
+import Sqlite.Decode.Row
+import Sqlite.Encode
+import Sqlite.Encode.Row
+import Sqlite.Migrate
+import Task exposing ( Task )
+import Test
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test, wrap )
+
+
+{-|-}
+type alias UserRow =
+    { id : String
+    , createdAt : Int
+    , updatedAt : Int
+    }
+
+
+{-|-}
+userRow : Sqlite.Database -> String -> Task Sqlite.Error (Maybe UserRow)
+userRow database userId =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT id, created_at, updated_at
+            FROM users
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.Row.column "id" (Sqlite.Encode.string userId)
+            ]
+        , rowDecoder =
+            Sqlite.Decode.Row.column "id" Sqlite.Decode.string <| \id ->
+            Sqlite.Decode.Row.column "created_at" Sqlite.Decode.int <| \createdAt ->
+            Sqlite.Decode.Row.column "updated_at" Sqlite.Decode.int <| \updatedAt ->
+                Sqlite.Decode.Row.succeed
+                    { id = id
+                    , createdAt = createdAt
+                    , updatedAt = updatedAt
+                    }
+        }
+
+
+{-|-}
+tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests fsPermission secureContext =
+    let
+        migrations : Array Sqlite.Migrate.Migration
+        migrations =
+            [ User.migrationV1
+            ]
+    in
+    await
+        "Open the on-disk test database (Sqlite.Auth.User)"
+        (Sqlite.open fsPermission Sqlite.defaultOptions (Sqlite.File (FileSystem.Path.fromPosixString "test-sqlite-auth-user.sqlite")))
+        (\database ->
+            await
+                "Apply migrations (Sqlite.Auth.User)"
+                (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
+                (\_ ->
+                    concat
+                        [ wrap pureTests
+                        , newPersistsTests database secureContext
+                        , getTests database secureContext
+                        , newUniqueTests database secureContext
+                        , deleteTests database secureContext
+                        ]
+                )
+        )
+
+
+{-|-}
+pureTests : Test.Test
+pureTests =
+    Test.describe "Sqlite.Auth.User pure tests"
+        [ Test.test "id returns the user's id string"
+            (\_ ->
+                User.id (Internal.User { userId = "user-123" })
+                    |> Expect.equal "user-123"
+            )
+        ]
+
+
+{-|-}
+newPersistsTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+newPersistsTests database secureContext =
+    await
+        "Create a user (persists)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Look up the created user row"
+                (userRow database (User.id user))
+                (\maybeRow ->
+                    concat
+                        [ test "new persists a users row for the returned id"
+                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map .id maybeRow))
+                        , test "new stamps created_at equal to updated_at"
+                            (\_ ->
+                                when maybeRow is
+                                    Just row ->
+                                        Expect.equal row.createdAt row.updatedAt
+
+                                    Nothing ->
+                                        Expect.fail "expected the created user row to exist"
+                            )
+                        ]
+                )
+        )
+
+
+{-|-}
+getTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+getTests database secureContext =
+    await
+        "Create a user (get)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Look up the created user by id"
+                (User.get database { id = User.id user })
+                (\found ->
+                    concat
+                        [ test "get resolves an existing id to its user"
+                            (\_ -> Expect.equal (User.id user) (User.id found))
+                        , awaitError
+                            "Look up an unknown id"
+                            (User.get database { id = "no-such-user" })
+                            (\_ ->
+                                test "get fails when no user has the id"
+                                    (\_ -> Expect.pass)
+                            )
+                        ]
+                )
+        )
+
+
+{-|-}
+newUniqueTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+newUniqueTests database secureContext =
+    await
+        "Create the first user (unique)"
+        (User.new database secureContext)
+        (\userA ->
+            await
+                "Create the second user (unique)"
+                (User.new database secureContext)
+                (\userB ->
+                    test "separate new calls produce distinct ids"
+                        (\_ -> Expect.notEqual (User.id userA) (User.id userB))
+                )
+        )
+
+
+{-|-}
+deleteTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+deleteTests database secureContext =
+    await
+        "Create a user (delete)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Delete the user"
+                (User.delete database (Internal.Verified { userId = User.id user }))
+                (\_ ->
+                    concat
+                        [ await
+                            "Look up the deleted user row"
+                            (userRow database (User.id user))
+                            (\maybeRow ->
+                                test "delete removes the user's row"
+                                    (\_ -> Expect.equal Nothing maybeRow)
+                            )
+                        , await
+                            "Delete a user who does not exist"
+                            (User.delete database (Internal.Verified { userId = "no-such-user" }))
+                            (\_ ->
+                                test "deleting a non-existent user succeeds"
+                                    (\_ -> Expect.pass)
+                            )
+                        ]
+                )
+        )
