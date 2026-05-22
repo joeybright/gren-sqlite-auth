@@ -1,6 +1,35 @@
 module Auth.Simple
 
-{-|-}
+{-| Exploring the structure of the package...
+
+# Tables
+
+## Base tables
+
+These tables are the tables that are necessary to be created
+and exist with a specific schema (minimal schema) for the auth
+to work at all.
+
+- `users` - user data, can be augmented after this with more data
+- `sessions` - login session; method-agnostic
+- `auth_events` - event log for auditing; can be disabled?
+
+## Unknown... TBD
+
+I'm not sure if these tables are method-specific or just part of
+the base tables? I could create them and they could just be empty?
+
+- `user_usernames`
+- `user_emails`
+
+## Password-specific method
+
+These are only needed if the password auth method is added to the
+database.
+
+- `passwords`
+- `password_reset_tokens`
+-}
 
 
 {-|-}
@@ -9,13 +38,10 @@ test =
     Debug.todo ""
     
 
-{-|-}
+{-| The migration necessary to support basic authentication.
+-}
 migration : String
 migration =
-    Debug.todo ""
-
-
-{-|-}
-loginWithUsernameAndPassword : String
-loginWithUsernameAndPassword =
+    -- Add user table
+    -- Add audits table
     Debug.todo ""
