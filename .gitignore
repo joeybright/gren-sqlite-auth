@@ -1,1 +1,4 @@
 .DS_Store
+tests/app
+tests/test.sqlite
+tests/.gren
