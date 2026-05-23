@@ -147,12 +147,58 @@ addSessionsTableMigration =
     }
 
 
-{-|-}
+{-| Migration SQL for adding a `sessions` table.
+
+`id` is an opaque token chosen by the consumer (random bytes, UUID, etc.).
+`revoked_at` is nullable so explicit logout/revocation can mark a row without
+deleting it, preserving the `auth_events` audit trail.
+-}
 addSessionsTableMigrationSql : String
 addSessionsTableMigrationSql =
     """
-    CREATE TABLE IF NOT EXISTS sessions
+    CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at TEXT NOT NULL,
+        last_used_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        revoked_at TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
     """
+
+
+{-| The columns the `sessions` table must contain for this package to function.
+-}
+requiredSessionsColumns : Array String
+requiredSessionsColumns =
+    [ "id", "user_id", "created_at", "expires_at", "last_used_at", "revoked_at" ]
+
+
+{-| Confirm the live `sessions` table has every column this package depends on.
+-}
+checkSessionsTableSchema : Sqlite.Database -> Task SchemaCheckError {}
+checkSessionsTableSchema db =
+    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "sessions"
+        |> Sqlite.getAll db
+        |> Task.mapError SchemaQueryFailed
+        |> Task.andThen
+            (\columns ->
+                let
+                    presentNames =
+                        Array.map .name columns
+
+                    missing =
+                        Array.keepIf
+                            (\required -> not (Array.member required presentNames))
+                            requiredSessionsColumns
+                in
+                if Array.isEmpty missing then
+                    Task.succeed {}
+
+                else
+                    Task.fail (MissingRequiredColumns missing)
+            )
 
 
 
@@ -163,13 +209,65 @@ addSessionsTableMigrationSql =
 addAuthEventsTableMigration : { name : String, statements : Array String }
 addAuthEventsTableMigration =
     { name = "Add auth_events table"
-    , statements = [ addSessionsTableMigrationSql ]
+    , statements = [ addAuthEventsTableMigrationSql ]
     }
 
 
-{-|-}
+{-| Migration SQL for adding an `auth_events` audit table.
+
+`user_id` is nullable because failed login attempts may not resolve to a known
+user. `ON DELETE SET NULL` preserves audit history when a user is purged.
+`metadata` holds a JSON blob for method-specific fields (IP, user-agent, etc.).
+-}
 addAuthEventsTableMigrationSql : String
 addAuthEventsTableMigrationSql =
     """
-    CREATE TABLE IF NOT EXISTS auth_events
+    CREATE TABLE auth_events (
+        id TEXT PRIMARY KEY,
+        user_id TEXT,
+        event_type TEXT NOT NULL,
+        occurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        metadata TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+    );
     """
+
+
+{-| Query the live `auth_events` table schema.
+-}
+getAuthEventsTableSchema : Sqlite.Query Utils.Sqlite.PragmaTableXInfo.Column
+getAuthEventsTableSchema =
+    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "auth_events"
+
+
+{-| The columns the `auth_events` table must contain for this package to function.
+-}
+requiredAuthEventsColumns : Array String
+requiredAuthEventsColumns =
+    [ "id", "user_id", "event_type", "occurred_at", "metadata" ]
+
+
+{-| Confirm the live `auth_events` table has every column this package depends on.
+-}
+checkAuthEventsTableSchema : Sqlite.Database -> Task SchemaCheckError {}
+checkAuthEventsTableSchema db =
+    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "auth_events"
+        |> Sqlite.getAll db
+        |> Task.mapError SchemaQueryFailed
+        |> Task.andThen
+            (\columns ->
+                let
+                    presentNames =
+                        Array.map .name columns
+
+                    missing =
+                        Array.keepIf
+                            (\required -> not (Array.member required presentNames))
+                            requiredAuthEventsColumns
+                in
+                if Array.isEmpty missing then
+                    Task.succeed {}
+
+                else
+                    Task.fail (MissingRequiredColumns missing)
+            )
