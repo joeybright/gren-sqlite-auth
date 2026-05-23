@@ -1,4 +1,4 @@
-module Auth.Simple
+module Auth.Simple exposing (..)
 
 {-| Exploring the structure of the package...
 
@@ -30,18 +30,146 @@ database.
 - `passwords`
 - `password_reset_tokens`
 -}
+    
+
+import Sqlite
+import Sqlite.Encode
+import Sqlite.Decode
+import Task exposing (Task)
+import Utils.Sqlite.PragmaTableXInfo
+
+
+{-| The migration necessary to support basic authentication.
+
+This should be run prior to any authentication-specific migrations.
+-}
+migration : Array { name : String, statements : Array String }
+migration =
+    [ addUsersTableMigration
+    , addSessionsTableMigration
+    , addAuthEventsTableMigration
+    ]
+
+
+
+---
 
 
 {-|-}
-test : String
-test =
-    Debug.todo ""
-    
+addUsersTableMigration : { name : String, statements : Array String }
+addUsersTableMigration =
+    { name = "Add users table"
+    , statements = [ addUsersTableMigrationSQL ]
+    }
 
-{-| The migration necessary to support basic authentication.
+
+{-| Migration SQL for adding a users table for this package
+to interact with.
 -}
-migration : String
-migration =
-    -- Add user table
-    -- Add audits table
-    Debug.todo ""
+addUsersTableMigrationSQL : String
+addUsersTableMigrationSQL =
+    """
+    CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+
+
+{-| Query the live `users` table schema.
+
+Pair with `Sqlite.getAll` to get an `Array Utils.Sqlite.PragmaTableXInfo.Column`
+to compare against the minimum shape required by this package.
+-}
+getUserTableSchema : Sqlite.Query Utils.Sqlite.PragmaTableXInfo.Column
+getUserTableSchema =
+    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "users"
+
+
+{-| The columns the `users` table must contain for this package to function.
+
+Consumers can extend the table with additional columns; only these names are
+checked for presence.
+-}
+requiredUsersColumns : Array String
+requiredUsersColumns =
+    [ "id", "created_at", "updated_at" ]
+
+
+{-| Failure modes when validating the live `users` table shape.
+-}
+type SchemaCheckError
+    = MissingRequiredColumns (Array String)
+    | SchemaQueryFailed Sqlite.Error
+
+
+{-| Confirm the live `users` table has every column this package depends on.
+
+Run as part of application initiation. Succeeds with `{}` when every name in
+`requiredUsersColumns` is present in the live table; fails with
+`MissingRequiredColumns` carrying the names of the missing columns (in the
+order declared by `requiredUsersColumns`).
+-}
+checkUsersTableSchema : Sqlite.Database -> Task SchemaCheckError {}
+checkUsersTableSchema db =
+    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "users"
+        |> Sqlite.getAll db 
+        |> Task.mapError SchemaQueryFailed
+        |> Task.andThen
+            (\columns ->
+                let
+                    presentNames =
+                        Array.map .name columns
+
+                    missing =
+                        Array.keepIf
+                            (\required -> not (Array.member required presentNames))
+                            requiredUsersColumns
+                in
+                if Array.isEmpty missing then
+                    Task.succeed {}
+
+                else
+                    Task.fail (MissingRequiredColumns missing)
+            )
+
+
+
+---
+
+
+{-|-}
+addSessionsTableMigration : { name : String, statements : Array String }
+addSessionsTableMigration =
+    { name = "Add sessions table"
+    , statements = [ addSessionsTableMigrationSql ]
+    }
+
+
+{-|-}
+addSessionsTableMigrationSql : String
+addSessionsTableMigrationSql =
+    """
+    CREATE TABLE IF NOT EXISTS sessions
+    """
+
+
+
+---
+
+
+{-|-}
+addAuthEventsTableMigration : { name : String, statements : Array String }
+addAuthEventsTableMigration =
+    { name = "Add auth_events table"
+    , statements = [ addSessionsTableMigrationSql ]
+    }
+
+
+{-|-}
+addAuthEventsTableMigrationSql : String
+addAuthEventsTableMigrationSql =
+    """
+    CREATE TABLE IF NOT EXISTS auth_events
+    """
