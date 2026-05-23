@@ -112,27 +112,8 @@ Run as part of application initiation. Succeeds with `{}` when every name in
 order declared by `requiredUsersColumns`).
 -}
 checkUsersTableSchema : Sqlite.Database -> Task SchemaCheckError {}
-checkUsersTableSchema db =
-    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "users"
-        |> Sqlite.getAll db 
-        |> Task.mapError SchemaQueryFailed
-        |> Task.andThen
-            (\columns ->
-                let
-                    presentNames =
-                        Array.map .name columns
-
-                    missing =
-                        Array.keepIf
-                            (\required -> not (Array.member required presentNames))
-                            requiredUsersColumns
-                in
-                if Array.isEmpty missing then
-                    Task.succeed {}
-
-                else
-                    Task.fail (MissingRequiredColumns missing)
-            )
+checkUsersTableSchema =
+    checkTableSchema "users" requiredUsersColumns
 
 
 
@@ -178,27 +159,8 @@ requiredSessionsColumns =
 {-| Confirm the live `sessions` table has every column this package depends on.
 -}
 checkSessionsTableSchema : Sqlite.Database -> Task SchemaCheckError {}
-checkSessionsTableSchema db =
-    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "sessions"
-        |> Sqlite.getAll db
-        |> Task.mapError SchemaQueryFailed
-        |> Task.andThen
-            (\columns ->
-                let
-                    presentNames =
-                        Array.map .name columns
-
-                    missing =
-                        Array.keepIf
-                            (\required -> not (Array.member required presentNames))
-                            requiredSessionsColumns
-                in
-                if Array.isEmpty missing then
-                    Task.succeed {}
-
-                else
-                    Task.fail (MissingRequiredColumns missing)
-            )
+checkSessionsTableSchema =
+    checkTableSchema "sessions" requiredSessionsColumns
 
 
 
@@ -250,8 +212,23 @@ requiredAuthEventsColumns =
 {-| Confirm the live `auth_events` table has every column this package depends on.
 -}
 checkAuthEventsTableSchema : Sqlite.Database -> Task SchemaCheckError {}
-checkAuthEventsTableSchema db =
-    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "auth_events"
+checkAuthEventsTableSchema =
+    checkTableSchema "auth_events" requiredAuthEventsColumns
+
+
+
+---
+
+
+{-| Shared body for the per-table `check*TableSchema` functions.
+
+Runs `PRAGMA table_info` on `tableName`, then fails with
+`MissingRequiredColumns` listing any names from `requiredColumns` that
+are absent from the live table (preserving the order given).
+-}
+checkTableSchema : String -> Array String -> Sqlite.Database -> Task SchemaCheckError {}
+checkTableSchema tableName requiredColumns db =
+    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery tableName
         |> Sqlite.getAll db
         |> Task.mapError SchemaQueryFailed
         |> Task.andThen
@@ -263,7 +240,7 @@ checkAuthEventsTableSchema db =
                     missing =
                         Array.keepIf
                             (\required -> not (Array.member required presentNames))
-                            requiredAuthEventsColumns
+                            requiredColumns
                 in
                 if Array.isEmpty missing then
                     Task.succeed {}
