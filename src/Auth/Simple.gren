@@ -69,7 +69,7 @@ to interact with.
 addUsersTableMigrationSQL : String
 addUsersTableMigrationSQL =
     """
-    CREATE TABLE users (
+    CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -156,7 +156,7 @@ deleting it, preserving the `auth_events` audit trail.
 addSessionsTableMigrationSql : String
 addSessionsTableMigrationSql =
     """
-    CREATE TABLE sessions (
+    CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -222,7 +222,7 @@ user. `ON DELETE SET NULL` preserves audit history when a user is purged.
 addAuthEventsTableMigrationSql : String
 addAuthEventsTableMigrationSql =
     """
-    CREATE TABLE auth_events (
+    CREATE TABLE IF NOT EXISTS auth_events (
         id TEXT PRIMARY KEY,
         user_id TEXT,
         event_type TEXT NOT NULL,
