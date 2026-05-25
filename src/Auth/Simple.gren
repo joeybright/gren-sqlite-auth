@@ -30,7 +30,7 @@ database.
 - `passwords`
 - `password_reset_tokens`
 -}
-    
+
 
 import Sqlite
 import Sqlite.Encode
@@ -39,28 +39,30 @@ import Task exposing (Task)
 import Utils.Sqlite.PragmaTableXInfo
 
 
+{-| Failure modes when validating the live `users` table shape.
+-}
+type SchemaCheckError
+    = MissingRequiredColumns (Array String)
+    | SchemaQueryFailed Sqlite.Error
+
+
 {-| The migration necessary to support basic authentication.
 
 This should be run prior to any authentication-specific migrations.
 -}
-migration : Array { name : String, statements : Array String }
-migration =
-    [ addUsersTableMigration
-    , addSessionsTableMigration
-    , addAuthEventsTableMigration
-    ]
-
-
-
----
-
-
-{-|-}
-addUsersTableMigration : { name : String, statements : Array String }
-addUsersTableMigration =
-    { name = "Add users table"
-    , statements = [ addUsersTableMigrationSQL ]
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Auth.Simple.migrationV1` - Add tables necessary for simple auth"
+    , statements = 
+        [ addUsersTableMigrationSQL
+        , addSessionsTableMigrationSql
+        , addAuthEventsTableMigrationSql
+        ]
     }
+
+
+
+--- `users` table
 
 
 {-| Migration SQL for adding a users table for this package
@@ -77,16 +79,6 @@ addUsersTableMigrationSQL =
     """
 
 
-{-| Query the live `users` table schema.
-
-Pair with `Sqlite.getAll` to get an `Array Utils.Sqlite.PragmaTableXInfo.Column`
-to compare against the minimum shape required by this package.
--}
-getUserTableSchema : Sqlite.Query Utils.Sqlite.PragmaTableXInfo.Column
-getUserTableSchema =
-    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "users"
-
-
 {-| The columns the `users` table must contain for this package to function.
 
 Consumers can extend the table with additional columns; only these names are
@@ -95,13 +87,6 @@ checked for presence.
 requiredUsersColumns : Array String
 requiredUsersColumns =
     [ "id", "created_at", "updated_at" ]
-
-
-{-| Failure modes when validating the live `users` table shape.
--}
-type SchemaCheckError
-    = MissingRequiredColumns (Array String)
-    | SchemaQueryFailed Sqlite.Error
 
 
 {-| Confirm the live `users` table has every column this package depends on.
@@ -117,15 +102,7 @@ checkUsersTableSchema =
 
 
 
----
-
-
-{-|-}
-addSessionsTableMigration : { name : String, statements : Array String }
-addSessionsTableMigration =
-    { name = "Add sessions table"
-    , statements = [ addSessionsTableMigrationSql ]
-    }
+--- `sessions` table
 
 
 {-| Migration SQL for adding a `sessions` table.
@@ -164,15 +141,7 @@ checkSessionsTableSchema =
 
 
 
----
-
-
-{-|-}
-addAuthEventsTableMigration : { name : String, statements : Array String }
-addAuthEventsTableMigration =
-    { name = "Add auth_events table"
-    , statements = [ addAuthEventsTableMigrationSql ]
-    }
+--- `auth_events` table
 
 
 {-| Migration SQL for adding an `auth_events` audit table.
@@ -195,13 +164,6 @@ addAuthEventsTableMigrationSql =
     """
 
 
-{-| Query the live `auth_events` table schema.
--}
-getAuthEventsTableSchema : Sqlite.Query Utils.Sqlite.PragmaTableXInfo.Column
-getAuthEventsTableSchema =
-    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "auth_events"
-
-
 {-| The columns the `auth_events` table must contain for this package to function.
 -}
 requiredAuthEventsColumns : Array String
@@ -217,7 +179,7 @@ checkAuthEventsTableSchema =
 
 
 
----
+--- Utilities
 
 
 {-| Shared body for the per-table `check*TableSchema` functions.
