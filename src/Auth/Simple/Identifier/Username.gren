@@ -1,0 +1,32 @@
+module Auth.Simple.Identifier.Username exposing ( .. )
+
+{-|-}
+
+import Identifier exposing ( Identifier )
+
+
+{-|-}
+test =
+    ""
+
+
+
+--- `username` table
+
+
+{-|-}
+addUsersTableMigrationSQL : String
+addUsersTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS usernames (
+        id TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE,
+        UNIQUE (normalized_username)
+    );
+    """

@@ -1,0 +1,30 @@
+module Auth.Simple.Identifier exposing ( Username(..), Email(..), Identifier, getUserById )
+
+{-| Various identifiers for 
+-}
+
+
+{-|-}
+type Username
+    = Username
+
+
+{-|-}
+type Email
+    = Email
+
+
+{-|-}
+type Identifier a
+    = Identifier String -- TODO: Flesh this out with a generic identifier data structure?
+
+
+
+--- username
+
+
+{-| Get a user by their username.
+-}
+getUserById : String -> Identifier Username
+getUserById userId =
+    Debug.todo ""
