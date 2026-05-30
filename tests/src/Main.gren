@@ -3,6 +3,9 @@ module Main exposing (main)
 {-|-}
 
 import Auth.Simple
+import Auth.Simple.UsernamePassword
+import Auth.Simple.Identifier.Username
+import Auth.Simple.Method.Password
 import Crypto
 import Expect
 import FileSystem

@@ -6,9 +6,20 @@ import Identifier exposing ( Identifier )
 
 
 {-|-}
-test =
-    ""
+migration : { v1 : { name : String, statements : Array String } }
+migration =
+    { v1 = migrationV1
+    }
 
+
+{-|-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Auth.Simple.Identifier.Username.migrationV1` - Add usernames table"
+    , statements =
+        [ addUsersTableMigrationSQL
+        ]
+    }
 
 
 --- `username` table
