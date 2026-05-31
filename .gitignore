@@ -2,3 +2,4 @@
 tests/app
 tests/test.sqlite
 .gren
+app.js
