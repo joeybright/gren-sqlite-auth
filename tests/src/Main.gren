@@ -20,7 +20,7 @@ main =
                     await "Get secure context for Crypto functions" Crypto.getSecureContext
                         (\secureContext ->
                             concat
-                                [ Tests.PhcString.tests secureContext
+                                [ Test.Runner.Effectful.wrap Tests.PhcString.tests
                                 ]
                         )
                         |> Test.Runner.Effectful.run env
