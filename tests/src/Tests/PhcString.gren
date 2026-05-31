@@ -7,21 +7,17 @@ Three groups:
   - **Positive shapes** — `parse` produces the expected record for
     every spec-legal shape. Salt and hash come back already padded
     to standard base64.
-  - **Basic failures** — inputs the parser rejects with a typed
-    [`Error`](Auth-Simple-Method-Password-PhcString#Error).
-  - **Insidious behaviour** — inputs where the structural parser
-    can't tell what the user meant. With auto-padding, several of
-    these now surface as `InvalidB64Length` instead of silent
-    miscategorisation. The base64-`=`-in-salt case still slips
-    through because the structural parser sees `=` as a kv
-    terminator before the padding step ever runs; the test pins
-    the current behaviour.
+  - **Basic failures** — malformed grammar and PHC character-set
+    violations are rejected with typed
+    [`Error`](Auth-Simple-Method-Password-PhcString#Error) values.
+  - **Insidious behaviour** — inputs the old terminator-driven parser
+    used to miscategorise are now rejected as structural PHC errors
+    before the padding step can mask them.
 -}
 
 import Auth.Simple.Method.Password.PhcString as Phc
 import Dict
 import Expect
-import String
 import Test exposing (Test, concat, describe, test)
 
 
@@ -175,8 +171,8 @@ roundTrip =
         ]
 
 
-{-| Three minimum-effort malformations the parser rejects with a
-typed `Error` variant.
+{-| Minimum-effort malformations the parser rejects with typed `Error`
+variants.
 -}
 basicFailures : Test
 basicFailures =
@@ -186,85 +182,72 @@ basicFailures =
                 Phc.parse ""
                     |> Expect.equal (Err Phc.EmptyInput)
             )
-        , test "rejects input that does not start with '$' with ParseFailed"
+        , test "rejects input that does not start with '$' with MissingLeadingDollar"
             (\_ ->
                 Phc.parse "argon2id$v=19$m=1$salt$hash"
-                    |> Expect.equal
-                        (Err (Phc.ParseFailed "1| argon2id$v=19$m=1$salt$hash\n   ^\n\nUnexpected char"))
+                    |> Expect.equal (Err Phc.MissingLeadingDollar)
             )
-        , test "rejects a kv pair after a comma missing its '=' with ParseFailed"
+        , test "rejects a kv pair after a comma missing its '=' with KvPairMissingEquals"
             (\_ ->
                 Phc.parse "$argon2id$m=65536,broken$gZiV$abcd"
-                    |> Expect.equal
-                        (Err
-                            (Phc.ParseFailed
-                                ("1| $argon2id$m=65536,broken$gZiV$abcd\n"
-                                    ++ String.repeat 27 " "
-                                    ++ "^\n\nUnexpected char"
-                                )
-                            )
-                        )
+                    |> Expect.equal (Err (Phc.KvPairMissingEquals "broken"))
+            )
+        , test "rejects an identifier outside the PHC id alphabet"
+            (\_ ->
+                Phc.parse "$Argon2id"
+                    |> Expect.equal (Err (Phc.InvalidId "Argon2id"))
+            )
+        , test "rejects a version mixed into a comma-separated param segment"
+            (\_ ->
+                Phc.parse "$argon2id$v=19,m=65536"
+                    |> Expect.equal (Err (Phc.InvalidVersionSegment "19"))
+            )
+        , test "rejects base64 padding characters in the hash"
+            (\_ ->
+                Phc.parse "$argon2id$gZiV$abcd="
+                    |> Expect.equal (Err (Phc.InvalidHash "abcd="))
             )
         ]
 
 
-{-| Cases where the structural parser misidentifies what's salt and
-what's a kv-pair. Auto-padding now turns the trailing-`$` and
-kv-name-typo cases into typed `InvalidB64Length` errors instead of
-silent miscategorisations.
+{-| Cases the old structural parser misidentified before auto-padding
+had enough context to reject them.
 -}
 insidiousBehaviour : Test
 insidiousBehaviour =
     describe "PhcString.parse — insidious behaviour"
-        [ test "base64 padding inside the salt is still misread as a kv pair"
-            -- Spec-conforming PHC strings never contain `=` outside
-            -- kv pairs, so this case only arises from a non-spec
-            -- producer. The structural parser sees `=` and treats
-            -- the segment as a kv name before auto-padding ever
-            -- gets a chance to look at the salt. Pinned as a
-            -- tripwire if the parsing strategy ever changes.
+        [ test "rejects base64 padding inside a would-be salt"
+            -- `=` forces the segment down the kv path. The would-be
+            -- param name contains uppercase letters, which are invalid
+            -- for PHC parameter names, so this no longer becomes a
+            -- silent parameter/salt miscategorisation.
             (\_ ->
                 Phc.parse "$argon2id$YWJjZA==$abcd"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.singleton "YWJjZA" "="
-                            , tail = Phc.SaltOnly "abcd"
-                            }
-                        )
+                    |> Expect.equal (Err (Phc.InvalidKvName "YWJjZA"))
             )
-        , test "a kv-name typo (missing '=value') is caught by auto-padding"
+        , test "a kv-name typo (missing '=value') is caught as an extra segment"
             -- Was: silently absorbed as salt, mangling the real
-            -- salt/hash. Now: the structurally-misidentified hash
-            -- `"realsalt$realhash"` has length 17 mod 4 == 1, so
-            -- auto-padding rejects it.
+            -- salt/hash. Now: the parser accepts `broken` as salt,
+            -- `realsalt` as hash, then rejects the extra segment.
             (\_ ->
                 Phc.parse "$argon2id$v=19$broken$realsalt$realhash"
-                    |> Expect.equal (Err (Phc.InvalidB64Length "realsalt$realhash"))
+                    |> Expect.equal (Err (Phc.UnexpectedSegmentAfterHash "realhash"))
             )
         , test "a comma inside a kv value breaks the parse"
             -- `,` is the kv-pair separator inside a segment, so a
             -- value containing a literal `,` truncates the value
             -- and leaves the trailing `b` in AfterComma position
-            -- with no `=`, failing at col 19.
+            -- with no `=`, surfacing as KvPairMissingEquals.
             (\_ ->
                 Phc.parse "$argon2id$data=a,b$salt$hash"
-                    |> Expect.equal
-                        (Err
-                            (Phc.ParseFailed
-                                ("1| $argon2id$data=a,b$salt$hash\n"
-                                    ++ String.repeat 21 " "
-                                    ++ "^\n\nUnexpected char"
-                                )
-                            )
-                        )
+                    |> Expect.equal (Err (Phc.KvPairMissingEquals "b"))
             )
-        , test "a trailing '$' after the hash is caught by auto-padding"
+        , test "a trailing '$' after the hash is caught as an extra segment"
             -- Was: silently absorbed into the hash value (`abcd$`).
-            -- Now: the hash chunk length 5 mod 4 == 1, so
-            -- auto-padding rejects it.
+            -- Now: `$` after the hash terminates the hash and starts
+            -- an impossible extra segment.
             (\_ ->
                 Phc.parse "$argon2id$gZiV$abcd$"
-                    |> Expect.equal (Err (Phc.InvalidB64Length "abcd$"))
+                    |> Expect.equal (Err (Phc.UnexpectedSegmentAfterHash ""))
             )
         ]
