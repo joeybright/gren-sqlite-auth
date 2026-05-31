@@ -11,12 +11,10 @@ password hashes such as Argon2 output.
 
 The spec lives at <https://github.com/P-H-C/phc-string-format>.
 
-This module's job is *string → structured data* plus PHC-level
-structural validation. It checks segment order, identifier/name
-alphabets, name length limits, version placement, version digits, PHC
-field alphabets, and B64 padding length. It deliberately does not check
-function-specific duties such as Argon2 parameter ordering, salt length,
-or hash output length. Duplicate parameter names are collapsed by the
+This module's job is *string → structured data*. It deliberately does no
+semantic validation: charset rules, length limits, base64 well-formedness,
+duplicate-name checks, and algorithm-specific requirements are the
+consumer's responsibility. Duplicate parameter names are collapsed by the
 underlying `Dict`. The version (`v=<n>`) lives in `params` under the key
 `"v"`.
 
@@ -26,9 +24,7 @@ to the next `$`, `=`, or `,` (or end of input) and let the next
 character decide the transition.
 -}
 
-import Char
 import Dict exposing (Dict)
-import Math
 import Maybe exposing (Maybe(..))
 import Result exposing (Result(..))
 import String
@@ -53,34 +49,9 @@ type alias PhcString =
   - `EmptyInput` — the input was empty.
   - `MissingLeadingDollar` — the input is non-empty but doesn't
     start with `$`.
-  - `InvalidId` — the function identifier was empty or contained a
-    character outside `[a-z0-9-]`.
-  - `IdTooLong` — the function identifier exceeded the PHC limit of
-    32 characters.
   - `KvPairMissingEquals` — inside a comma-separated kv segment a
     pair was missing its `=`; the wrapped string is the offending
     chunk.
-  - `InvalidKvName` — a parameter name was empty, used invalid
-    characters, or used the reserved name `v` outside the version
-    segment.
-  - `KvNameTooLong` — a parameter name exceeded the PHC limit of 32
-    characters.
-  - `InvalidVersion` — the `v=<version>` segment had an empty or
-    non-decimal version.
-  - `InvalidVersionSegment` — the version was mixed into a
-    comma-separated parameter segment instead of appearing as its own
-    `$v=<version>` segment.
-  - `InvalidKvValue` — a parameter value contained a character outside
-    `[a-zA-Z0-9/+.-]`.
-  - `InvalidSalt` — the salt contained a character outside
-    `[a-zA-Z0-9/+.-]`.
-  - `InvalidHash` — the hash contained a character outside
-    `[a-zA-Z0-9/+.-]`.
-  - `UnexpectedSegmentAfterHash` — a `$` appeared after the hash
-    segment.
-  - `InvalidB64Length` — after parsing, the salt or hash chunk had
-    a length whose `mod 4` is 1, which the PHC spec says is never
-    a valid B64 output. The wrapped string is the offending chunk.
   - `UnexpectedParseFailure` — defensive catch-all for parser
     dead-ends that do not map to a public error; should never fire
     given the current parser.
@@ -88,18 +59,7 @@ type alias PhcString =
 type Error
     = EmptyInput
     | MissingLeadingDollar
-    | InvalidId String
-    | IdTooLong String
     | KvPairMissingEquals String
-    | InvalidKvName String
-    | KvNameTooLong String
-    | InvalidVersion String
-    | InvalidVersionSegment String
-    | InvalidKvValue { name : String, value : String }
-    | InvalidSalt String
-    | InvalidHash String
-    | UnexpectedSegmentAfterHash String
-    | InvalidB64Length String
     | UnexpectedParseFailure String
 
 
@@ -118,9 +78,7 @@ type Tail
 
 
 {-| Parse a PHC string into a structured [`PhcString`](#PhcString)
-record. The salt and hash inside the returned `tail` are
-auto-padded back to standard base64 so the caller can feed them
-straight to any base64 decoder.
+record. Salt and hash chunks are returned exactly as parsed.
 
     parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
 -}
@@ -132,7 +90,6 @@ parse input =
     else
         Parser.run phcParser {} input
             |> Result.mapError deadEndsToError
-            |> Result.andThen padTail
 
 
 unexpectedEnd : Error
@@ -168,58 +125,6 @@ isDomainDeadEnd de =
 
         _ ->
             True
-
-
-{-| Walk a freshly-parsed `PhcString` and pad the salt/hash strings
-back to standard base64. Fails with [`InvalidB64Length`](#Error) if
-either chunk has length `mod 4 == 1`.
--}
-padTail : PhcString -> Result Error PhcString
-padTail phc =
-    when phc.tail is
-        NoTail ->
-            Ok phc
-
-        SaltOnly s ->
-            padB64 s
-                |> Result.map (\padded -> { phc | tail = SaltOnly padded })
-
-        SaltAndHash r ->
-            padB64 r.salt
-                |> Result.andThen
-                    (\saltPadded ->
-                        padB64 r.hash
-                            |> Result.map
-                                (\hashPadded ->
-                                    { phc
-                                        | tail =
-                                            SaltAndHash
-                                                { salt = saltPadded
-                                                , hash = hashPadded
-                                                }
-                                    }
-                                )
-                    )
-
-
-{-| Append the `=` padding that the PHC B64 spec strips, so the
-result is valid standard base64. Returns [`InvalidB64Length`](#Error)
-if the input length mod 4 is 1.
--}
-padB64 : String -> Result Error String
-padB64 base64String =
-    let
-        mod =
-            Math.modBy 4 (String.unitLength base64String)
-    in
-    if mod == 1 then
-        Err (InvalidB64Length base64String)
-
-    else if mod == 0 then
-        Ok base64String
-
-    else
-        Ok (base64String ++ String.repeat (4 - mod) "=")
 
 
 {-| Encode a [`PhcString`](#PhcString) record back into its canonical
@@ -295,136 +200,14 @@ type alias PhcParser a =
     Parser.Parser {} Error a
 
 
-{-| Loop state. Each variant carries exactly the fields that have
-already been parsed when the state is entered.
-
-`ReadingKvPair`'s `ctx` distinguishes the start of a fresh kv-segment
-(where the chunk could still turn out to be the salt) from a
-continuation after `,` (where the chunk must be a kv-name).
+{-| Loop state. Each variant carries the fields already parsed when the
+state is entered.
 -}
 type LoopState
-    = ReadingId
-    | ReadingKvPair { id : String, params : Dict String String, ctx : KvContext }
-    | ReadingHash { id : String, params : Dict String String, salt : String }
-
-
-{-| Whether `ReadingKvPair` was just entered at the start of a fresh
-kv-segment or after a comma inside one.
--}
-type KvContext
-    = StartOfSegment
-    | AfterComma
-
-
-maxNameLength : Int
-maxNameLength =
-    32
-
-
-fromResult : Result Error a -> PhcParser a
-fromResult result =
-    when result is
-        Ok value ->
-            Parser.succeed value
-
-        Err problem ->
-            Parser.problem problem
-
-
-validateId : String -> Result Error {}
-validateId id =
-    if String.isEmpty id then
-        Err (InvalidId id)
-
-    else if String.unitLength id > maxNameLength then
-        Err (IdTooLong id)
-
-    else if String.all isPhcNameChar id then
-        Ok {}
-
-    else
-        Err (InvalidId id)
-
-
-validateKv : Bool -> String -> String -> Result Error {}
-validateKv isVersionPosition name value =
-    when validateKvName isVersionPosition name is
-        Err problem ->
-            Err problem
-
-        Ok _ ->
-            if name == "v" then
-                validateVersion value
-
-            else
-                validateKvValue name value
-
-
-validateKvName : Bool -> String -> Result Error {}
-validateKvName isVersionPosition name =
-    if String.isEmpty name then
-        Err (InvalidKvName name)
-
-    else if String.unitLength name > maxNameLength then
-        Err (KvNameTooLong name)
-
-    else if not (String.all isPhcNameChar name) then
-        Err (InvalidKvName name)
-
-    else if name == "v" && not isVersionPosition then
-        Err (InvalidKvName name)
-
-    else
-        Ok {}
-
-
-validateVersion : String -> Result Error {}
-validateVersion version =
-    if String.isEmpty version then
-        Err (InvalidVersion version)
-
-    else if String.all Char.isDigit version then
-        Ok {}
-
-    else
-        Err (InvalidVersion version)
-
-
-validateKvValue : String -> String -> Result Error {}
-validateKvValue name value =
-    if String.all isPhcValueChar value then
-        Ok {}
-
-    else
-        Err (InvalidKvValue { name = name, value = value })
-
-
-validateSalt : String -> Result Error {}
-validateSalt salt =
-    if String.all isPhcValueChar salt then
-        Ok {}
-
-    else
-        Err (InvalidSalt salt)
-
-
-validateHash : String -> Result Error {}
-validateHash hash =
-    if String.all isPhcValueChar hash then
-        Ok {}
-
-    else
-        Err (InvalidHash hash)
-
-
-isPhcNameChar : Char -> Bool
-isPhcNameChar c =
-    Char.isLower c || Char.isDigit c || c == '-'
-
-
-isPhcValueChar : Char -> Bool
-isPhcValueChar c =
-    Char.isAlphaNum c || c == '/' || c == '+' || c == '.' || c == '-'
+    = ParsingId
+    | ParsingParamOrSalt { id : String, params : Dict String String }
+    | ParsingKvPairAfterComma { id : String, params : Dict String String }
+    | ParsingHash { id : String, params : Dict String String, salt : String }
 
 
 {-| Top-level parser: consume the leading `$`, then drive the state
@@ -435,192 +218,162 @@ phcParser : PhcParser PhcString
 phcParser =
     Parser.succeed identity
         |> Parser.skip (Parser.chompChar '$' MissingLeadingDollar)
-        |> Parser.keep (Parser.loop ReadingId step)
+        |> Parser.keep (Parser.loop ParsingId step)
 
 
-{-| One step of the loop. Dispatches to the per-state reader so each
+{-| One step of the loop. Dispatches to the per-state parser so each
 state's logic can be read (and reviewed) in isolation.
 -}
 step : LoopState -> PhcParser (Step LoopState PhcString)
 step state =
     when state is
-        ReadingId ->
-            readId
+        ParsingId ->
+            parseId
 
-        ReadingKvPair r ->
-            when r.ctx is
-                StartOfSegment ->
-                    readKvPairStart { id = r.id, params = r.params }
+        ParsingParamOrSalt r ->
+            parseParamOrSalt { id = r.id, params = r.params }
 
-                AfterComma ->
-                    readKvPairAfterComma { id = r.id, params = r.params }
+        ParsingKvPairAfterComma r ->
+            parseKvPairAfterComma { id = r.id, params = r.params }
 
-        ReadingHash r ->
-            readHash r
+        ParsingHash r ->
+            parseHash r
 
 
-{-| Read the identifier segment. Terminates on `$` (kv section
+{-| Parse the identifier segment. Terminates on `$` (kv section
 follows) or end of input (id-only string).
 -}
-readId : PhcParser (Step LoopState PhcString)
-readId =
+parseId : PhcParser (Step LoopState PhcString)
+parseId =
     Parser.getChompedString (Parser.chompUntilEndOr "$")
         |> Parser.andThen
             (\id ->
-                fromResult (validateId id)
-                    |> Parser.andThen
-                        (\_ ->
-                            Parser.oneOf
-                                [ Parser.chompChar '$' unexpectedEnd
-                                    |> Parser.map
-                                        (\_ ->
-                                            Loop
-                                                (ReadingKvPair
-                                                    { id = id
-                                                    , params = Dict.empty
-                                                    , ctx = StartOfSegment
-                                                    }
-                                                )
-                                        )
-                                , Parser.end unexpectedEnd
-                                    |> Parser.map
-                                        (\_ ->
-                                            Done
-                                                { id = id
-                                                , params = Dict.empty
-                                                , tail = NoTail
-                                                }
-                                        )
-                                ]
-                        )
-            )
-
-
-{-| Read at the start of a fresh kv segment. The chunk could be a
-kv-name (followed by `=`), the salt (followed by `$`), or the salt
-with no hash (followed by end of input).
--}
-readKvPairStart : { id : String, params : Dict String String } -> PhcParser (Step LoopState PhcString)
-readKvPairStart r =
-    Parser.getChompedString (Parser.chompWhile isNotKvNameTerminator)
-        |> Parser.andThen
-            (\chunk ->
-                let
-                    isVersionPosition =
-                        Dict.isEmpty r.params
-                in
                 Parser.oneOf
-                    [ Parser.chompChar '=' unexpectedEnd
-                        |> Parser.andThen
+                    [ Parser.chompChar '$' unexpectedEnd
+                        |> Parser.map
                             (\_ ->
-                                readKvValue
-                                    { id = r.id
-                                    , params = r.params
-                                    , name = chunk
-                                    , isVersionPosition = isVersionPosition
-                                    }
-                            )
-                    , Parser.chompChar '$' unexpectedEnd
-                        |> Parser.andThen
-                            (\_ ->
-                                fromResult (validateSalt chunk)
-                                    |> Parser.map
-                                        (\_ ->
-                                            Loop
-                                                (ReadingHash
-                                                    { id = r.id
-                                                    , params = r.params
-                                                    , salt = chunk
-                                                    }
-                                                )
-                                        )
+                                Loop
+                                    (ParsingParamOrSalt
+                                        { id = id
+                                        , params = Dict.empty
+                                        }
+                                    )
                             )
                     , Parser.end unexpectedEnd
-                        |> Parser.andThen
+                        |> Parser.map
                             (\_ ->
-                                fromResult (validateSalt chunk)
-                                    |> Parser.map
-                                        (\_ ->
-                                            Done
-                                                { id = r.id
-                                                , params = r.params
-                                                , tail = SaltOnly chunk
-                                                }
-                                        )
+                                Done
+                                    { id = id
+                                    , params = Dict.empty
+                                    , tail = NoTail
+                                    }
                             )
                     ]
             )
 
 
-{-| Read after a `,` inside a kv segment. The chunk must be a
+{-| Parse the next `$`-delimited segment after the identifier or after
+a previous kv segment.
+
+At this point PHC is intentionally ambiguous: `$name=value` starts a
+parameter segment, while `$salt` starts the tail. We resolve that by
+chomping until `=` or `$`:
+
+  - `=` means the chunk is a kv name, so parse the value.
+  - `$` means the chunk is the salt, and the next state parses the hash.
+  - end means the chunk is a salt with no hash.
+-}
+parseParamOrSalt : { id : String, params : Dict String String } -> PhcParser (Step LoopState PhcString)
+parseParamOrSalt r =
+    Parser.getChompedString (Parser.chompWhile isNotKvNameTerminator)
+        |> Parser.andThen
+            (\chunk ->
+                Parser.oneOf
+                    [ Parser.chompChar '=' unexpectedEnd
+                        |> Parser.andThen
+                            (\_ ->
+                                parseKvValue
+                                    { id = r.id
+                                    , params = r.params
+                                    , name = chunk
+                                    }
+                            )
+                    , Parser.chompChar '$' unexpectedEnd
+                        |> Parser.map
+                            (\_ ->
+                                Loop
+                                    (ParsingHash
+                                        { id = r.id
+                                        , params = r.params
+                                        , salt = chunk
+                                        }
+                                    )
+                            )
+                    , Parser.end unexpectedEnd
+                        |> Parser.map
+                            (\_ ->
+                                Done
+                                    { id = r.id
+                                    , params = r.params
+                                    , tail = SaltOnly chunk
+                                    }
+                            )
+                    ]
+            )
+
+
+{-| Parse after a `,` inside a kv segment. The chunk must be a
 kv-name, so only the `=` continuation is valid.
 -}
-readKvPairAfterComma : { id : String, params : Dict String String } -> PhcParser (Step LoopState PhcString)
-readKvPairAfterComma r =
+parseKvPairAfterComma : { id : String, params : Dict String String } -> PhcParser (Step LoopState PhcString)
+parseKvPairAfterComma r =
     Parser.getChompedString (Parser.chompWhile isNotKvNameTerminator)
         |> Parser.andThen
             (\chunk ->
                 Parser.chompChar '=' (KvPairMissingEquals chunk)
                     |> Parser.andThen
                         (\_ ->
-                            readKvValue
+                            parseKvValue
                                 { id = r.id
                                 , params = r.params
                                 , name = chunk
-                                , isVersionPosition = False
                                 }
                         )
             )
 
 
-{-| Read the hash segment. A following `$` is a structural error; PHC
-hash strings end after the hash output.
+{-| Parse the hash segment (everything remaining until end of input)
+and finish the parse.
 -}
-readHash : { id : String, params : Dict String String, salt : String } -> PhcParser (Step LoopState PhcString)
-readHash r =
-    Parser.getChompedString (Parser.chompWhile (\c -> c /= '$'))
+parseHash : { id : String, params : Dict String String, salt : String } -> PhcParser (Step LoopState PhcString)
+parseHash r =
+    Parser.getChompedString (Parser.chompWhile (\_ -> True))
         |> Parser.andThen
             (\hash ->
-                fromResult (validateHash hash)
-                    |> Parser.andThen
+                Parser.end unexpectedEnd
+                    |> Parser.map
                         (\_ ->
-                            Parser.oneOf
-                                [ Parser.chompChar '$' unexpectedEnd
-                                    |> Parser.andThen
-                                        (\_ ->
-                                            Parser.getChompedString (Parser.chompWhile (\_ -> True))
-                                                |> Parser.andThen
-                                                    (\extra ->
-                                                        Parser.problem (UnexpectedSegmentAfterHash extra)
-                                                    )
-                                        )
-                                , Parser.end unexpectedEnd
-                                    |> Parser.map
-                                        (\_ ->
-                                            Done
-                                                { id = r.id
-                                                , params = r.params
-                                                , tail = SaltAndHash { salt = r.salt, hash = hash }
-                                                }
-                                        )
-                                ]
+                            Done
+                                { id = r.id
+                                , params = r.params
+                                , tail = SaltAndHash { salt = r.salt, hash = hash }
+                                }
                         )
             )
 
 
-{-| After a `name=`, chomp the value chunk and dispatch on the
+{-| After a `name=`, parse the value chunk and dispatch on the
 character that followed: `,` for another kv pair in the same segment,
 `$` to leave the segment (either more kv or salt — same state
 re-disambiguates), or end of input to finish.
 -}
-readKvValue :
+parseKvValue :
     { id : String
     , params : Dict String String
     , name : String
-    , isVersionPosition : Bool
     }
     -> PhcParser (Step LoopState PhcString)
-readKvValue r =
+parseKvValue r =
     let
         isNotKvValueTerminator c =
             c /= ',' && c /= '$'
@@ -628,62 +381,34 @@ readKvValue r =
     Parser.getChompedString (Parser.chompWhile isNotKvValueTerminator)
         |> Parser.andThen
             (\value ->
-                fromResult (validateKv r.isVersionPosition r.name value)
-                    |> Parser.andThen
-                        (\_ ->
-                            let
-                                nextParams =
-                                    Dict.set r.name value r.params
-                            in
-                            if r.name == "v" then
-                                Parser.oneOf
-                                    [ Parser.chompChar '$' unexpectedEnd
-                                        |> Parser.map
-                                            (\_ ->
-                                                Loop
-                                                    (ReadingKvPair
-                                                        { id = r.id, params = nextParams, ctx = StartOfSegment }
-                                                    )
-                                            )
-                                    , Parser.end unexpectedEnd
-                                        |> Parser.map
-                                            (\_ ->
-                                                Done
-                                                    { id = r.id, params = nextParams, tail = NoTail }
-                                            )
-                                    , Parser.chompChar ',' unexpectedEnd
-                                        |> Parser.andThen
-                                            (\_ ->
-                                                Parser.problem (InvalidVersionSegment value)
-                                            )
-                                    ]
-
-                            else
-                                Parser.oneOf
-                                    [ Parser.chompChar ',' unexpectedEnd
-                                        |> Parser.map
-                                            (\_ ->
-                                                Loop
-                                                    (ReadingKvPair
-                                                        { id = r.id, params = nextParams, ctx = AfterComma }
-                                                    )
-                                            )
-                                    , Parser.chompChar '$' unexpectedEnd
-                                        |> Parser.map
-                                            (\_ ->
-                                                Loop
-                                                    (ReadingKvPair
-                                                        { id = r.id, params = nextParams, ctx = StartOfSegment }
-                                                    )
-                                            )
-                                    , Parser.end unexpectedEnd
-                                        |> Parser.map
-                                            (\_ ->
-                                                Done
-                                                    { id = r.id, params = nextParams, tail = NoTail }
-                                            )
-                                    ]
-                        )
+                let
+                    nextParams =
+                        Dict.set r.name value r.params
+                in
+                Parser.oneOf
+                    [ Parser.chompChar ',' unexpectedEnd
+                        |> Parser.map
+                            (\_ ->
+                                Loop
+                                    (ParsingKvPairAfterComma
+                                        { id = r.id, params = nextParams }
+                                    )
+                            )
+                    , Parser.chompChar '$' unexpectedEnd
+                        |> Parser.map
+                            (\_ ->
+                                Loop
+                                    (ParsingParamOrSalt
+                                        { id = r.id, params = nextParams }
+                                    )
+                            )
+                    , Parser.end unexpectedEnd
+                        |> Parser.map
+                            (\_ ->
+                                Done
+                                    { id = r.id, params = nextParams, tail = NoTail }
+                            )
+                    ]
             )
 
 

@@ -5,14 +5,12 @@ module Tests.PhcString exposing (tests)
 Three groups:
 
   - **Positive shapes** — `parse` produces the expected record for
-    every spec-legal shape. Salt and hash come back already padded
-    to standard base64.
-  - **Basic failures** — malformed grammar and PHC character-set
-    violations are rejected with typed
+    every supported structural shape. Salt and hash are returned as
+    parsed.
+  - **Basic failures** — malformed delimiters are rejected with typed
     [`Error`](Auth-Simple-Method-Password-PhcString#Error) values.
-  - **Insidious behaviour** — inputs the old terminator-driven parser
-    used to miscategorise are now rejected as structural PHC errors
-    before the padding step can mask them.
+  - **Permissive behaviour** — inputs that need semantic validation are
+    still transformed into structured data for callers to validate.
 -}
 
 import Auth.Simple.Method.Password.PhcString as Phc
@@ -30,18 +28,17 @@ tests =
         [ positiveShapes
         , roundTrip
         , basicFailures
-        , insidiousBehaviour
+        , permissiveBehaviour
         ]
 
 
-{-| Structural shapes covered by the PHC spec, parsed to the
-expected record. Salt and hash are auto-padded to standard base64
-inside `tail`.
+{-| Structural shapes covered by the PHC spec, parsed to the expected
+record. Salt and hash are not validated or normalized.
 -}
 positiveShapes : Test
 positiveShapes =
     describe "PhcString.parse — positive shapes"
-        [ test "parses the canonical Argon2id example with padded salt/hash"
+        [ test "parses the canonical Argon2id example"
             (\_ ->
                 Phc.parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
                     |> Expect.equal
@@ -55,8 +52,8 @@ positiveShapes =
                                     |> Dict.set "p" "1"
                             , tail =
                                 Phc.SaltAndHash
-                                    { salt = "gZiV/M1gPc22ElAH/Jh1Hw=="
-                                    , hash = "CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno="
+                                    { salt = "gZiV/M1gPc22ElAH/Jh1Hw"
+                                    , hash = "CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
                                     }
                             }
                         )
@@ -120,14 +117,14 @@ positiveShapes =
                             }
                         )
             )
-        , test "auto-pads a length-mod-4 == 2 salt with '=='"
+        , test "keeps an unpadded salt exactly as parsed"
             (\_ ->
                 Phc.parse "$argon2id$gZiV/M1gPc22ElAH/Jh1Hw"
                     |> Expect.equal
                         (Ok
                             { id = "argon2id"
                             , params = Dict.empty
-                            , tail = Phc.SaltOnly "gZiV/M1gPc22ElAH/Jh1Hw=="
+                            , tail = Phc.SaltOnly "gZiV/M1gPc22ElAH/Jh1Hw"
                             }
                         )
             )
@@ -171,8 +168,8 @@ roundTrip =
         ]
 
 
-{-| Minimum-effort malformations the parser rejects with typed `Error`
-variants.
+{-| Minimum-effort delimiter malformations the parser rejects with typed
+`Error` variants.
 -}
 basicFailures : Test
 basicFailures =
@@ -192,46 +189,47 @@ basicFailures =
                 Phc.parse "$argon2id$m=65536,broken$gZiV$abcd"
                     |> Expect.equal (Err (Phc.KvPairMissingEquals "broken"))
             )
-        , test "rejects an identifier outside the PHC id alphabet"
-            (\_ ->
-                Phc.parse "$Argon2id"
-                    |> Expect.equal (Err (Phc.InvalidId "Argon2id"))
-            )
-        , test "rejects a version mixed into a comma-separated param segment"
-            (\_ ->
-                Phc.parse "$argon2id$v=19,m=65536"
-                    |> Expect.equal (Err (Phc.InvalidVersionSegment "19"))
-            )
-        , test "rejects base64 padding characters in the hash"
-            (\_ ->
-                Phc.parse "$argon2id$gZiV$abcd="
-                    |> Expect.equal (Err (Phc.InvalidHash "abcd="))
-            )
         ]
 
 
-{-| Cases the old structural parser misidentified before auto-padding
-had enough context to reject them.
+{-| Cases this module deliberately leaves to callers for semantic
+validation.
 -}
-insidiousBehaviour : Test
-insidiousBehaviour =
-    describe "PhcString.parse — insidious behaviour"
-        [ test "rejects base64 padding inside a would-be salt"
-            -- `=` forces the segment down the kv path. The would-be
-            -- param name contains uppercase letters, which are invalid
-            -- for PHC parameter names, so this no longer becomes a
-            -- silent parameter/salt miscategorisation.
+permissiveBehaviour : Test
+permissiveBehaviour =
+    describe "PhcString.parse — permissive behaviour"
+        [ test "parses an identifier without validating its alphabet"
+            (\_ ->
+                Phc.parse "$Argon2id"
+                    |> Expect.equal
+                        (Ok
+                            { id = "Argon2id"
+                            , params = Dict.empty
+                            , tail = Phc.NoTail
+                            }
+                        )
+            )
+        , test "base64 padding inside a would-be salt follows delimiter parsing"
             (\_ ->
                 Phc.parse "$argon2id$YWJjZA==$abcd"
-                    |> Expect.equal (Err (Phc.InvalidKvName "YWJjZA"))
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.singleton "YWJjZA" "="
+                            , tail = Phc.SaltOnly "abcd"
+                            }
+                        )
             )
-        , test "a kv-name typo (missing '=value') is caught as an extra segment"
-            -- Was: silently absorbed as salt, mangling the real
-            -- salt/hash. Now: the parser accepts `broken` as salt,
-            -- `realsalt` as hash, then rejects the extra segment.
+        , test "a kv-name typo is parsed as salt plus hash tail"
             (\_ ->
                 Phc.parse "$argon2id$v=19$broken$realsalt$realhash"
-                    |> Expect.equal (Err (Phc.UnexpectedSegmentAfterHash "realhash"))
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.singleton "v" "19"
+                            , tail = Phc.SaltAndHash { salt = "broken", hash = "realsalt$realhash" }
+                            }
+                        )
             )
         , test "a comma inside a kv value breaks the parse"
             -- `,` is the kv-pair separator inside a segment, so a
@@ -242,12 +240,26 @@ insidiousBehaviour =
                 Phc.parse "$argon2id$data=a,b$salt$hash"
                     |> Expect.equal (Err (Phc.KvPairMissingEquals "b"))
             )
-        , test "a trailing '$' after the hash is caught as an extra segment"
-            -- Was: silently absorbed into the hash value (`abcd$`).
-            -- Now: `$` after the hash terminates the hash and starts
-            -- an impossible extra segment.
+        , test "a trailing '$' after the hash is included in the hash"
             (\_ ->
                 Phc.parse "$argon2id$gZiV$abcd$"
-                    |> Expect.equal (Err (Phc.UnexpectedSegmentAfterHash ""))
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.empty
+                            , tail = Phc.SaltAndHash { salt = "gZiV", hash = "abcd$" }
+                            }
+                        )
+            )
+        , test "base64 padding characters in the hash are preserved"
+            (\_ ->
+                Phc.parse "$argon2id$gZiV$abcd="
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.empty
+                            , tail = Phc.SaltAndHash { salt = "gZiV", hash = "abcd=" }
+                            }
+                        )
             )
         ]
