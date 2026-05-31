@@ -2,45 +2,12 @@ module Main exposing (main)
 
 {-|-}
 
-import Auth.Simple
-import Auth.Simple.UsernamePassword
-import Auth.Simple.Identifier.Username
-import Auth.Simple.Method.Password
 import Crypto
-import Expect
 import FileSystem
-import FileSystem.Path
 import Init
 import Node
-import Sqlite
-import Sqlite.Migrate
-import Test.Runner.Effectful exposing ( test, describe, await, concat, wrap )
+import Test.Runner.Effectful exposing ( await, concat, wrap )
 import Tests.PhcString
-
-
-{-|-}
-migrationSmokeTest : FileSystem.Permission -> Sqlite.Migrate.Permissions -> Test.Runner.Effectful.Test
-migrationSmokeTest fileSystemPermission migratePermissions =
-    describe "Auth.Simple.migration"
-        [ await "Open ./test.sqlite"
-            (Sqlite.open fileSystemPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "./test.sqlite"))
-            (\db ->
-                await "Apply Auth.Simple.migration"
-                    (Sqlite.Migrate.migrate db migratePermissions Auth.Simple.migration)
-                    (\_ ->
-                        test "Runs without error"
-                            (\_ -> Expect.pass)
-                    )
-            )
-        ]
-
-
-{-| Pure parse tests for the PHC string format module, lifted into
-the effectful runner.
--}
-phcStringTests : Test.Runner.Effectful.Test
-phcStringTests =
-    wrap Tests.PhcString.tests
 
 
 {-|-}
@@ -49,14 +16,11 @@ main =
     Node.defineSimpleProgram
         (\env ->
             Init.await FileSystem.initialize
-                (\fileSystemPermission ->
+                (\_ ->
                     await "Get secure context for Crypto functions" Crypto.getSecureContext
                         (\secureContext ->
                             concat
-                                [ migrationSmokeTest
-                                    fileSystemPermission
-                                    { secureContext = secureContext }
-                                , phcStringTests
+                                [ Tests.PhcString.tests secureContext
                                 ]
                         )
                         |> Test.Runner.Effectful.run env

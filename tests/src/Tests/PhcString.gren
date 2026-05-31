@@ -1,265 +1,351 @@
 module Tests.PhcString exposing (tests)
 
 {-| Tests for `Auth.Simple.Method.Password.PhcString`.
-
-Three groups:
-
-  - **Positive shapes** — `parse` produces the expected record for
-    every supported structural shape. Salt and hash are returned as
-    parsed.
-  - **Basic failures** — malformed delimiters are rejected with typed
-    [`Error`](Auth-Simple-Method-Password-PhcString#Error) values.
-  - **Permissive behaviour** — inputs that need semantic validation are
-    still transformed into structured data for callers to validate.
 -}
 
-import Auth.Simple.Method.Password.PhcString as Phc
+import Auth.Simple.Method.Password.PhcString
+import Base64.Decode
+import Base64.Encode
+import Bytes exposing (Bytes)
+import Bytes.Encode
+import Crypto
 import Dict
 import Expect
-import Test exposing (Test, concat, describe, test)
+import Fuzz exposing (Fuzzer)
+import String
+import Test exposing (Test, describe, fuzzWith, noDistribution, test)
+import Test.Runner.Effectful
+import Math
 
 
-{-| Pure-test suite for the PHC string parser. Lifted into the
-effectful runner from `Main` via `Test.Runner.Effectful.wrap`.
+{-| Entry point for the PHC string tests. Takes the `SecureContext` (acquired in
+`Main`) so the effectful runner stays ready for future crypto-backed cases; the
+current tests are pure and are simply wrapped.
 -}
-tests : Test
-tests =
-    concat
-        [ positiveShapes
-        , roundTrip
-        , basicFailures
-        , permissiveBehaviour
+tests : Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests _ =
+    Test.Runner.Effectful.wrap allTests
+
+
+{-|-}
+allTests : Test
+allTests =
+    describe "Auth.Simple.Method.Password.PhcString"
+        [ describe "documented examples"
+            [ test "parses the canonical Argon2id example exactly"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
+                        |> Expect.equal
+                            (Ok
+                                { id = "argon2id"
+                                , params =
+                                    Dict.empty
+                                        |> Dict.set "v" "19"
+                                        |> Dict.set "m" "65536"
+                                        |> Dict.set "t" "2"
+                                        |> Dict.set "p" "1"
+                                , tail =
+                                    Auth.Simple.Method.Password.PhcString.SaltAndHash
+                                        { salt = "gZiV/M1gPc22ElAH/Jh1Hw"
+                                        , hash = "CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
+                                        }
+                                }
+                            )
+                )
+            , test "toString emits params in Dict order after version"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
+                        |> Result.map Auth.Simple.Method.Password.PhcString.toString
+                        |> Expect.equal
+                            (Ok "$argon2id$v=19$m=65536,p=1,t=2$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno")
+                )
+            , test "returns EmptyInput on empty input"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse ""
+                        |> Expect.equal (Err Auth.Simple.Method.Password.PhcString.EmptyInput)
+                )
+            ]
+        , describe "permissive parsing"
+            [ test "treats unpadded base64 with embedded '=' as a kv pair"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$YWJjZA==$abcd"
+                        |> Expect.equal
+                            (Ok
+                                { id = "argon2id"
+                                , params = Dict.singleton "YWJjZA" "="
+                                , tail = Auth.Simple.Method.Password.PhcString.SaltOnly "abcd"
+                                }
+                            )
+                )
+            , test "treats extra '$' inside hash as part of the hash"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$v=19$broken$realsalt$realhash"
+                        |> Expect.equal
+                            (Ok
+                                { id = "argon2id"
+                                , params = Dict.singleton "v" "19"
+                                , tail = Auth.Simple.Method.Password.PhcString.SaltAndHash { salt = "broken", hash = "realsalt$realhash" }
+                                }
+                            )
+                )
+            , test "preserves trailing '$' as part of the hash"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$gZiV$abcd$"
+                        |> Expect.equal
+                            (Ok
+                                { id = "argon2id"
+                                , params = Dict.empty
+                                , tail = Auth.Simple.Method.Password.PhcString.SaltAndHash { salt = "gZiV", hash = "abcd$" }
+                                }
+                            )
+                )
+            , test "preserves trailing '=' as part of the hash"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$gZiV$abcd="
+                        |> Expect.equal
+                            (Ok
+                                { id = "argon2id"
+                                , params = Dict.empty
+                                , tail = Auth.Simple.Method.Password.PhcString.SaltAndHash { salt = "gZiV", hash = "abcd=" }
+                                }
+                            )
+                )
+            ]
+        , describe "grg"
+            [ test "parses lone '$' as empty id with NoTail"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$"
+                        |> Expect.equal
+                            (Ok { id = "", params = Dict.empty, tail = Auth.Simple.Method.Password.PhcString.NoTail })
+                )
+            , test "parses '$$' as empty id with empty SaltOnly"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$$"
+                        |> Expect.equal
+                            (Ok { id = "", params = Dict.empty, tail = Auth.Simple.Method.Password.PhcString.SaltOnly "" })
+                )
+            , test "parses '$argon2id$' as id with empty SaltOnly"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$"
+                        |> Expect.equal
+                            (Ok { id = "argon2id", params = Dict.empty, tail = Auth.Simple.Method.Password.PhcString.SaltOnly "" })
+                )
+            , test "parses '$argon2id$$' as id with empty SaltAndHash"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$$"
+                        |> Expect.equal
+                            (Ok
+                                { id = "argon2id"
+                                , params = Dict.empty
+                                , tail = Auth.Simple.Method.Password.PhcString.SaltAndHash { salt = "", hash = "" }
+                                }
+                            )
+                )
+            ]
+        , describe "kv value boundary"
+            [ test "splits a kv pair on the first '=' only"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$argon2id$name=a=b$salt$hash"
+                        |> Expect.equal
+                            (Ok
+                                { id = "argon2id"
+                                , params = Dict.singleton "name" "a=b"
+                                , tail = Auth.Simple.Method.Password.PhcString.SaltAndHash { salt = "salt", hash = "hash" }
+                                }
+                            )
+                )
+            ]
+        , describe "toString"
+            [ test "emits id-only string for empty params and NoTail"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.toString
+                        { id = "argon2id", params = Dict.empty, tail = Auth.Simple.Method.Password.PhcString.NoTail }
+                        |> Expect.equal "$argon2id"
+                )
+            , test "emits version segment when only 'v' is present"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.toString
+                        { id = "argon2id"
+                        , params = Dict.singleton "v" "19"
+                        , tail = Auth.Simple.Method.Password.PhcString.NoTail
+                        }
+                        |> Expect.equal "$argon2id$v=19"
+                )
+            , test "emits version before other params"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.toString
+                        { id = "argon2id"
+                        , params =
+                            Dict.empty
+                                |> Dict.set "v" "19"
+                                |> Dict.set "m" "65536"
+                        , tail = Auth.Simple.Method.Password.PhcString.NoTail
+                        }
+                        |> Expect.equal "$argon2id$v=19$m=65536"
+                )
+            , test "emits SaltOnly with a single trailing segment"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.toString
+                        { id = "argon2id", params = Dict.empty, tail = Auth.Simple.Method.Password.PhcString.SaltOnly "gZiV" }
+                        |> Expect.equal "$argon2id$gZiV"
+                )
+            , test "emits SaltAndHash with two trailing segments"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.toString
+                        { id = "argon2id"
+                        , params = Dict.empty
+                        , tail = Auth.Simple.Method.Password.PhcString.SaltAndHash { salt = "gZiV", hash = "CWOr" }
+                        }
+                        |> Expect.equal "$argon2id$gZiV$CWOr"
+                )
+            , test "strips trailing '=' padding from salt and hash"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.toString
+                        { id = "argon2id"
+                        , params = Dict.empty
+                        , tail = Auth.Simple.Method.Password.PhcString.SaltAndHash { salt = "gZiV==", hash = "CWOr=" }
+                        }
+                        |> Expect.equal "$argon2id$gZiV$CWOr"
+                )
+            ]
+        , describe "structural errors"
+            [ test "returns MissingLeadingDollar when the '$' prefix is absent"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "argon2id"
+                        |> Expect.equal (Err Auth.Simple.Method.Password.PhcString.MissingLeadingDollar)
+                )
+            , test "returns KvPairMissingEquals for a comma chunk without '='"
+                (\_ ->
+                    Auth.Simple.Method.Password.PhcString.parse "$id$m=65536,bad"
+                        |> Expect.equal (Err (Auth.Simple.Method.Password.PhcString.KvPairMissingEquals "bad"))
+                )
+            ]
+        , describe "base64 byte round-trip"
+            [ fuzzWith { runs = 20, distribution = noDistribution }
+                payloadFuzzer
+                "base64 payloads survive the PHC round-trip at the byte level"
+                expectBase64RoundTrip
+            ]
         ]
 
 
-{-| Structural shapes covered by the PHC spec, parsed to the expected
-record. Salt and hash are not validated or normalized.
+{-| A random byte (0 to 255) for building base64 payloads.
 -}
-positiveShapes : Test
-positiveShapes =
-    describe "PhcString.parse — positive shapes"
-        [ test "parses the canonical Argon2id example"
-            (\_ ->
-                Phc.parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params =
-                                Dict.empty
-                                    |> Dict.set "v" "19"
-                                    |> Dict.set "m" "65536"
-                                    |> Dict.set "t" "2"
-                                    |> Dict.set "p" "1"
-                            , tail =
-                                Phc.SaltAndHash
-                                    { salt = "gZiV/M1gPc22ElAH/Jh1Hw"
-                                    , hash = "CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
-                                    }
-                            }
-                        )
-            )
-        , test "parses an id-only string"
-            (\_ ->
-                Phc.parse "$argon2id"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.empty
-                            , tail = Phc.NoTail
-                            }
-                        )
-            )
-        , test "parses id + version"
-            (\_ ->
-                Phc.parse "$argon2id$v=19"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.singleton "v" "19"
-                            , tail = Phc.NoTail
-                            }
-                        )
-            )
-        , test "parses id + comma-separated params"
-            (\_ ->
-                Phc.parse "$argon2id$m=65536,t=2,p=1"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params =
-                                Dict.empty
-                                    |> Dict.set "m" "65536"
-                                    |> Dict.set "t" "2"
-                                    |> Dict.set "p" "1"
-                            , tail = Phc.NoTail
-                            }
-                        )
-            )
-        , test "parses id + salt that needs no padding (length mod 4 == 0)"
-            (\_ ->
-                Phc.parse "$argon2id$gZiV"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.empty
-                            , tail = Phc.SaltOnly "gZiV"
-                            }
-                        )
-            )
-        , test "parses id + salt + hash that need no padding"
-            (\_ ->
-                Phc.parse "$argon2id$gZiV$CWOr"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.empty
-                            , tail = Phc.SaltAndHash { salt = "gZiV", hash = "CWOr" }
-                            }
-                        )
-            )
-        , test "keeps an unpadded salt exactly as parsed"
-            (\_ ->
-                Phc.parse "$argon2id$gZiV/M1gPc22ElAH/Jh1Hw"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.empty
-                            , tail = Phc.SaltOnly "gZiV/M1gPc22ElAH/Jh1Hw"
-                            }
-                        )
-            )
-        ]
+byteFuzzer : Fuzzer Int
+byteFuzzer =
+    Fuzz.intRange 0 255
 
 
-{-| `toString` strips padding so its output is spec-conforming PHC.
-The full round-trip `parse → toString → parse` is the cleanest
-guarantee.
+{-| Random salt and hash byte payloads for the base64 round-trip test.
 -}
-roundTrip : Test
-roundTrip =
-    describe "PhcString — round-trip"
-        [ test "toString strips trailing '=' from a padded salt"
-            (\_ ->
-                Phc.toString
-                    { id = "argon2id"
-                    , params = Dict.empty
-                    , tail = Phc.SaltOnly "gZiV/M1gPc22ElAH/Jh1Hw=="
-                    }
-                    |> Expect.equal "$argon2id$gZiV/M1gPc22ElAH/Jh1Hw"
-            )
-        , test "parse |> toString on the canonical Argon2id sample produces a spec-conforming PHC string (params reordered alphabetically)"
-            (\_ ->
-                Phc.parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
-                    |> Result.map Phc.toString
-                    |> Expect.equal
-                        (Ok "$argon2id$v=19$m=65536,p=1,t=2$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno")
-            )
-        , test "parse |> toString |> parse yields the same PhcString"
-            (\_ ->
-                let
-                    input =
-                        "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
-                in
-                Phc.parse input
-                    |> Result.map Phc.toString
-                    |> Result.andThen Phc.parse
-                    |> Expect.equal (Phc.parse input)
-            )
-        ]
+payloadFuzzer : Fuzzer { salt : Array Int, hash : Array Int }
+payloadFuzzer =
+    Fuzz.map2
+        (\salt hash -> { salt = salt, hash = hash })
+        (Fuzz.arrayOfLengthBetween 1 32 byteFuzzer)
+        (Fuzz.arrayOfLengthBetween 1 48 byteFuzzer)
 
 
-{-| Minimum-effort delimiter malformations the parser rejects with typed
-`Error` variants.
+{-| Encode random bytes as base64, embed them as the salt and hash of a PHC
+string, round-trip through `toString`/`parse`, base64-decode the recovered
+payloads, and confirm the bytes are unchanged. Bytes are compared as canonical
+(padded) base64, a faithful proxy for byte equality.
 -}
-basicFailures : Test
-basicFailures =
-    describe "PhcString.parse — basic failures"
-        [ test "rejects empty input with EmptyInput"
-            (\_ ->
-                Phc.parse ""
-                    |> Expect.equal (Err Phc.EmptyInput)
+expectBase64RoundTrip : { salt : Array Int, hash : Array Int } -> Expect.Expectation
+expectBase64RoundTrip payload =
+    let
+        saltBytes =
+            bytesFromUInt8s payload.salt
+
+        hashBytes =
+            bytesFromUInt8s payload.hash
+    in
+    { id = "argon2id"
+    , params = Dict.empty
+    , tail =
+        Auth.Simple.Method.Password.PhcString.SaltAndHash
+            { salt = encodePhcBase64 saltBytes
+            , hash = encodePhcBase64 hashBytes
+            }
+    }
+        |> Auth.Simple.Method.Password.PhcString.toString
+        |> Auth.Simple.Method.Password.PhcString.parse
+        |> Result.mapError Debug.toString
+        |> Result.andThen
+            (\parsed ->
+                when parsed.tail is
+                    Auth.Simple.Method.Password.PhcString.SaltAndHash sh ->
+                        decodePhcBase64 sh.salt
+                            |> Result.andThen
+                                (\salt ->
+                                    decodePhcBase64 sh.hash
+                                        |> Result.map (\hash -> { salt = salt, hash = hash })
+                                )
+                                
+                    _ ->
+                        Err "expected a SaltAndHash tail"
             )
-        , test "rejects input that does not start with '$' with MissingLeadingDollar"
-            (\_ ->
-                Phc.parse "argon2id$v=19$m=1$salt$hash"
-                    |> Expect.equal (Err Phc.MissingLeadingDollar)
-            )
-        , test "rejects a kv pair after a comma missing its '=' with KvPairMissingEquals"
-            (\_ ->
-                Phc.parse "$argon2id$m=65536,broken$gZiV$abcd"
-                    |> Expect.equal (Err (Phc.KvPairMissingEquals "broken"))
-            )
-        ]
+        |> Expect.equal
+            (Ok { salt = encodeBase64 saltBytes, hash = encodeBase64 hashBytes })
 
 
-{-| Cases this module deliberately leaves to callers for semantic
-validation.
+{-| Re-pad a PHC base64 payload (`toString` strips `=`) and decode it back to
+canonical base64, so it can be compared byte-for-byte against the original.
 -}
-permissiveBehaviour : Test
-permissiveBehaviour =
-    describe "PhcString.parse — permissive behaviour"
-        [ test "parses an identifier without validating its alphabet"
-            (\_ ->
-                Phc.parse "$Argon2id"
-                    |> Expect.equal
-                        (Ok
-                            { id = "Argon2id"
-                            , params = Dict.empty
-                            , tail = Phc.NoTail
-                            }
-                        )
-            )
-        , test "base64 padding inside a would-be salt follows delimiter parsing"
-            (\_ ->
-                Phc.parse "$argon2id$YWJjZA==$abcd"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.singleton "YWJjZA" "="
-                            , tail = Phc.SaltOnly "abcd"
-                            }
-                        )
-            )
-        , test "a kv-name typo is parsed as salt plus hash tail"
-            (\_ ->
-                Phc.parse "$argon2id$v=19$broken$realsalt$realhash"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.singleton "v" "19"
-                            , tail = Phc.SaltAndHash { salt = "broken", hash = "realsalt$realhash" }
-                            }
-                        )
-            )
-        , test "a comma inside a kv value breaks the parse"
-            -- `,` is the kv-pair separator inside a segment, so a
-            -- value containing a literal `,` truncates the value
-            -- and leaves the trailing `b` in AfterComma position
-            -- with no `=`, surfacing as KvPairMissingEquals.
-            (\_ ->
-                Phc.parse "$argon2id$data=a,b$salt$hash"
-                    |> Expect.equal (Err (Phc.KvPairMissingEquals "b"))
-            )
-        , test "a trailing '$' after the hash is included in the hash"
-            (\_ ->
-                Phc.parse "$argon2id$gZiV$abcd$"
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.empty
-                            , tail = Phc.SaltAndHash { salt = "gZiV", hash = "abcd$" }
-                            }
-                        )
-            )
-        , test "base64 padding characters in the hash are preserved"
-            (\_ ->
-                Phc.parse "$argon2id$gZiV$abcd="
-                    |> Expect.equal
-                        (Ok
-                            { id = "argon2id"
-                            , params = Dict.empty
-                            , tail = Phc.SaltAndHash { salt = "gZiV", hash = "abcd=" }
-                            }
-                        )
-            )
-        ]
+decodePhcBase64 : String -> Result String String
+decodePhcBase64 payload =
+    payload
+        |> padBase64
+        |> Base64.Decode.bytes
+        |> Result.map encodeBase64
+        |> Result.mapError Debug.toString
+
+
+{-| Restore `=` padding to a base64 string so its length is a multiple of 4.
+-}
+padBase64 : String -> String
+padBase64 base64 =
+    if Math.modBy 4 (String.unitLength base64) == 0 then
+        base64
+
+    else
+        padBase64 (base64 ++ "=")
+
+
+{-| Pack an array of unsigned 8-bit values into `Bytes`.
+-}
+bytesFromUInt8s : Array Int -> Bytes
+bytesFromUInt8s bytes =
+    bytes
+        |> Array.map Bytes.Encode.unsignedInt8
+        |> Bytes.Encode.sequence
+        |> Bytes.Encode.encode
+
+
+{-| Standard (padded) base64 encoding of some `Bytes`.
+-}
+encodeBase64 : Bytes -> String
+encodeBase64 bytes =
+    bytes
+        |> Base64.Encode.bytes
+        |> Base64.Encode.encode
+
+
+{-| PHC-style base64 encoding: standard base64 with trailing `=` padding removed.
+-}
+encodePhcBase64 : Bytes -> String
+encodePhcBase64 bytes =
+    bytes
+        |> encodeBase64
+        |> stripTrailingEquals
+
+
+{-| Drop any trailing `=` padding characters from a string.
+-}
+stripTrailingEquals : String -> String
+stripTrailingEquals string =
+    if String.endsWith "=" string then
+        stripTrailingEquals (String.dropLast 1 string)
+
+    else
+        string
