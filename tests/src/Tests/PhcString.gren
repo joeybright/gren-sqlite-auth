@@ -1,0 +1,270 @@
+module Tests.PhcString exposing (tests)
+
+{-| Tests for `Auth.Simple.Method.Password.PhcString`.
+
+Three groups:
+
+  - **Positive shapes** — `parse` produces the expected record for
+    every spec-legal shape. Salt and hash come back already padded
+    to standard base64.
+  - **Basic failures** — inputs the parser rejects with a typed
+    [`Error`](Auth-Simple-Method-Password-PhcString#Error).
+  - **Insidious behaviour** — inputs where the structural parser
+    can't tell what the user meant. With auto-padding, several of
+    these now surface as `InvalidB64Length` instead of silent
+    miscategorisation. The base64-`=`-in-salt case still slips
+    through because the structural parser sees `=` as a kv
+    terminator before the padding step ever runs; the test pins
+    the current behaviour.
+-}
+
+import Auth.Simple.Method.Password.PhcString as Phc
+import Dict
+import Expect
+import String
+import Test exposing (Test, concat, describe, test)
+
+
+{-| Pure-test suite for the PHC string parser. Lifted into the
+effectful runner from `Main` via `Test.Runner.Effectful.wrap`.
+-}
+tests : Test
+tests =
+    concat
+        [ positiveShapes
+        , roundTrip
+        , basicFailures
+        , insidiousBehaviour
+        ]
+
+
+{-| Structural shapes covered by the PHC spec, parsed to the
+expected record. Salt and hash are auto-padded to standard base64
+inside `tail`.
+-}
+positiveShapes : Test
+positiveShapes =
+    describe "PhcString.parse — positive shapes"
+        [ test "parses the canonical Argon2id example with padded salt/hash"
+            (\_ ->
+                Phc.parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params =
+                                Dict.empty
+                                    |> Dict.set "v" "19"
+                                    |> Dict.set "m" "65536"
+                                    |> Dict.set "t" "2"
+                                    |> Dict.set "p" "1"
+                            , tail =
+                                Phc.SaltAndHash
+                                    { salt = "gZiV/M1gPc22ElAH/Jh1Hw=="
+                                    , hash = "CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno="
+                                    }
+                            }
+                        )
+            )
+        , test "parses an id-only string"
+            (\_ ->
+                Phc.parse "$argon2id"
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.empty
+                            , tail = Phc.NoTail
+                            }
+                        )
+            )
+        , test "parses id + version"
+            (\_ ->
+                Phc.parse "$argon2id$v=19"
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.singleton "v" "19"
+                            , tail = Phc.NoTail
+                            }
+                        )
+            )
+        , test "parses id + comma-separated params"
+            (\_ ->
+                Phc.parse "$argon2id$m=65536,t=2,p=1"
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params =
+                                Dict.empty
+                                    |> Dict.set "m" "65536"
+                                    |> Dict.set "t" "2"
+                                    |> Dict.set "p" "1"
+                            , tail = Phc.NoTail
+                            }
+                        )
+            )
+        , test "parses id + salt that needs no padding (length mod 4 == 0)"
+            (\_ ->
+                Phc.parse "$argon2id$gZiV"
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.empty
+                            , tail = Phc.SaltOnly "gZiV"
+                            }
+                        )
+            )
+        , test "parses id + salt + hash that need no padding"
+            (\_ ->
+                Phc.parse "$argon2id$gZiV$CWOr"
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.empty
+                            , tail = Phc.SaltAndHash { salt = "gZiV", hash = "CWOr" }
+                            }
+                        )
+            )
+        , test "auto-pads a length-mod-4 == 2 salt with '=='"
+            (\_ ->
+                Phc.parse "$argon2id$gZiV/M1gPc22ElAH/Jh1Hw"
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.empty
+                            , tail = Phc.SaltOnly "gZiV/M1gPc22ElAH/Jh1Hw=="
+                            }
+                        )
+            )
+        ]
+
+
+{-| `toString` strips padding so its output is spec-conforming PHC.
+The full round-trip `parse → toString → parse` is the cleanest
+guarantee.
+-}
+roundTrip : Test
+roundTrip =
+    describe "PhcString — round-trip"
+        [ test "toString strips trailing '=' from a padded salt"
+            (\_ ->
+                Phc.toString
+                    { id = "argon2id"
+                    , params = Dict.empty
+                    , tail = Phc.SaltOnly "gZiV/M1gPc22ElAH/Jh1Hw=="
+                    }
+                    |> Expect.equal "$argon2id$gZiV/M1gPc22ElAH/Jh1Hw"
+            )
+        , test "parse |> toString on the canonical Argon2id sample produces a spec-conforming PHC string (params reordered alphabetically)"
+            (\_ ->
+                Phc.parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
+                    |> Result.map Phc.toString
+                    |> Expect.equal
+                        (Ok "$argon2id$v=19$m=65536,p=1,t=2$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno")
+            )
+        , test "parse |> toString |> parse yields the same PhcString"
+            (\_ ->
+                let
+                    input =
+                        "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
+                in
+                Phc.parse input
+                    |> Result.map Phc.toString
+                    |> Result.andThen Phc.parse
+                    |> Expect.equal (Phc.parse input)
+            )
+        ]
+
+
+{-| Three minimum-effort malformations the parser rejects with a
+typed `Error` variant.
+-}
+basicFailures : Test
+basicFailures =
+    describe "PhcString.parse — basic failures"
+        [ test "rejects empty input with EmptyInput"
+            (\_ ->
+                Phc.parse ""
+                    |> Expect.equal (Err Phc.EmptyInput)
+            )
+        , test "rejects input that does not start with '$' with ParseFailed"
+            (\_ ->
+                Phc.parse "argon2id$v=19$m=1$salt$hash"
+                    |> Expect.equal
+                        (Err (Phc.ParseFailed "1| argon2id$v=19$m=1$salt$hash\n   ^\n\nUnexpected char"))
+            )
+        , test "rejects a kv pair after a comma missing its '=' with ParseFailed"
+            (\_ ->
+                Phc.parse "$argon2id$m=65536,broken$gZiV$abcd"
+                    |> Expect.equal
+                        (Err
+                            (Phc.ParseFailed
+                                ("1| $argon2id$m=65536,broken$gZiV$abcd\n"
+                                    ++ String.repeat 27 " "
+                                    ++ "^\n\nUnexpected char"
+                                )
+                            )
+                        )
+            )
+        ]
+
+
+{-| Cases where the structural parser misidentifies what's salt and
+what's a kv-pair. Auto-padding now turns the trailing-`$` and
+kv-name-typo cases into typed `InvalidB64Length` errors instead of
+silent miscategorisations.
+-}
+insidiousBehaviour : Test
+insidiousBehaviour =
+    describe "PhcString.parse — insidious behaviour"
+        [ test "base64 padding inside the salt is still misread as a kv pair"
+            -- Spec-conforming PHC strings never contain `=` outside
+            -- kv pairs, so this case only arises from a non-spec
+            -- producer. The structural parser sees `=` and treats
+            -- the segment as a kv name before auto-padding ever
+            -- gets a chance to look at the salt. Pinned as a
+            -- tripwire if the parsing strategy ever changes.
+            (\_ ->
+                Phc.parse "$argon2id$YWJjZA==$abcd"
+                    |> Expect.equal
+                        (Ok
+                            { id = "argon2id"
+                            , params = Dict.singleton "YWJjZA" "="
+                            , tail = Phc.SaltOnly "abcd"
+                            }
+                        )
+            )
+        , test "a kv-name typo (missing '=value') is caught by auto-padding"
+            -- Was: silently absorbed as salt, mangling the real
+            -- salt/hash. Now: the structurally-misidentified hash
+            -- `"realsalt$realhash"` has length 17 mod 4 == 1, so
+            -- auto-padding rejects it.
+            (\_ ->
+                Phc.parse "$argon2id$v=19$broken$realsalt$realhash"
+                    |> Expect.equal (Err (Phc.InvalidB64Length "realsalt$realhash"))
+            )
+        , test "a comma inside a kv value breaks the parse"
+            -- `,` is the kv-pair separator inside a segment, so a
+            -- value containing a literal `,` truncates the value
+            -- and leaves the trailing `b` in AfterComma position
+            -- with no `=`, failing at col 19.
+            (\_ ->
+                Phc.parse "$argon2id$data=a,b$salt$hash"
+                    |> Expect.equal
+                        (Err
+                            (Phc.ParseFailed
+                                ("1| $argon2id$data=a,b$salt$hash\n"
+                                    ++ String.repeat 21 " "
+                                    ++ "^\n\nUnexpected char"
+                                )
+                            )
+                        )
+            )
+        , test "a trailing '$' after the hash is caught by auto-padding"
+            -- Was: silently absorbed into the hash value (`abcd$`).
+            -- Now: the hash chunk length 5 mod 4 == 1, so
+            -- auto-padding rejects it.
+            (\_ ->
+                Phc.parse "$argon2id$gZiV$abcd$"
+                    |> Expect.equal (Err (Phc.InvalidB64Length "abcd$"))
+            )
+        ]

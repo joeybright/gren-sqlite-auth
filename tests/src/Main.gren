@@ -14,7 +14,8 @@ import Init
 import Node
 import Sqlite
 import Sqlite.Migrate
-import Test.Runner.Effectful exposing ( test, describe, await )
+import Test.Runner.Effectful exposing ( test, describe, await, concat, wrap )
+import Tests.PhcString
 
 
 {-|-}
@@ -34,6 +35,14 @@ migrationSmokeTest fileSystemPermission migratePermissions =
         ]
 
 
+{-| Pure parse tests for the PHC string format module, lifted into
+the effectful runner.
+-}
+phcStringTests : Test.Runner.Effectful.Test
+phcStringTests =
+    wrap Tests.PhcString.tests
+
+
 {-|-}
 main : Test.Runner.Effectful.Program a
 main =
@@ -43,9 +52,12 @@ main =
                 (\fileSystemPermission ->
                     await "Get secure context for Crypto functions" Crypto.getSecureContext
                         (\secureContext ->
-                            migrationSmokeTest
-                                fileSystemPermission
-                                { secureContext = secureContext }
+                            concat
+                                [ migrationSmokeTest
+                                    fileSystemPermission
+                                    { secureContext = secureContext }
+                                , phcStringTests
+                                ]
                         )
                         |> Test.Runner.Effectful.run env
                 )
