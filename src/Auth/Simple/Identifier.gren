@@ -4,6 +4,7 @@ module Auth.Simple.Identifier exposing ( Username(..), Email(..), Identifier, ge
 -}
 
 import Json.Decode
+import Task exposing ( Task )
 
 
 {-|-}
