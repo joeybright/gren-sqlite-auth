@@ -3,11 +3,13 @@ module Main exposing (main)
 {-|-}
 
 import Crypto
+import Expect
 import FileSystem
 import Init
 import Node
-import Test.Runner.Effectful exposing ( await, concat, wrap )
+import Test.Runner.Effectful exposing ( await, concat, test, wrap )
 import Tests.PhcString
+import Auth.Simple.UsernamePassword
 
 
 {-|-}
@@ -21,6 +23,14 @@ main =
                         (\secureContext ->
                             concat
                                 [ Test.Runner.Effectful.wrap Tests.PhcString.tests
+                                , await "Hash the password \"hello\""
+                                    (Auth.Simple.UsernamePassword.hashPassword "hello" secureContext)
+                                    (\hashedPassword ->
+                                        test "produces a non-empty PHC string"
+                                            (\_ ->
+                                                Expect.notEqual "" (Debug.log "hashed password" hashedPassword)
+                                            )
+                                    )
                                 ]
                         )
                         |> Test.Runner.Effectful.run env

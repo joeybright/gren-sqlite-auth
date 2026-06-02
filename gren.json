@@ -7,10 +7,12 @@
     "version": "1.0.0",
     "exposed-modules": [
         "Auth.Simple",
-        "Utils.Sqlite.PragmaTableXInfo"
+        "Utils.Sqlite.PragmaTableXInfo",
+        "Auth.Simple.UsernamePassword"
     ],
     "gren-version": "0.6.0 <= v < 0.7.0",
     "dependencies": {
+        "blaix/gren-base64": "2.0.0 <= v < 3.0.0",
         "gren-lang/core": "local:../gren-core",
         "gren-lang/node": "local:../node"
     }
