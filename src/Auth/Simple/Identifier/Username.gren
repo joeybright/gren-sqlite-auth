@@ -2,8 +2,6 @@ module Auth.Simple.Identifier.Username exposing ( .. )
 
 {-|-}
 
-import Identifier exposing ( Identifier )
-
 
 {-|-}
 migration : { v1 : { name : String, statements : Array String } }
