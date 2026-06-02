@@ -11,7 +11,7 @@
         "direct": {
             "blaix/gren-base64": "2.0.2",
             "blaix/gren-effectful-tests": "6.0.0",
-            "gren-lang/core": "7.4.0",
+            "gren-lang/core": "local:../../gren-core",
             "gren-lang/node": "local:../../node",
             "gren-lang/test": "5.0.0",
             "gren-lang/test-runner-node": "7.0.0"
