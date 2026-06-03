@@ -14,9 +14,11 @@ The spec lives at <https://github.com/P-H-C/phc-string-format>.
 This module's job is *string → structured data*. It deliberately does no
 semantic validation: charset rules, length limits, base64 well-formedness,
 duplicate-name checks, and algorithm-specific requirements are the
-consumer's responsibility. Duplicate parameter names are collapsed by the
-underlying `Dict`. The version (`v=<n>`) lives in `params` under the key
-`"v"`.
+consumer's responsibility. The one normalization it does perform is
+re-padding the salt and hash: PHC stores them as unpadded base64, so the
+parser restores the trailing `=` so the chunks are ready to decode.
+Duplicate parameter names are collapsed by the underlying `Dict`. The
+version (`v=<n>`) lives in `params` under the key `"v"`.
 
 The parser is a sequential, no-backtracking state machine driven by
 `String.Parser.Advanced.loop`. Each chomp is terminator-driven: we walk
@@ -29,6 +31,7 @@ import Maybe exposing (Maybe(..))
 import Result exposing (Result(..))
 import String
 import String.Parser.Advanced as Parser exposing (Step(..))
+import Math exposing (remainderBy)
 
 
 {-| A parsed PHC string.
@@ -78,9 +81,9 @@ type Tail
 
 
 {-| Parse a PHC string into a structured [`PhcString`](#PhcString)
-record. Salt and hash chunks are returned exactly as parsed.
-
-    parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
+record. PHC stores the salt and hash as unpadded base64, so those
+chunks are re-padded with `=` on the way out. Everything else is returned 
+exactly as parsed.
 -}
 parse : String -> Result Error PhcString
 parse input =
@@ -177,6 +180,22 @@ stripTrailingEquals string =
 
     else
         string
+
+
+{-| Restore base64 `=` padding to a chunk that the PHC format stored
+unpadded.
+-}
+padBase64 : String -> String
+padBase64 string =
+    when (remainderBy 4 (String.count string)) is
+        2 ->
+            string ++ "=="
+
+        3 ->
+            string ++ "="
+
+        _ ->
+            string
 
 
 {-| Fold a dict of params into a comma-separated `name=value,...`
@@ -315,7 +334,7 @@ parseParamOrSalt r =
                                 Done
                                     { id = r.id
                                     , params = r.params
-                                    , tail = SaltOnly chunk
+                                    , tail = SaltOnly (padBase64 chunk)
                                     }
                             )
                     ]
@@ -356,7 +375,7 @@ parseHash r =
                             Done
                                 { id = r.id
                                 , params = r.params
-                                , tail = SaltAndHash { salt = r.salt, hash = hash }
+                                , tail = SaltAndHash { salt = padBase64 r.salt, hash = padBase64 hash }
                                 }
                         )
             )
