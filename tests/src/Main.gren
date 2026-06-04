@@ -7,15 +7,10 @@ import Expect
 import FileSystem
 import Init
 import Node
-import Test.Runner.Effectful exposing ( await, concat, test, wrap )
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test, wrap )
 import Tests.PhcString
-import Auth.Simple.Method.Password.PhcString as PhcString
 import Auth.Simple.UsernamePassword
-import Base64.Decode
-import Bytes
 import Task exposing ( Task )
-import Dict
-import Base64.Encode
 
 
 {-|-}
@@ -37,10 +32,10 @@ main =
         )
 
 
-{-| Hashing a password, then re-deriving with the salt recovered from the
-resulting PHC string, must reproduce the exact same PHC string. That
-determinism is what lets a stored hash be re-derived and compared when a user
-logs in later.
+{-| Hashing a password, then verifying that password against the resulting PHC
+string, must succeed. That determinism — the stored hash re-deriving to the same
+value — is what lets a stored hash be re-derived and compared when a user logs in
+later. A different password must be rejected with `PasswordMismatch`.
 -}
 deterministicHashTest : Crypto.SecureContext -> Test.Runner.Effectful.Test
 deterministicHashTest secureContext =
@@ -48,106 +43,21 @@ deterministicHashTest secureContext =
         password =
             "hello12343"
     in
-    await "hash the password"
+    await "Hash the password"
         (Auth.Simple.UsernamePassword.hashPassword password secureContext)
-        (\originalPhcString ->
-            await "re-derive using the salt and iterations parsed back out of the PHC string"
-                (rederivePhcString secureContext password originalPhcString)
-                (\rederivedPhcString ->
-                    test "the same password and PHC parameters reproduce the same PHC string"
-                        (\_ -> Expect.equal originalPhcString rederivedPhcString)
-                )
-        )
-
-
-{-| Re-run the PBKDF2 derivation for a password using the salt and iteration
-count recovered from a PHC string, rebuilding the PHC string. Everything needed
-to reproduce the hash is read back out of the string itself, so a match proves
-the derivation is deterministic.
--}
-rederivePhcString : Crypto.SecureContext -> String -> String -> Task String String
-rederivePhcString secureContext password phcString =
-    when paramsFromPhcString phcString is
-        Err error ->
-            Task.fail error
-
-        Ok { salt, iterations } ->
-            password
-                |> Bytes.fromString
-                |> Crypto.importPbkdf2KeyFromRaw secureContext
-                |> Task.mapError (\_ -> "could not import the password as a PBKDF2 key")
-                |> Task.andThen
-                    (Crypto.deriveBitsWithPbkdf2
-                        { salt = salt, iterations = iterations, hash = Crypto.Sha256 }
-                        Nothing
-                        >> Task.mapError (\_ -> "could not derive bits with PBKDF2")
-                        >> Task.map (\hashedPasswordBytes ->
-                            PhcString.toString
-                                { id = "pbkdf2-sha256"
-                                , params = Dict.singleton "i" (String.fromInt iterations)
-                                , tail =
-                                    PhcString.SaltAndHash
-                                        { salt = Base64.Encode.bytes salt |> Base64.Encode.encode
-                                        , hash = Base64.Encode.bytes hashedPasswordBytes |> Base64.Encode.encode
-                                        }
-                                }
-                        )
+        (\phcString ->
+            concat
+                [ await "Verify the correct password against the PHC string"
+                    (Auth.Simple.UsernamePassword.verifyPassword password phcString secureContext)
+                    (\correct ->
+                        test "the same password verifies against its own hash"
+                            (\_ -> Expect.equal {} correct)
                     )
-
-
-{-| Recover everything needed to reproduce the hash from a PHC string: the raw
-salt `Bytes` (parsed and base64 decoded) and the iteration count (from the `i`
-parameter).
--}
-paramsFromPhcString : String -> Result String { salt : Bytes.Bytes, iterations : Int }
-paramsFromPhcString phcString =
-    PhcString.parse phcString
-        |> Result.mapError (\_ -> "could not parse the PHC string")
-        |> Result.andThen
-            (\parsed ->
-                Result.map2
-                    (\salt iterations -> { salt = salt, iterations = iterations })
-                    (saltBytesFromTail parsed.tail)
-                    (iterationsFromParams parsed.params)
-            )
-
-
-{-| Pull the raw salt `Bytes` out of a parsed PHC string's tail by base64
-decoding the salt segment.
--}
-saltBytesFromTail : PhcString.Tail -> Result String Bytes.Bytes
-saltBytesFromTail tail =
-    when tail is
-        PhcString.SaltAndHash { salt } ->
-            decodeSalt salt
-
-        PhcString.SaltOnly salt ->
-            decodeSalt salt
-
-        PhcString.NoTail ->
-            Err "the PHC string had no salt to recover"
-
-
-{-| Read the PBKDF2 iteration count from a parsed PHC string's `i` parameter.
--}
-iterationsFromParams : Dict.Dict String String -> Result String Int
-iterationsFromParams params =
-    when Dict.get "i" params is
-        Nothing ->
-            Err "the PHC string had no `i` (iterations) parameter"
-
-        Just value ->
-            when String.toInt value is
-                Nothing ->
-                    Err "the `i` parameter was not an integer"
-
-                Just iterations ->
-                    Ok iterations
-
-
-{-| Base64 decode a salt segment into raw `Bytes`.
--}
-decodeSalt : String -> Result String Bytes.Bytes
-decodeSalt salt =
-    Base64.Decode.bytes salt
-        |> Result.mapError (\_ -> "could not base64 decode the salt")
+                , awaitError "Verify an incorrect password against the PHC string"
+                    (Auth.Simple.UsernamePassword.verifyPassword "wrongpw" phcString secureContext)
+                    (\incorrect ->
+                        test "A different password is rejected with PasswordMismatch"
+                            (\_ -> Expect.equal Auth.Simple.UsernamePassword.PasswordMismatch incorrect)
+                    )
+                ]
+        )
