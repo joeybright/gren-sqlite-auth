@@ -1,0 +1,300 @@
+module Auth.Simple.AuthEvent exposing
+    ( AuthEventType(..)
+    , eventTypeToString
+    , eventTypeFromString
+    , AuthEvent
+    , create
+    , insert
+    , get
+    , update
+    , delete
+    )
+
+{-| CRUD access to the `auth_events` table.
+
+`auth_events` is an append-only audit log of authentication-related events.
+`user_id` is nullable because some events (such as failed logins) may not resolve
+to a known user, and `metadata` holds an optional JSON blob of method-specific
+fields. This module is a thin, reusable data-access layer; the schema is owned by
+[`Auth.Simple.migrationV1`](Auth.Simple).
+
+Because the table is an audit log, [`create`](#create), [`get`](#get) and
+[`insert`](#insert) cover the normal use. [`update`](#update) and
+[`delete`](#delete) are provided for completeness but are atypical — mutating or
+removing audit records defeats the point of the log.
+
+@docs AuthEventType
+@docs eventTypeToString
+@docs eventTypeFromString
+@docs AuthEvent
+@docs create
+@docs insert
+@docs get
+@docs update
+@docs delete
+
+-}
+
+import Crypto
+import Sqlite
+import Sqlite.Decode
+import Sqlite.Encode
+import Task exposing ( Task )
+import Time
+
+
+{-| The closed set of authentication events this package records.
+
+This is package-owned, not consumer-extensible: an auth event is always one of
+these known kinds. Each maps to a stable snake_case string stored in the
+`event_type` column (see [`eventTypeToString`](#eventTypeToString)).
+-}
+type AuthEventType
+    = UserRegistered
+    | UserLoggedIn
+    | UserLoggedOut
+    | LoginFailed
+    | PasswordChanged
+    | UnknownEvent
+
+
+{-| The stable string stored in the `event_type` column for an
+[`AuthEventType`](#AuthEventType).
+-}
+eventTypeToString : AuthEventType -> String
+eventTypeToString eventType =
+    when eventType is
+        UserRegistered ->
+            "user_registered"
+
+        UserLoggedIn ->
+            "user_logged_in"
+
+        UserLoggedOut ->
+            "user_logged_out"
+
+        LoginFailed ->
+            "login_failed"
+
+        PasswordChanged ->
+            "password_changed"
+
+        UnknownEvent ->
+            "unknown"
+
+
+{-| Parse a stored `event_type` string back into an [`AuthEventType`](#AuthEventType),
+returning `Nothing` for an unrecognized value. Inverse of
+[`eventTypeToString`](#eventTypeToString).
+-}
+eventTypeFromString : String -> AuthEventType
+eventTypeFromString string =
+    when string is
+        "user_registered" ->
+            UserRegistered
+
+        "user_logged_in" ->
+            UserLoggedIn
+
+        "user_logged_out" ->
+            UserLoggedOut
+
+        "login_failed" ->
+            LoginFailed
+
+        "password_changed" ->
+            PasswordChanged
+
+        _ ->
+            UnknownEvent
+
+
+{-| A row from the `auth_events` table. `userId` and `metadata` are nullable.
+-}
+type alias AuthEvent =
+    { id : String
+    , userId : Maybe String
+    , eventType : AuthEventType
+    , occurredAt : Int
+    , metadata : Maybe String
+    }
+
+
+{-| Decode a single `auth_events` row into an [`AuthEvent`](#AuthEvent).
+-}
+decoder : Sqlite.Decode.Decoder AuthEvent
+decoder =
+    Sqlite.Decode.string "id"
+        (\id ->
+            Sqlite.Decode.maybe Sqlite.Decode.string "user_id"
+                (\userId ->
+                    Sqlite.Decode.string "event_type"
+                        (\eventType ->
+                            Sqlite.Decode.int "occurred_at"
+                                (\occurredAt ->
+                                    Sqlite.Decode.maybe Sqlite.Decode.string "metadata"
+                                        (\metadata ->
+                                            Sqlite.Decode.succeed
+                                                { id = id
+                                                , userId = userId
+                                                , eventType = eventTypeFromString eventType
+                                                , occurredAt = occurredAt
+                                                , metadata = metadata
+                                                }
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+
+--- creating auth events
+
+
+{-| Record a new auth event and save it to the database.
+
+Generates a fresh `id` and an `occurred_at` timestamp of now, inserts the row, and
+returns the created [`AuthEvent`](#AuthEvent). To insert inside an existing
+transaction with a caller-supplied `id` and timestamp, use [`insert`](#insert)
+directly.
+-}
+create :
+    { userId : Maybe String, eventType : AuthEventType, metadata : Maybe String }
+    -> Sqlite.Database
+    -> Crypto.SecureContext
+    -> Task Sqlite.Error AuthEvent
+create { userId, eventType, metadata } database secureContext =
+    Task.map2
+        (\id now ->
+            { id = id
+            , occurredAt = Time.posixToMillis now
+            }
+        )
+        (Crypto.randomUuidV4 secureContext)
+        Time.now
+        |> Task.andThen
+            (\{ id, occurredAt } ->
+                insert database
+                    { id = id
+                    , userId = userId
+                    , eventType = eventTypeToString eventType
+                    , occurredAt = occurredAt
+                    , metadata = metadata
+                    }
+                    |> Task.map
+                        (\_ ->
+                            { id = id
+                            , userId = userId
+                            , eventType = eventType
+                            , occurredAt = occurredAt
+                            , metadata = metadata
+                            }
+                        )
+            )
+
+
+{-| Insert an auth-event row into the `auth_events` table using caller-supplied
+values.
+-}
+insert :
+    Sqlite.Database
+    ->
+        { id : String
+        , userId : Maybe String
+        , eventType : String
+        , occurredAt : Int
+        , metadata : Maybe String
+        }
+    -> Task Sqlite.Error Sqlite.ExecutionSummary
+insert database { id, userId, eventType, occurredAt, metadata } =
+    let
+        statement : String
+        statement =
+            """
+            INSERT INTO auth_events (id, user_id, event_type, occurred_at, metadata)
+            VALUES (:id, :user_id, :event_type, :occurred_at, :metadata)
+            """
+    in
+    Sqlite.execute database
+        { statement = statement
+        , parameters =
+            [ Sqlite.Encode.string "id" id
+            , Sqlite.Encode.maybe Sqlite.Encode.string "user_id" userId
+            , Sqlite.Encode.string "event_type" eventType
+            , Sqlite.Encode.int "occurred_at" occurredAt
+            , Sqlite.Encode.maybe Sqlite.Encode.string "metadata" metadata
+            ]
+        }
+
+
+
+--- reading auth events
+
+
+{-| Read a single auth event by `id`, returning `Nothing` when no such row exists.
+-}
+get : String -> Sqlite.Database -> Task Sqlite.Error (Maybe AuthEvent)
+get id database =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT id, user_id, event_type, occurred_at, metadata
+            FROM auth_events
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "id" id 
+            ]
+        , rowDecoder = decoder
+        }
+
+
+
+--- updating auth events
+
+
+{-| Update an auth event's `event_type` and `metadata` by `id`.
+
+Provided for completeness; mutating an audit record is atypical.
+-}
+update :
+    { id : String, eventType : String, metadata : Maybe String }
+    -> Sqlite.Database
+    -> Task Sqlite.Error Sqlite.ExecutionSummary
+update { id, eventType, metadata } database =
+    Sqlite.execute database
+        { statement =
+            """
+            UPDATE auth_events
+            SET event_type = :event_type, metadata = :metadata
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "event_type" eventType
+            , Sqlite.Encode.maybe Sqlite.Encode.string "metadata" metadata
+            , Sqlite.Encode.string "id" id
+            ]
+        }
+
+
+
+--- deleting auth events
+
+
+{-| Delete an auth event by `id`.
+
+Provided for completeness; removing an audit record is atypical.
+-}
+delete : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
+delete id database =
+    Sqlite.execute database
+        { statement =
+            """
+            DELETE FROM auth_events
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "id" id 
+            ]
+        }

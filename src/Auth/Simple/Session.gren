@@ -1,0 +1,238 @@
+module Auth.Simple.Session exposing
+    ( Session
+    , create
+    , insert
+    , get
+    , update
+    , delete
+    )
+
+{-| CRUD access to the `sessions` table.
+
+A session is a method-agnostic login token tied to a user. Its `id` is an opaque
+token; `revoked_at` is nullable so an explicit logout can mark a row without
+deleting it. This module is a thin, reusable data-access layer; the schema is
+owned by [`Auth.Simple.migrationV1`](Auth.Simple).
+
+@docs Session
+@docs create
+@docs insert
+@docs get
+@docs update
+@docs delete
+
+-}
+
+import Base64.Encode
+import Crypto
+import Sqlite
+import Sqlite.Decode
+import Sqlite.Encode
+import Task exposing ( Task )
+import Time
+
+
+{-| A row from the `sessions` table. `revokedAt` is `Nothing` for a live session
+and `Just` the revocation time once it has been explicitly revoked.
+-}
+type alias Session =
+    { id : String
+    , userId : String
+    , createdAt : Int
+    , expiresAt : Int
+    , lastUsedAt : Int
+    , revokedAt : Maybe Int
+    }
+
+
+{-| Decode a single `sessions` row into a [`Session`](#Session).
+-}
+decoder : Sqlite.Decode.Decoder Session
+decoder =
+    Sqlite.Decode.string "id"
+        (\id ->
+            Sqlite.Decode.string "user_id"
+                (\userId ->
+                    Sqlite.Decode.int "created_at"
+                        (\createdAt ->
+                            Sqlite.Decode.int "expires_at"
+                                (\expiresAt ->
+                                    Sqlite.Decode.int "last_used_at"
+                                        (\lastUsedAt ->
+                                            Sqlite.Decode.maybe Sqlite.Decode.int "revoked_at"
+                                                (\revokedAt ->
+                                                    Sqlite.Decode.succeed
+                                                        { id = id
+                                                        , userId = userId
+                                                        , createdAt = createdAt
+                                                        , expiresAt = expiresAt
+                                                        , lastUsedAt = lastUsedAt
+                                                        , revokedAt = revokedAt
+                                                        }
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+
+--- creating sessions
+
+
+{-| Open a new session for `userId`, expiring at `expiresAt`, and save it to the
+database.
+
+Generates an opaque token (32 cryptographically-random bytes, base64 encoded) for
+the `id` and a `created_at`/`last_used_at` timestamp of now, inserts the row, and
+returns the created [`Session`](#Session). To insert inside an existing transaction
+with a caller-supplied token and timestamps, use [`insert`](#insert) directly.
+-}
+create :
+    { userId : String, expiresAt : Int }
+    -> Sqlite.Database
+    -> Crypto.SecureContext
+    -> Task Sqlite.Error Session
+create { userId, expiresAt } database _ =
+    Task.map2
+        (\token now ->
+            { id = token
+            , userId = userId
+            , createdAt = Time.posixToMillis now
+            , expiresAt = expiresAt
+            , lastUsedAt = Time.posixToMillis now
+            , revokedAt = Nothing
+            }
+        )
+        generateToken
+        Time.now
+        |> Task.andThen
+            (\session ->
+                insert database session
+                    |> Task.map (\_ -> session)
+            )
+
+
+{-| Generate an opaque session token: 32 cryptographically-random bytes, base64
+encoded.
+-}
+generateToken : Task x String
+generateToken =
+    Crypto.getRandomUInt8Values 32
+        |> Task.map
+            (\tokenBytes ->
+                Base64.Encode.bytes tokenBytes
+                    |> Base64.Encode.encode
+            )
+
+
+{-| Insert a session row into the `sessions` table using caller-supplied values.
+-}
+insert :
+    Sqlite.Database
+    ->
+        { id : String
+        , userId : String
+        , createdAt : Int
+        , expiresAt : Int
+        , lastUsedAt : Int
+        , revokedAt : Maybe Int
+        }
+    -> Task Sqlite.Error Sqlite.ExecutionSummary
+insert database { id, userId, createdAt, expiresAt, lastUsedAt, revokedAt } =
+    let
+        statement : String
+        statement =
+            """
+            INSERT INTO sessions (id, user_id, created_at, expires_at, last_used_at, revoked_at)
+            VALUES (:id, :user_id, :created_at, :expires_at, :last_used_at, :revoked_at)
+            """
+    in
+    Sqlite.execute database
+        { statement = statement
+        , parameters =
+            [ Sqlite.Encode.string "id" id
+            , Sqlite.Encode.string "user_id" userId
+            , Sqlite.Encode.int "created_at" createdAt
+            , Sqlite.Encode.int "expires_at" expiresAt
+            , Sqlite.Encode.int "last_used_at" lastUsedAt
+            , Sqlite.Encode.maybe Sqlite.Encode.int "revoked_at" revokedAt
+            ]
+        }
+
+
+
+--- reading sessions
+
+
+{-| Read a single session by `id`, returning `Nothing` when no such row exists.
+-}
+get : String -> Sqlite.Database -> Task Sqlite.Error (Maybe Session)
+get id database =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT id, user_id, created_at, expires_at, last_used_at, revoked_at
+            FROM sessions
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "id" id
+            ]
+        , rowDecoder = decoder
+        }
+
+
+
+--- updating sessions
+
+
+{-| Update a session's mutable fields by `id`.
+
+Covers both "touch on use" (bump `lastUsedAt`) and revocation (set `revokedAt` to
+`Just` the revocation time); pass `Nothing` for `revokedAt` to keep the session
+live. `expiresAt` lets callers extend or shorten the lifetime.
+-}
+update :
+    { id : String, expiresAt : Int, lastUsedAt : Int, revokedAt : Maybe Int }
+    -> Sqlite.Database
+    -> Task Sqlite.Error Sqlite.ExecutionSummary
+update { id, expiresAt, lastUsedAt, revokedAt } database =
+    Sqlite.execute database
+        { statement =
+            """
+            UPDATE sessions
+            SET expires_at = :expires_at, last_used_at = :last_used_at, revoked_at = :revoked_at
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.int "expires_at" expiresAt
+            , Sqlite.Encode.int "last_used_at" lastUsedAt
+            , Sqlite.Encode.maybe Sqlite.Encode.int "revoked_at" revokedAt
+            , Sqlite.Encode.string "id" id
+            ]
+        }
+
+
+
+--- deleting sessions
+
+
+{-| Delete a session by `id`.
+
+This is a hard delete. To keep the row for auditing while ending the session,
+prefer setting `revoked_at` via [`update`](#update).
+-}
+delete : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
+delete id database =
+    Sqlite.execute database
+        { statement =
+            """
+            DELETE FROM sessions
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "id" id 
+            ]
+        }

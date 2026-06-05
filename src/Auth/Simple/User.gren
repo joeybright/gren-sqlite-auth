@@ -1,0 +1,203 @@
+module Auth.Simple.User exposing
+    ( User
+    , create
+    , insert
+    , get
+    , update
+    , delete
+    )
+
+{-| CRUD access to the `users` table.
+
+The `users` table holds the minimal user record this package depends on (`id`,
+`created_at`, `updated_at`); consumers may extend it with additional columns.
+This module is a thin, reusable data-access layer over those base columns. The
+schema itself is owned by [`Auth.Simple.migrationV1`](Auth.Simple); nothing here
+creates or alters the table.
+
+@docs User
+@docs create
+@docs insert
+@docs get
+@docs update
+@docs delete
+
+-}
+
+import Crypto
+import Sqlite
+import Sqlite.Decode
+import Sqlite.Encode
+import Task exposing ( Task )
+import Time
+
+
+{-| A row from the `users` table.
+-}
+type alias User =
+    { id : String
+    , createdAt : Int
+    , updatedAt : Int
+    }
+
+
+{-| Decode a single `users` row into a [`User`](#User).
+-}
+decoder : Sqlite.Decode.Decoder User
+decoder =
+    Sqlite.Decode.string "id"
+        (\id ->
+            Sqlite.Decode.int "created_at"
+                (\createdAt ->
+                    Sqlite.Decode.int "updated_at"
+                        (\updatedAt ->
+                            Sqlite.Decode.succeed
+                                { id = id
+                                , createdAt = createdAt
+                                , updatedAt = updatedAt
+                                }
+                        )
+                )
+        )
+
+
+
+--- creating users
+
+
+{-| Create a new user and save it to the database.
+
+Generates a fresh `id` and timestamp, inserts the row (with `created_at` and
+`updated_at` both set to now), and returns the created [`User`](#User). To insert
+inside an existing transaction with a caller-supplied `id` and timestamp, use
+[`insert`](#insert) directly.
+-}
+create :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Task Sqlite.Error User
+create database secureContext =
+    Task.map2
+        (\id now ->
+            { id = id
+            , createdAt = Time.posixToMillis now
+            }
+        )
+        (Crypto.randomUuidV4 secureContext)
+        Time.now
+        |> Task.andThen
+            (\{ id, createdAt } ->
+                insert database 
+                    { id = id
+                    , createdAt = createdAt 
+                    }
+                    |> Task.map
+                        (\_ ->
+                            { id = id
+                            , createdAt = createdAt
+                            , updatedAt = createdAt
+                            }
+                        )
+            )
+
+
+{-| Insert a user row into the `users` table, using the given `id` and
+`createdAt` timestamp. Both `created_at` and `updated_at` are set to `createdAt`.
+-}
+insert :
+    Sqlite.Database
+    -> { id : String, createdAt : Int }
+    -> Task Sqlite.Error Sqlite.ExecutionSummary
+insert database { id, createdAt } =
+    let
+        statement : String
+        statement =
+            """
+            INSERT INTO users (id, created_at, updated_at)
+            VALUES (:id, :created_at, :updated_at)
+            """
+    in
+    Sqlite.execute database
+        { statement = statement
+        , parameters =
+            [ Sqlite.Encode.string "id" id
+            , Sqlite.Encode.int "created_at" createdAt
+            , Sqlite.Encode.int "updated_at" createdAt
+            ]
+        }
+
+
+
+--- reading users
+
+
+{-| Read a single user by `id`, returning `Nothing` when no such row exists.
+-}
+get : String -> Sqlite.Database -> Task Sqlite.Error (Maybe User)
+get id database =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT id, created_at, updated_at
+            FROM users
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "id" id 
+            ]
+        , rowDecoder = decoder
+        }
+
+
+
+--- updating users
+
+
+{-| Touch a user, bumping its `updated_at` to the current time.
+
+The minimal `users` schema has no other mutable column, so updating a user means
+refreshing its `updated_at` timestamp. Consumers that have extended the table
+with their own columns should write their own update queries for those.
+-}
+update : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
+update id database =
+    Time.now
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        UPDATE users
+                        SET updated_at = :updated_at
+                        WHERE id = :id
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.int "updated_at" (Time.posixToMillis now)
+                        , Sqlite.Encode.string "id" id
+                        ]
+                    }
+            )
+
+
+
+--- deleting users
+
+
+{-| Delete a user by `id`.
+
+Foreign keys reference `users(id)`, so deleting a user cascades to its sessions,
+usernames, and password rows (and sets `auth_events.user_id` to null) per the
+schema in [`Auth.Simple`](Auth.Simple).
+-}
+delete : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
+delete id database =
+    Sqlite.execute database
+        { statement =
+            """
+            DELETE FROM users
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "id" id 
+            ]
+        }

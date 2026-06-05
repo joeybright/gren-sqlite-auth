@@ -8,7 +8,10 @@
     "exposed-modules": [
         "Auth.Simple",
         "Utils.Sqlite.PragmaTableXInfo",
-        "Auth.Simple.UsernamePassword"
+        "Auth.Simple.UsernamePassword",
+        "Auth.Simple.User",
+        "Auth.Simple.Session",
+        "Auth.Simple.AuthEvent"
     ],
     "gren-version": "0.6.0 <= v < 0.7.0",
     "dependencies": {
