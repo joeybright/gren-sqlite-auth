@@ -5,9 +5,10 @@ module Tests.Login exposing ( tests )
 Registration and login are separate steps. First it registers a user via
 [`Auth.Simple.UsernamePassword.create`](Auth.Simple.UsernamePassword), which
 returns only the new `userId` and issues no session. Then it logs in via
-[`verify`](Auth.Simple.UsernamePassword) to obtain a session token. The database
-persists across runs, so each run gives the user a random username suffix to
-avoid the `usernames.username` UNIQUE constraint.
+[`login`](Auth.Simple.UsernamePassword) — the realistic flow, starting from the
+typed username and password rather than a `userId` the handler wouldn't have. The
+database persists across runs, so each run gives the user a random username suffix
+to avoid the `usernames.username` UNIQUE constraint.
 
 @docs tests
 
@@ -24,12 +25,14 @@ import FileSystem
 import FileSystem.Path
 import Sqlite
 import Sqlite.Migrate
-import Test.Runner.Effectful exposing ( await, concat, test )
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
 
 
-{-| Register a user (user, username, password) through `create`, then separately
-log in through `verify`, asserting the session `verify` issues belongs to that
-user.
+{-| Register a user (user, username, password) through `create`, then log in
+through `login` with that username and password. Asserts the issued session
+belongs to the registered user, and that both a wrong password and an unknown
+username are rejected with the same `InvalidCredentials` (so neither reveals
+whether the username exists).
 -}
 tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
 tests fsPermission secureContext =
@@ -59,42 +62,75 @@ tests fsPermission secureContext =
                         "Generate a unique username suffix"
                         (Crypto.randomUuidV4 secureContext)
                         (\usernameSuffix ->
+                            let
+                                username : String
+                                username =
+                                    "alice-" ++ usernameSuffix
+                            in
                             await
                                 "Register the user via create"
                                 (Auth.Simple.UsernamePassword.create
-                                    { username = "alice-" ++ usernameSuffix
+                                    { username = username
                                     , password = password
                                     }
                                     database
                                     secureContext
                                 )
                                 (\created ->
-                                    await
-                                        "Log in via verify (its own transaction)"
-                                        (Auth.Simple.UsernamePassword.verify
-                                            { userId = created.userId
-                                            , password = password
-                                            }
-                                            database
-                                            secureContext
-                                        )
-                                        (\result ->
-                                            await
-                                                "Look up the session by its raw token"
-                                                (Auth.Simple.Session.getByToken result.token database secureContext)
-                                                (\maybeSession ->
-                                                    concat
-                                                        [ test "the new session belongs to the user that just logged in"
-                                                            (\_ -> Expect.equal created.userId result.session.userId)
-                                                        , test "verify returns a non-empty raw token"
-                                                            (\_ -> Expect.notEqual "" result.token)
-                                                        , test "the stored session id is a hash, not the raw token"
-                                                            (\_ -> Expect.notEqual result.token result.session.id)
-                                                        , test "looking up by the raw token resolves the stored session"
-                                                            (\_ -> Expect.equal (Just result.session.id) (Maybe.map .id maybeSession))
-                                                        ]
-                                                )
-                                        )
+                                    concat
+                                        [ await
+                                            "Log in via login (username + password)"
+                                            (Auth.Simple.UsernamePassword.login
+                                                { username = username
+                                                , password = password
+                                                }
+                                                database
+                                                secureContext
+                                            )
+                                            (\result ->
+                                                await
+                                                    "Look up the session by its raw token"
+                                                    (Auth.Simple.Session.getByToken result.token database secureContext)
+                                                    (\maybeSession ->
+                                                        concat
+                                                            [ test "the new session belongs to the user that just logged in"
+                                                                (\_ -> Expect.equal created.userId result.session.userId)
+                                                            , test "login returns a non-empty raw token"
+                                                                (\_ -> Expect.notEqual "" result.token)
+                                                            , test "the stored session id is a hash, not the raw token"
+                                                                (\_ -> Expect.notEqual result.token result.session.id)
+                                                            , test "looking up by the raw token resolves the stored session"
+                                                                (\_ -> Expect.equal (Just result.session.id) (Maybe.map .id maybeSession))
+                                                            ]
+                                                    )
+                                            )
+                                        , awaitError
+                                            "Log in with the right username but wrong password"
+                                            (Auth.Simple.UsernamePassword.login
+                                                { username = username
+                                                , password = "wrong password"
+                                                }
+                                                database
+                                                secureContext
+                                            )
+                                            (\error ->
+                                                test "a wrong password is rejected with InvalidCredentials"
+                                                    (\_ -> Expect.equal Auth.Simple.UsernamePassword.InvalidCredentials error)
+                                            )
+                                        , awaitError
+                                            "Log in with a username that does not exist"
+                                            (Auth.Simple.UsernamePassword.login
+                                                { username = "does-not-exist-" ++ usernameSuffix
+                                                , password = password
+                                                }
+                                                database
+                                                secureContext
+                                            )
+                                            (\error ->
+                                                test "an unknown username is rejected with the same InvalidCredentials"
+                                                    (\_ -> Expect.equal Auth.Simple.UsernamePassword.InvalidCredentials error)
+                                            )
+                                        ]
                                 )
                         )
                 )

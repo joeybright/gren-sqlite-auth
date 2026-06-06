@@ -4,6 +4,7 @@ module Auth.Simple.Identifier.Username exposing
     , create
     , insert
     , get
+    , getByUsername
     , update
     , delete
     )
@@ -20,6 +21,7 @@ on the row `id`.
 @docs create
 @docs insert
 @docs get
+@docs getByUsername
 @docs update
 @docs delete
 
@@ -191,7 +193,26 @@ get id database =
             WHERE id = :id
             """
         , parameters =
-            [ Sqlite.Encode.string "id" id 
+            [ Sqlite.Encode.string "id" id
+            ]
+        , rowDecoder = decoder
+        }
+
+
+{-| Read a single username row by its `username` value, returning `Nothing` when
+no such row exists.
+-}
+getByUsername : String -> Sqlite.Database -> Task Sqlite.Error (Maybe Username)
+getByUsername username database =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT id, user_id, username, created_at, updated_at
+            FROM usernames
+            WHERE username = :username
+            """
+        , parameters =
+            [ Sqlite.Encode.string "username" username
             ]
         , rowDecoder = decoder
         }
