@@ -10,6 +10,7 @@ import Node
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test, wrap )
 import Tests.PhcString
 import Tests.Login
+import Tests.Register
 import Auth.Simple.UsernamePassword
 import Task exposing ( Task )
 
@@ -27,6 +28,7 @@ main =
                                 [ Test.Runner.Effectful.wrap Tests.PhcString.tests
                                 , deterministicHashTest secureContext
                                 , Tests.Login.tests fsPermission secureContext
+                                , Tests.Register.tests fsPermission secureContext
                                 ]
                         )
                         |> Test.Runner.Effectful.run env
