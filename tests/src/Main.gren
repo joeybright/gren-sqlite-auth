@@ -9,6 +9,7 @@ import Init
 import Node
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test, wrap )
 import Tests.PhcString
+import Tests.Login
 import Auth.Simple.UsernamePassword
 import Task exposing ( Task )
 
@@ -19,12 +20,13 @@ main =
     Node.defineSimpleProgram
         (\env ->
             Init.await FileSystem.initialize
-                (\_ ->
+                (\fsPermission ->
                     await "Get secure context for Crypto functions" Crypto.getSecureContext
                         (\secureContext ->
                             concat
                                 [ Test.Runner.Effectful.wrap Tests.PhcString.tests
                                 , deterministicHashTest secureContext
+                                , Tests.Login.tests fsPermission secureContext
                                 ]
                         )
                         |> Test.Runner.Effectful.run env
