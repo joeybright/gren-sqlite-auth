@@ -1,4 +1,4 @@
-module Auth.Simple exposing (..)
+module Auth.Simple exposing ( migrationV1, addUsersTableMigrationSQL )
 
 {-| Exploring the structure of the package...
 
@@ -29,6 +29,10 @@ database.
 
 - `passwords`
 - `password_reset_tokens`
+
+# Migrations
+
+@docs migrationV1, addUsersTableMigrationSQL
 -}
 
 
