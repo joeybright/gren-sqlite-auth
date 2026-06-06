@@ -7,7 +7,6 @@
     "version": "1.0.0",
     "exposed-modules": [
         "Auth.Simple",
-        "Utils.Sqlite.PragmaTableXInfo",
         "Auth.Simple.UsernamePassword",
         "Auth.Simple.User",
         "Auth.Simple.Session",
