@@ -12,6 +12,7 @@ import Tests.PhcString
 import Tests.Login
 import Tests.Register
 import Auth.Simple.UsernamePassword
+import Auth.Simple.Credential.Password
 import Task exposing ( Task )
 
 
@@ -61,7 +62,7 @@ deterministicHashTest secureContext =
                     (Auth.Simple.UsernamePassword.verifyPassword "wrongpw" phcString secureContext)
                     (\incorrect ->
                         test "A different password is rejected with PasswordMismatch"
-                            (\_ -> Expect.equal Auth.Simple.UsernamePassword.PasswordMismatch incorrect)
+                            (\_ -> Expect.equal Auth.Simple.Credential.Password.PasswordMismatch incorrect)
                     )
                 ]
         )
