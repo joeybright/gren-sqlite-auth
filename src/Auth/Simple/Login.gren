@@ -1,0 +1,106 @@
+module Auth.Simple.Login exposing ( login, Error(..) )
+
+{-| Drive an [`Identifier`](Auth.Simple.Identifier) and a
+[`Credential`](Auth.Simple.Credential) into a login workflow: resolve the
+identifier to a user, validate the credential, and issue a session.
+
+@docs login, Error
+
+-}
+
+import Auth.Simple.Credential exposing ( Credential )
+import Auth.Simple.Identifier exposing ( Identifier )
+import Auth.Simple.Session as Session exposing ( Session )
+import Crypto
+import Sqlite
+import Task exposing ( Task )
+import Time
+
+
+{-| Everything a login can go wrong on: resolving the identifier (`idErr`), no
+user owning that identifier, validating the credential (`credErr`), or opening the
+session.
+
+These are kept distinct for clarity during development; collapsing them into one
+opaque "invalid credentials" (to resist user enumeration) is a later hardening
+step.
+-}
+type Error identifierError credentialError
+    = IdentifierError identifierError
+    | IdentifierNotFound
+    | CredentialError credentialError
+    | SessionError Sqlite.Error
+
+
+{-| Build a login function from a database, secure context, an
+[`Identifier`](Auth.Simple.Identifier), and a
+[`Credential`](Auth.Simple.Credential). Partially apply the first four arguments
+to get your app's own login, then call it with a runtime identifier value and
+secret:
+
+    myLogin =
+        Auth.Simple.Login.login db ctx
+            Auth.Simple.Identifier.Username.identifier
+            Auth.Simple.Credential.Password.credential
+
+    myLogin { identifier = "alice", secret = plainTextPassword }
+
+On success it issues a session and returns `{ session, token }` — hand `token` to
+the client, keep nothing else.
+-}
+login :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Identifier identifierError identifierValue
+    -> Credential credentialError candidateCredential storedCredential
+    -> { identifier : identifierValue, secret : candidateCredential }
+    -> Task (Error identifierError credentialError) { session : Session, token : String }
+login database secureContext identifier credential input =
+    identifier.resolve input.identifier database secureContext
+        |> Task.mapError IdentifierError
+        |> Task.andThen
+            (\maybeUserId ->
+                when maybeUserId is
+                    Nothing ->
+                        Task.fail IdentifierNotFound
+
+                    Just userId ->
+                        credential.validate
+                            { userId = userId, secret = input.secret }
+                            database
+                            secureContext
+                            |> Task.mapError CredentialError
+                            |> Task.andThen (\_ -> issueSession userId database secureContext)
+            )
+
+
+{-| Open a fresh session for a verified user, expiring `sessionLifetimeMillis`
+from now.
+-}
+issueSession :
+    String
+    -> Sqlite.Database
+    -> Crypto.SecureContext
+    -> Task (Error idErr credErr) { session : Session, token : String }
+issueSession userId database secureContext =
+    Time.now
+        |> Task.andThen
+            (\now ->
+                Session.create
+                    { userId = userId
+                    , expiresAt = Time.posixToMillis now + sessionLifetimeMillis
+                    }
+                    database
+                    secureContext
+                    |> Task.mapError SessionError
+            )
+
+
+{-| How long an issued session stays valid: 30 days, in milliseconds.
+
+Hard-coded for now to match the lifetime used elsewhere in the package; a future
+revision can lift this into `login`'s configuration.
+-}
+sessionLifetimeMillis : Int
+sessionLifetimeMillis =
+    30 * 24 * 60 * 60 * 1000

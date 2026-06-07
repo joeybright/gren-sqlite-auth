@@ -1,0 +1,181 @@
+module Auth.Simple.Register exposing ( identifier, credential, register, Error(..) )
+
+{-| Drive an [`Identifier`](Auth.Simple.Identifier) and/or a
+[`Credential`](Auth.Simple.Credential) into a registration workflow: optionally
+create the user, then write the identifier and/or the credential against that user.
+
+This is the counterpart to [`Auth.Simple.Login`](Auth.Simple.Login). Like login, it
+holds no storage logic of its own — it calls the `insert` function each bundle
+carries, so the concrete module (e.g. [`Auth.Simple.Credential.Password`](Auth.Simple.Credential.Password))
+remains the only place that knows how to persist its own secret.
+
+Registering an identifier and registering a credential are separate operations
+([`identifier`](#identifier), [`credential`](#credential)) so a user can hold many
+identifiers, a single credential, or an identifier with no credential yet (a
+reserved username, an unconfirmed email — login through it simply fails until a
+credential exists). [`register`](#register) is the convenience that does a user, an
+identifier, and a credential together.
+
+@docs identifier, credential, register, Error
+
+-}
+
+import Auth.Simple.Credential exposing ( Credential )
+import Auth.Simple.Identifier exposing ( Identifier )
+import Auth.Simple.User as User
+import Crypto
+import Sqlite
+import Task exposing ( Task )
+
+
+{-| Everything a registration can go wrong on: creating the user, writing the
+identifier (`identifierError`), or writing the credential (`credentialError`).
+
+A single error type is shared by all three entry points; [`identifier`](#identifier)
+never produces a `CredentialError` and [`credential`](#credential) never produces an
+`IdentifierError`, so those calls leave the unused parameter polymorphic and unify
+cleanly when composed. `TransactionError` is the failure of a `BEGIN`/`COMMIT`/
+`ROLLBACK` itself.
+-}
+type Error identifierError credentialError
+    = UserError Sqlite.Error
+    | IdentifierError identifierError
+    | CredentialError credentialError
+    | TransactionError Sqlite.Error
+
+
+{-| Run a registration's writes inside one SQLite transaction: `BEGIN`, the writes,
+then `COMMIT` — or, if any write fails, `ROLLBACK` and re-raise the original error so
+a half-finished account (a user with no identifier, an identifier with no credential)
+never lands. A failing `BEGIN`/`COMMIT`/`ROLLBACK` surfaces as
+[`TransactionError`](#Error).
+-}
+withTransaction :
+    Sqlite.Database
+    -> Task (Error identifierError credentialError) a
+    -> Task (Error identifierError credentialError) a
+withTransaction database task =
+    Sqlite.executeScript database "BEGIN TRANSACTION"
+        |> Task.mapError TransactionError
+        |> Task.andThen
+            (\_ ->
+                task
+                    |> Task.andThen
+                        (\result ->
+                            Sqlite.executeScript database "COMMIT"
+                                |> Task.mapError TransactionError
+                                |> Task.map (\_ -> result)
+                        )
+                    |> Task.onError
+                        (\err ->
+                            Sqlite.executeScript database "ROLLBACK"
+                                |> Task.mapError TransactionError
+                                |> Task.andThen (\_ -> Task.fail err)
+                        )
+            )
+
+
+{-| Settle on the user to register against: use the supplied `userId`, or, when it
+is `Nothing`, create a fresh user via [`Auth.Simple.User.create`](Auth.Simple.User)
+and use its id.
+-}
+resolveUserId :
+    Maybe String
+    -> Sqlite.Database
+    -> Crypto.SecureContext
+    -> Task (Error identifierError credentialError) String
+resolveUserId maybeUserId database secureContext =
+    when maybeUserId is
+        Just userId ->
+            Task.succeed userId
+
+        Nothing ->
+            User.create database secureContext
+                |> Task.mapError UserError
+                |> Task.map (\user -> user.id)
+
+
+{-| Register an [`Identifier`](Auth.Simple.Identifier) value for a user. Pass
+`userId = Nothing` to create the user first, or `Just id` to add the identifier to an
+existing user. Returns the user the identifier now belongs to.
+-}
+identifier :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Identifier identifierError value
+    -> { userId : Maybe String, value : value }
+    -> Task (Error identifierError credentialError) { userId : String }
+identifier database secureContext theIdentifier input =
+    withTransaction database
+        (resolveUserId input.userId database secureContext
+            |> Task.andThen
+                (\userId ->
+                    theIdentifier.insert
+                        { userId = userId, value = input.value }
+                        database
+                        secureContext
+                        |> Task.mapError IdentifierError
+                        |> Task.map (\_ -> { userId = userId })
+                )
+        )
+
+
+{-| Register a [`Credential`](Auth.Simple.Credential) secret for a user. The secret
+is the credential's `stored` type (e.g. an already-hashed password), prepared by the
+caller. Pass `userId = Nothing` to create the user first, or `Just id` to add the
+credential to an existing user. Returns the user the credential now belongs to.
+-}
+credential :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Credential credentialError candidate stored
+    -> { userId : Maybe String, secret : stored }
+    -> Task (Error identifierError credentialError) { userId : String }
+credential database secureContext theCredential input =
+    withTransaction database
+        (resolveUserId input.userId database secureContext
+            |> Task.andThen
+                (\userId ->
+                    theCredential.insert
+                        { userId = userId, secret = input.secret }
+                        database
+                        secureContext
+                        |> Task.mapError CredentialError
+                        |> Task.map (\_ -> { userId = userId })
+                )
+        )
+
+
+{-| Register an identifier and a credential for the same user in one task. Pass
+`userId = Nothing` to create the user first, or `Just id` to attach both to an
+existing user. The user is resolved once and both writes share it; on success returns
+that user's id.
+-}
+register :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Identifier identifierError value
+    -> Credential credentialError candidate stored
+    -> { userId : Maybe String, value : value, secret : stored }
+    -> Task (Error identifierError credentialError) { userId : String }
+register database secureContext theIdentifier theCredential input =
+    withTransaction database
+        (resolveUserId input.userId database secureContext
+            |> Task.andThen
+                (\userId ->
+                    theIdentifier.insert
+                        { userId = userId, value = input.value }
+                        database
+                        secureContext
+                        |> Task.mapError IdentifierError
+                        |> Task.andThen
+                            (\_ ->
+                                theCredential.insert
+                                    { userId = userId, secret = input.secret }
+                                    database
+                                    secureContext
+                                    |> Task.mapError CredentialError
+                            )
+                        |> Task.map (\_ -> { userId = userId })
+                )
+        )

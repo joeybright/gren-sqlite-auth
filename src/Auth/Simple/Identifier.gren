@@ -1,0 +1,32 @@
+module Auth.Simple.Identifier exposing ( Identifier )
+
+{-| A generic identifier: how to resolve an identifier value to the user it
+belongs to.
+
+@docs Identifier
+
+-}
+
+import Crypto
+import Sqlite
+import Task exposing ( Task )
+
+
+{-| How to resolve an identifier value (a username, an email, …) to the owning
+user's id.
+
+Like [`Auth.Simple.Credential`](Auth.Simple.Credential), this is a pure bundle of
+functions: the `Sqlite.Database` and `Crypto.SecureContext` are supplied per call
+by whatever drives it (e.g. [`Auth.Simple.Login`](Auth.Simple.Login)), so it holds
+no config of its own. `value` is the identifier type the consumer supplies at
+login; `error` is the failure type `resolve` surfaces. `resolve` succeeds with
+`Nothing` when no user owns that identifier.
+
+`resolve` answers "who owns this identifier value?"; `insert` writes a new
+identifier value for a user (account creation, adding an identifier). `remove`
+remains a future seam.
+-}
+type alias Identifier error value =
+    { resolve : value -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe String)
+    , insert : { userId : String, value : value } -> Sqlite.Database -> Crypto.SecureContext -> Task error {}
+    }

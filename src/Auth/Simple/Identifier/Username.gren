@@ -7,6 +7,7 @@ module Auth.Simple.Identifier.Username exposing
     , getByUsername
     , update
     , delete
+    , identifier
     )
 
 {-| The username identifier: its schema migration and CRUD access to the
@@ -24,9 +25,11 @@ on the row `id`.
 @docs getByUsername
 @docs update
 @docs delete
+@docs identifier
 
 -}
 
+import Auth.Simple.Identifier exposing ( Identifier )
 import Crypto
 import Sqlite
 import Sqlite.Decode
@@ -266,6 +269,29 @@ delete id database =
             WHERE id = :id
             """
         , parameters =
-            [ Sqlite.Encode.string "id" id 
+            [ Sqlite.Encode.string "id" id
             ]
         }
+
+
+
+--- as an identifier
+
+
+{-| Expose usernames as a generic [`Identifier`](Auth.Simple.Identifier): `resolve`
+maps a username string to the owning user's id via [`getByUsername`](#getByUsername),
+and `insert` registers a new username for a user via [`create`](#create).
+-}
+identifier : Identifier Sqlite.Error String
+identifier =
+    { resolve =
+        (\username database _ ->
+            getByUsername username database
+                |> Task.map (Maybe.map .userId)
+        )
+    , insert =
+        (\{ userId, value } database secureContext ->
+            create { userId = userId, username = value } database secureContext
+                |> Task.map (\_ -> {})
+        )
+    }

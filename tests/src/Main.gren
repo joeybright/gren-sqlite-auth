@@ -3,17 +3,13 @@ module Main exposing (main)
 {-|-}
 
 import Crypto
-import Expect
 import FileSystem
 import Init
 import Node
-import Test.Runner.Effectful exposing ( await, awaitError, concat, test, wrap )
+import Test.Runner.Effectful exposing ( await, concat )
 import Tests.PhcString
-import Tests.Login
 import Tests.Register
-import Auth.Simple.UsernamePassword
-import Auth.Simple.Credential.Password
-import Task exposing ( Task )
+import Tests.CredentialLogin
 
 
 {-|-}
@@ -27,42 +23,10 @@ main =
                         (\secureContext ->
                             concat
                                 [ Test.Runner.Effectful.wrap Tests.PhcString.tests
-                                , deterministicHashTest secureContext
-                                , Tests.Login.tests fsPermission secureContext
                                 , Tests.Register.tests fsPermission secureContext
+                                , Tests.CredentialLogin.tests fsPermission secureContext
                                 ]
                         )
                         |> Test.Runner.Effectful.run env
                 )
-        )
-
-
-{-| Hashing a password, then verifying that password against the resulting PHC
-string, must succeed. That determinism — the stored hash re-deriving to the same
-value — is what lets a stored hash be re-derived and compared when a user logs in
-later. A different password must be rejected with `PasswordMismatch`.
--}
-deterministicHashTest : Crypto.SecureContext -> Test.Runner.Effectful.Test
-deterministicHashTest secureContext =
-    let
-        password =
-            "hello12343"
-    in
-    await "Hash the password"
-        (Auth.Simple.UsernamePassword.hashPassword password secureContext)
-        (\phcString ->
-            concat
-                [ await "Verify the correct password against the PHC string"
-                    (Auth.Simple.UsernamePassword.verifyPassword password phcString secureContext)
-                    (\correct ->
-                        test "the same password verifies against its own hash"
-                            (\_ -> Expect.equal {} correct)
-                    )
-                , awaitError "Verify an incorrect password against the PHC string"
-                    (Auth.Simple.UsernamePassword.verifyPassword "wrongpw" phcString secureContext)
-                    (\incorrect ->
-                        test "A different password is rejected with PasswordMismatch"
-                            (\_ -> Expect.equal Auth.Simple.Credential.Password.PasswordMismatch incorrect)
-                    )
-                ]
         )
