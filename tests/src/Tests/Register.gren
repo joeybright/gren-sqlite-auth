@@ -17,7 +17,7 @@ runs, so each run derives unique usernames from a fresh UUID.
 
 import Auth.Simple
 import Auth.Simple.Identifier.Username
-import Auth.Simple.Method.Password
+import Auth.Simple.Credential.Password
 import Auth.Simple.UsernamePassword
 import Crypto
 import Expect
@@ -43,7 +43,7 @@ tests fsPermission secureContext =
         migrations =
             [ Auth.Simple.migrationV1
             , Auth.Simple.Identifier.Username.migration.v1
-            , Auth.Simple.Method.Password.migrationV1
+            , Auth.Simple.Credential.Password.migrationV1
             ]
     in
     await
