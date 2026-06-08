@@ -1,1 +1,3 @@
-# gren-simple-auth
+# gren-sqlite-auth
+
+This package assumes a minimum specific set of tables ...
