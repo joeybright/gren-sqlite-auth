@@ -1,0 +1,44 @@
+module Auth.Simple.Token exposing ( Token )
+
+{-| The artifact a successful login hands back: the thing a client presents on
+later requests to prove it already authenticated.
+
+This is the third pluggable abstraction in the package, alongside
+[`Identifier`](Auth.Simple.Identifier) (who you are) and
+[`Credential`](Auth.Simple.Credential) (how you prove it). You combine an
+`Identifier` with a `Credential` to obtain a `Token`. A `Token` is the genus; a
+database-stored session ([`Auth.Simple.Token.Session`](Auth.Simple.Token.Session))
+is its first species, a JWT a future one.
+
+Like the other abstractions, a `Token` is a plain bundle of functions held per
+call — it carries no stored configuration. Each species owns its own migrations as
+a separate module export (a JWT species may need none), so they are not a field
+here.
+
+@docs Token
+
+-}
+
+import Crypto
+import Sqlite
+import Task exposing ( Task )
+
+
+{-| A bundle of functions describing one way to issue, verify, and revoke the
+token a login hands back.
+
+- `error` — the species' failure type (a stored session uses `Sqlite.Error`).
+- `issued` — what `issue` returns, i.e. what `login` hands the caller (a stored
+  session returns `{ session, token }`).
+- `verified` — what a presented token resolves to on success (a stored session
+  resolves to its `Session` row).
+
+`issue` takes only `{ userId }`: lifetime and expiry policy live inside the
+implementation, not the caller. `verify` and `revoke` take the raw bearer string
+the client holds — uniform across sessions and JWTs.
+-}
+type alias Token error issued verified =
+    { issue : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error issued
+    , verify : String -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe verified)
+    , revoke : String -> Sqlite.Database -> Crypto.SecureContext -> Task error {}
+    }

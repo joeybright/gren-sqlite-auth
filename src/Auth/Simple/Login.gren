@@ -1,8 +1,9 @@
 module Auth.Simple.Login exposing ( login, Error(..) )
 
-{-| Drive an [`Identifier`](Auth.Simple.Identifier) and a
-[`Credential`](Auth.Simple.Credential) into a login workflow: resolve the
-identifier to a user, validate the credential, and issue a session.
+{-| Drive an [`Identifier`](Auth.Simple.Identifier), a
+[`Credential`](Auth.Simple.Credential), and a [`Token`](Auth.Simple.Token) into a
+login workflow: resolve the identifier to a user, validate the credential, and
+issue a token.
 
 @docs login, Error
 
@@ -10,52 +11,54 @@ identifier to a user, validate the credential, and issue a session.
 
 import Auth.Simple.Credential exposing ( Credential )
 import Auth.Simple.Identifier exposing ( Identifier )
-import Auth.Simple.Session as Session exposing ( Session )
+import Auth.Simple.Token exposing ( Token )
 import Crypto
 import Sqlite
 import Task exposing ( Task )
-import Time
 
 
-{-| Everything a login can go wrong on: resolving the identifier (`idErr`), no
-user owning that identifier, validating the credential (`credErr`), or opening the
-session.
+{-| Everything a login can go wrong on: resolving the identifier (`identifierError`),
+no user owning that identifier, validating the credential (`credentialError`), or
+issuing the token (`tokenError`).
 
 These are kept distinct for clarity during development; collapsing them into one
 opaque "invalid credentials" (to resist user enumeration) is a later hardening
 step.
 -}
-type Error identifierError credentialError
+type Error identifierError credentialError tokenError
     = IdentifierError identifierError
     | IdentifierNotFound
     | CredentialError credentialError
-    | SessionError Sqlite.Error
+    | TokenError tokenError
 
 
 {-| Build a login function from a database, secure context, an
-[`Identifier`](Auth.Simple.Identifier), and a
-[`Credential`](Auth.Simple.Credential). Partially apply the first four arguments
-to get your app's own login, then call it with a runtime identifier value and
-secret:
+[`Identifier`](Auth.Simple.Identifier), a
+[`Credential`](Auth.Simple.Credential), and a [`Token`](Auth.Simple.Token).
+Partially apply the first five arguments to get your app's own login, then call it
+with a runtime identifier value and secret:
 
     myLogin =
         Auth.Simple.Login.login db ctx
             Auth.Simple.Identifier.Username.identifier
             Auth.Simple.Credential.Password.credential
+            Auth.Simple.Token.Session.token
 
     myLogin { identifier = "alice", secret = plainTextPassword }
 
-On success it issues a session and returns `{ session, token }` — hand `token` to
-the client, keep nothing else.
+On success it issues a token and returns whatever the [`Token`](Auth.Simple.Token)
+produces — for the database-stored session that is `{ session, token }`; hand
+`token` to the client, keep nothing else.
 -}
 login :
     Sqlite.Database
     -> Crypto.SecureContext
     -> Identifier identifierError identifierValue
     -> Credential credentialError candidateCredential storedCredential
+    -> Token tokenError issued verified
     -> { identifier : identifierValue, secret : candidateCredential }
-    -> Task (Error identifierError credentialError) { session : Session, token : String }
-login database secureContext identifier credential input =
+    -> Task (Error identifierError credentialError tokenError) issued
+login database secureContext identifier credential token input =
     identifier.resolve input.identifier database secureContext
         |> Task.mapError IdentifierError
         |> Task.andThen
@@ -70,37 +73,9 @@ login database secureContext identifier credential input =
                             database
                             secureContext
                             |> Task.mapError CredentialError
-                            |> Task.andThen (\_ -> issueSession userId database secureContext)
+                            |> Task.andThen
+                                (\_ ->
+                                    token.issue { userId = userId } database secureContext
+                                        |> Task.mapError TokenError
+                                )
             )
-
-
-{-| Open a fresh session for a verified user, expiring `sessionLifetimeMillis`
-from now.
--}
-issueSession :
-    String
-    -> Sqlite.Database
-    -> Crypto.SecureContext
-    -> Task (Error idErr credErr) { session : Session, token : String }
-issueSession userId database secureContext =
-    Time.now
-        |> Task.andThen
-            (\now ->
-                Session.create
-                    { userId = userId
-                    , expiresAt = Time.posixToMillis now + sessionLifetimeMillis
-                    }
-                    database
-                    secureContext
-                    |> Task.mapError SessionError
-            )
-
-
-{-| How long an issued session stays valid: 30 days, in milliseconds.
-
-Hard-coded for now to match the lifetime used elsewhere in the package; a future
-revision can lift this into `login`'s configuration.
--}
-sessionLifetimeMillis : Int
-sessionLifetimeMillis =
-    30 * 24 * 60 * 60 * 1000

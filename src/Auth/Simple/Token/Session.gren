@@ -1,5 +1,6 @@
-module Auth.Simple.Session exposing
+module Auth.Simple.Token.Session exposing
     ( Session
+    , token
     , generateTokenBytes
     , encodeToken
     , hashToken
@@ -7,18 +8,26 @@ module Auth.Simple.Session exposing
     , insert
     , getByToken
     , update
+    , revoke
     , delete
+    , migration
+    , migrationV1
     )
 
-{-| CRUD access to the `sessions` table.
+{-| The database-stored [`Token`](Auth.Simple.Token) species, plus CRUD access to
+the `sessions` table that backs it.
 
 A session is a login token tied to a user. The raw token is handed to the client
 once (as a cookie); only its SHA-256 hash is stored in `sessions.id`, so a stolen
 database can't be replayed as live sessions. Functions that take a token hash it
 at the boundary. `revoked_at` is nullable so logout can mark a row instead of
-deleting it. The schema is owned by [`Auth.Simple.migrationV1`](Auth.Simple).
+deleting it.
+
+[`token`](#token) bundles `create`/`getByToken`/`revoke` into the pluggable
+`Token` interface; this module owns the `sessions` table via [`migration`](#migration).
 
 @docs Session
+@docs token
 @docs generateTokenBytes
 @docs encodeToken
 @docs hashToken
@@ -26,10 +35,14 @@ deleting it. The schema is owned by [`Auth.Simple.migrationV1`](Auth.Simple).
 @docs insert
 @docs getByToken
 @docs update
+@docs revoke
 @docs delete
+@docs migration
+@docs migrationV1
 
 -}
 
+import Auth.Simple.Token exposing ( Token )
 import Base64.Decode
 import Base64.Encode
 import Bytes exposing ( Bytes )
@@ -52,6 +65,43 @@ type alias Session =
     , lastUsedAt : Int
     , revokedAt : Maybe Int
     }
+
+
+{-| The database-stored implementation of the [`Token`](Auth.Simple.Token)
+interface: issue a session with [`create`](#create), verify a presented token with
+[`getByToken`](#getByToken), and revoke it with [`revoke`](#revoke). Pass this as
+the token argument to [`Auth.Simple.Login.login`](Auth.Simple.Login).
+
+`issue` returns `{ session, token }` — hand `token` to the client, keep nothing
+else. `verify` resolves a raw token to its stored [`Session`](#Session).
+-}
+token : Token Sqlite.Error { session : Session, token : String } Session
+token =
+    { issue =
+        (\{ userId } database secureContext ->
+            Time.now
+                |> Task.andThen
+                    (\now ->
+                        create
+                            { userId = userId
+                            , expiresAt = Time.posixToMillis now + sessionLifetimeMillis
+                            }
+                            database
+                            secureContext
+                    )
+        )
+    , verify = getByToken
+    , revoke = revoke
+    }
+
+
+{-| How long an issued session stays valid: 30 days, in milliseconds.
+
+Hard-coded for now; a future revision can lift this into configuration.
+-}
+sessionLifetimeMillis : Int
+sessionLifetimeMillis =
+    30 * 24 * 60 * 60 * 1000
 
 
 {-| Decode a single `sessions` row into a [`Session`](#Session).
@@ -167,8 +217,8 @@ hashToken secureContext tokenBytes =
 [`encodeToken`](#encodeToken). A non-base64 token yields `Nothing`.
 -}
 decodeToken : String -> Maybe Bytes
-decodeToken token =
-    when Base64.Decode.bytes token is
+decodeToken rawToken =
+    when Base64.Decode.bytes rawToken is
         Ok tokenBytes ->
             Just tokenBytes
 
@@ -178,17 +228,18 @@ decodeToken token =
 
 {-| Map a base64 token string to the value stored in `sessions.id`. Decode it to raw
 bytes, then [`hashToken`](#hashToken). The boundary used by
-[`getByToken`](#getByToken), [`update`](#update), and [`delete`](#delete). An
-undecodable cookie is passed through verbatim and simply matches no row.
+[`getByToken`](#getByToken), [`update`](#update), [`revoke`](#revoke), and
+[`delete`](#delete). An undecodable cookie is passed through verbatim and simply
+matches no row.
 -}
 hashTokenString : Crypto.SecureContext -> String -> Task x String
-hashTokenString secureContext token =
-    when decodeToken token is
+hashTokenString secureContext rawToken =
+    when decodeToken rawToken is
         Just tokenBytes ->
             hashToken secureContext tokenBytes
 
         Nothing ->
-            Task.succeed token
+            Task.succeed rawToken
 
 
 {-| Insert a session row into the `sessions` table using caller-supplied values.
@@ -235,8 +286,8 @@ matches. The token is mapped to the stored id via
 [`hashTokenString`](#hashTokenString) before matching.
 -}
 getByToken : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error (Maybe Session)
-getByToken token database secureContext =
-    hashTokenString secureContext token
+getByToken rawToken database secureContext =
+    hashTokenString secureContext rawToken
         |> Task.andThen
             (\hashedToken ->
                 Sqlite.getMaybeOne database
@@ -260,18 +311,18 @@ getByToken token database secureContext =
 
 {-| Update a session's mutable fields, identified by its raw token.
 
-Covers both "touch on use" (bump `lastUsedAt`) and revocation (set `revokedAt`).
-Pass `Nothing` for `revokedAt` to keep the session live. `expiresAt` extends or
-shortens the lifetime. The `token` is mapped to the stored id via
+Covers "touch on use" (bump `lastUsedAt`) and lifetime changes (`expiresAt`); for
+logout use [`revoke`](#revoke). Pass `Nothing` for `revokedAt` to keep the session
+live. The `rawToken` is mapped to the stored id via
 [`hashTokenString`](#hashTokenString) before matching.
 -}
 update :
-    { token : String, expiresAt : Int, lastUsedAt : Int, revokedAt : Maybe Int }
+    { rawToken : String, expiresAt : Int, lastUsedAt : Int, revokedAt : Maybe Int }
     -> Sqlite.Database
     -> Crypto.SecureContext
     -> Task Sqlite.Error Sqlite.ExecutionSummary
-update { token, expiresAt, lastUsedAt, revokedAt } database secureContext =
-    hashTokenString secureContext token
+update { rawToken, expiresAt, lastUsedAt, revokedAt } database secureContext =
+    hashTokenString secureContext rawToken
         |> Task.andThen
             (\hashedToken ->
                 Sqlite.execute database
@@ -291,17 +342,46 @@ update { token, expiresAt, lastUsedAt, revokedAt } database secureContext =
             )
 
 
+{-| Revoke a session by its raw token, stamping `revoked_at` with the current
+time. Idempotent: a token matching no row simply updates nothing. The row is kept
+for auditing — to hard-delete instead, use [`delete`](#delete). The `rawToken` is
+mapped to the stored id via [`hashTokenString`](#hashTokenString) before matching.
+-}
+revoke : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
+revoke rawToken database secureContext =
+    Task.map2
+        (\hashedToken now -> { hashedToken = hashedToken, now = now })
+        (hashTokenString secureContext rawToken)
+        Time.now
+        |> Task.andThen
+            (\{ hashedToken, now } ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        UPDATE sessions
+                        SET revoked_at = :revoked_at
+                        WHERE id = :id
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.int "revoked_at" (Time.posixToMillis now)
+                        , Sqlite.Encode.string "id" hashedToken
+                        ]
+                    }
+            )
+        |> Task.map (\_ -> {})
+
+
 
 --- deleting sessions
 
 
-{-| Hard-delete a session by its raw token. To keep the row for auditing, set 
-`revoked_at` via [`update`](#update) instead. The `token` is mapped to the 
-stored id via [`hashTokenString`](#hashTokenString) before matching.
+{-| Hard-delete a session by its raw token. To keep the row for auditing, use
+[`revoke`](#revoke) instead. The `rawToken` is mapped to the stored id via
+[`hashTokenString`](#hashTokenString) before matching.
 -}
 delete : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Sqlite.ExecutionSummary
-delete token database secureContext =
-    hashTokenString secureContext token
+delete rawToken database secureContext =
+    hashTokenString secureContext rawToken
         |> Task.andThen
             (\hashedToken ->
                 Sqlite.execute database
@@ -315,3 +395,47 @@ delete token database secureContext =
                         ]
                     }
             )
+
+
+
+--- migrations
+
+
+{-| The migrations this token species owns, keyed by version.
+-}
+migration : { v1 : { name : String, statements : Array String } }
+migration =
+    { v1 = migrationV1
+    }
+
+
+{-| Create the `sessions` table backing the database-stored token. Run after
+[`Auth.Simple.migrationV1`](Auth.Simple) (it references `users`).
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Auth.Simple.Token.Session.migrationV1` - Add sessions table"
+    , statements =
+        [ addSessionsTableMigrationSQL
+        ]
+    }
+
+
+{-| Migration SQL for adding a `sessions` table.
+
+`revoked_at` is nullable so explicit logout/revocation can mark a row without
+deleting it, preserving the `auth_events` audit trail.
+-}
+addSessionsTableMigrationSQL : String
+addSessionsTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        last_used_at INTEGER NOT NULL,
+        revoked_at INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    """

@@ -11,16 +11,18 @@ and exist with a specific schema (minimal schema) for the auth
 to work at all.
 
 - `users` - user data, can be augmented after this with more data
-- `sessions` - login session; method-agnostic
 - `auth_events` - event log for auditing; can be disabled?
 
-## Unknown... TBD
+## Token-specific
 
-I'm not sure if these tables are method-specific or just part of
-the base tables? I could create them and they could just be empty?
+The artifact issued on login owns its own table. The database-stored token
+([`Auth.Simple.Token.Session`](Auth.Simple.Token.Session)) brings:
 
-- `user_usernames`
-- `user_emails`
+- `sessions` - login session; created by `Auth.Simple.Token.Session.migration`
+
+## Identifier-specific
+
+- `usernames` - created by `Auth.Simple.Identifier.Username.migration`
 
 ## Password-specific method
 
@@ -57,9 +59,8 @@ This should be run prior to any authentication-specific migrations.
 migrationV1 : { name : String, statements : Array String }
 migrationV1 =
     { name = "`Auth.Simple.migrationV1` - Add tables necessary for simple auth"
-    , statements = 
+    , statements =
         [ addUsersTableMigrationSQL
-        , addSessionsTableMigrationSql
         , addAuthEventsTableMigrationSql
         ]
     }
@@ -103,45 +104,6 @@ order declared by `requiredUsersColumns`).
 checkUsersTableSchema : Sqlite.Database -> Task SchemaCheckError {}
 checkUsersTableSchema =
     checkTableSchema "users" requiredUsersColumns
-
-
-
---- `sessions` table
-
-
-{-| Migration SQL for adding a `sessions` table.
-
-`id` is an opaque token chosen by the consumer (random bytes, UUID, etc.).
-`revoked_at` is nullable so explicit logout/revocation can mark a row without
-deleting it, preserving the `auth_events` audit trail.
--}
-addSessionsTableMigrationSql : String
-addSessionsTableMigrationSql =
-    """
-    CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY,
-        user_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
-        last_used_at INTEGER NOT NULL,
-        revoked_at INTEGER,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-    """
-
-
-{-| The columns the `sessions` table must contain for this package to function.
--}
-requiredSessionsColumns : Array String
-requiredSessionsColumns =
-    [ "id", "user_id", "created_at", "expires_at", "last_used_at", "revoked_at" ]
-
-
-{-| Confirm the live `sessions` table has every column this package depends on.
--}
-checkSessionsTableSchema : Sqlite.Database -> Task SchemaCheckError {}
-checkSessionsTableSchema =
-    checkTableSchema "sessions" requiredSessionsColumns
 
 
 
