@@ -7,12 +7,9 @@
     "version": "1.0.0",
     "exposed-modules": [
         "Auth.Simple",
-        "Auth.Simple.UsernamePassword",
-        "Auth.Simple.User",
-        "Auth.Simple.Session",
-        "Auth.Simple.AuthEvent",
         "Auth.Simple.Login",
         "Auth.Simple.Register",
+        "Auth.Simple.Session",
         "Auth.Simple.Identifier",
         "Auth.Simple.Identifier.Username",
         "Auth.Simple.Credential",
