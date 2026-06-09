@@ -13,10 +13,7 @@ see [`Auth.Simple.Credential.Password.Reset`](Auth.Simple.Credential.Password.Re
 
 -}
 
-import Auth.Simple.AuthEvent as AuthEvent
 import Auth.Simple.Credential as Credential exposing ( Credential )
-import Auth.Simple.Internal.Event as Event
-import Auth.Simple.Internal.Transaction as Transaction
 import Crypto
 import Sqlite
 import Task exposing ( Task )
@@ -24,8 +21,10 @@ import Task exposing ( Task )
 
 {-| Everything a credential change can go wrong on: the current secret didn't
 match (`InvalidCredentials`), the credential is locked after repeated failures
-(`Locked`), a real fault in the credential itself (`credentialError`), or a
-failing `BEGIN`/`COMMIT`/`ROLLBACK` around the replacement (`TransactionError`).
+(`Locked`), a real fault while validating (`credentialError`), or the
+transactional replacement itself (`TransactionError` — the `remove`/`insert`
+writes and the `BEGIN`/`COMMIT`/`ROLLBACK` around them are all plain database
+operations).
 -}
 type Error credentialError
     = InvalidCredentials
@@ -37,13 +36,13 @@ type Error credentialError
 {-| Replace a user's stored secret after validating the current one.
 
 The replacement is the credential's `remove` followed by its `insert`, run
-inside one transaction so the user is never left without a secret. Replacing
-rather than mutating deliberately resets the credential's bookkeeping (creation
-time, failure counters) — correct for a fresh secret.
+inside one [`Sqlite.inTransaction`](Sqlite#inTransaction) so the user is never
+left without a secret. Replacing rather than mutating deliberately resets the
+credential's bookkeeping (creation time, failure counters) — correct for a
+fresh secret.
 
 The new secret is the credential's `stored` type (e.g. an already-hashed
-password), prepared by the caller. A successful change records a
-`password_changed` row in `auth_events`, best-effort.
+password), prepared by the caller.
 -}
 change :
     Sqlite.Database
@@ -61,23 +60,17 @@ change database secureContext credential input =
             (\validity ->
                 when validity is
                     Credential.Valid ->
-                        Transaction.withTransaction TransactionError
-                            database
+                        Sqlite.inTransaction database
                             (credential.remove { userId = input.userId } database secureContext
-                                |> Task.mapError CredentialError
                                 |> Task.andThen
                                     (\_ ->
                                         credential.insert
                                             { userId = input.userId, secret = input.new }
                                             database
                                             secureContext
-                                            |> Task.mapError CredentialError
-                                    )
-                                |> Task.andThen
-                                    (\_ ->
-                                        Event.record database secureContext { userId = Just input.userId, eventType = AuthEvent.PasswordChanged }
                                     )
                             )
+                            |> Task.mapError TransactionError
 
                     Credential.Invalid ->
                         Task.fail InvalidCredentials

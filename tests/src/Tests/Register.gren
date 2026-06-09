@@ -8,8 +8,8 @@ Covers the typed errors around the (already sound) hashing core: a too-short
 password is rejected by
 [`Password.validateLength`](Auth.Simple.Credential.Password) before any write, a
 blank username is rejected as `UsernameBlank`, a repeated username is reported as
-`UsernameTaken`, and — because the username identifier normalizes — a
-case/whitespace variant of an existing username is *also* `UsernameTaken`. A
+`IdentifierTaken`, and — because the username identifier normalizes — a
+case/whitespace variant of an existing username is *also* `IdentifierTaken`. A
 clean registration still succeeds. The database persists across runs, so each
 run derives unique usernames from a fresh UUID.
 
@@ -38,7 +38,7 @@ drives.
 -}
 type SetupError
     = HashError Password.HashPasswordError
-    | RegisterError (Register.Error Username.AsIdentifierError Password.AsCredentialError)
+    | RegisterError (Register.Error Username.AsIdentifierError)
 
 
 {-| Hash the password, then register the username + password combo through
@@ -133,8 +133,8 @@ tests fsPermission secureContext =
                                                 "Register the same username again"
                                                 (doRegister { username = "dup-" ++ suffix, password = password } database secureContext)
                                                 (\error ->
-                                                    test "a duplicate username is rejected with UsernameTaken"
-                                                        (\_ -> Expect.equal (RegisterError (Register.IdentifierError Username.UsernameTaken)) error)
+                                                    test "a duplicate username is rejected with IdentifierTaken"
+                                                        (\_ -> Expect.equal (RegisterError Register.IdentifierTaken) error)
                                                 )
                                             ]
                                     )
@@ -149,8 +149,8 @@ tests fsPermission secureContext =
                                             "Register a case/whitespace variant of it"
                                             (doRegister { username = "  casetest-" ++ suffix ++ "  ", password = password } database secureContext)
                                             (\error ->
-                                                test "a case/whitespace variant is rejected with UsernameTaken"
-                                                    (\_ -> Expect.equal (RegisterError (Register.IdentifierError Username.UsernameTaken)) error)
+                                                test "a case/whitespace variant is rejected with IdentifierTaken"
+                                                    (\_ -> Expect.equal (RegisterError Register.IdentifierTaken) error)
                                             )
                                     )
                                 ]

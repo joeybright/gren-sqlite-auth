@@ -11,7 +11,6 @@ and exist with a specific schema (minimal schema) for the auth
 to work at all.
 
 - `users` - user data, can be augmented after this with more data
-- `auth_events` - event log for auditing; can be disabled?
 
 ## Token-specific
 
@@ -61,7 +60,6 @@ migrationV1 =
     { name = "`Auth.Simple.migrationV1` - Add tables necessary for simple auth"
     , statements =
         [ addUsersTableMigrationSQL
-        , addAuthEventsTableMigrationSql
         ]
     }
 
@@ -105,43 +103,6 @@ checkUsersTableSchema : Sqlite.Database -> Task SchemaCheckError {}
 checkUsersTableSchema =
     checkTableSchema "users" requiredUsersColumns
 
-
-
---- `auth_events` table
-
-
-{-| Migration SQL for adding an `auth_events` audit table.
-
-`user_id` is nullable because failed login attempts may not resolve to a known
-user. `ON DELETE SET NULL` preserves audit history when a user is purged.
-`metadata` holds a JSON blob for method-specific fields (IP, user-agent, etc.).
--}
-addAuthEventsTableMigrationSql : String
-addAuthEventsTableMigrationSql =
-    """
-    CREATE TABLE IF NOT EXISTS auth_events (
-        id TEXT PRIMARY KEY,
-        user_id TEXT,
-        event_type TEXT NOT NULL,
-        occurred_at INTEGER NOT NULL,
-        metadata TEXT,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-    );
-    """
-
-
-{-| The columns the `auth_events` table must contain for this package to function.
--}
-requiredAuthEventsColumns : Array String
-requiredAuthEventsColumns =
-    [ "id", "user_id", "event_type", "occurred_at", "metadata" ]
-
-
-{-| Confirm the live `auth_events` table has every column this package depends on.
--}
-checkAuthEventsTableSchema : Sqlite.Database -> Task SchemaCheckError {}
-checkAuthEventsTableSchema =
-    checkTableSchema "auth_events" requiredAuthEventsColumns
 
 
 

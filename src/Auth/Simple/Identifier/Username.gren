@@ -294,14 +294,13 @@ normalize =
 
 
 {-| Failure modes when driving the `usernames` table through the generic
-[`Identifier`](Auth.Simple.Identifier) interface: a database fault, a username
-that is blank after [`normalize`](#normalize), or one that another user already
-holds.
+[`Identifier`](Auth.Simple.Identifier) interface: a database fault, or a
+username that is blank after [`normalize`](#normalize) — a value that can never
+resolve to a user nor be registered.
 -}
 type AsIdentifierError
     = StorageError Sqlite.Error
     | UsernameBlank
-    | UsernameTaken
 
 
 {-| Expose usernames as a generic [`Identifier`](Auth.Simple.Identifier): `resolve`
@@ -309,26 +308,20 @@ maps a username string to the owning user's id via [`getByUsername`](#getByUsern
 and `insert` registers a new username for a user via [`create`](#create). Both
 run the input through [`normalize`](#normalize) first.
 
-`insert` rejects a blank username (`UsernameBlank`) and one that already exists
-(`UsernameTaken`). The taken-check is a read-before-write;
-[`Auth.Simple.Register`](Auth.Simple.Register) runs it inside a transaction, and
-the table's `UNIQUE (username)` constraint remains the backstop for a race —
-surfacing as `StorageError`.
+`resolve` rejects a blank username (`UsernameBlank`) — malformed input, distinct
+from `Nothing` (well-formed but unknown). `insert` is a plain write;
+[`Auth.Simple.Register`](Auth.Simple.Register) checks availability via `resolve`
+before inserting, and the table's `UNIQUE (username)` constraint remains the
+backstop for a race.
 -}
 identifier : Identifier AsIdentifierError String
 identifier =
     { resolve =
         (\username database _ ->
-            getByUsername (normalize username) database
-                |> Task.mapError StorageError
-                |> Task.map (Maybe.map .userId)
-        )
-    , insert =
-        (\{ userId, value } database secureContext ->
             let
                 normalized : String
                 normalized =
-                    normalize value
+                    normalize username
             in
             if String.isEmpty normalized then
                 Task.fail UsernameBlank
@@ -336,16 +329,11 @@ identifier =
             else
                 getByUsername normalized database
                     |> Task.mapError StorageError
-                    |> Task.andThen
-                        (\existing ->
-                            when existing is
-                                Just _ ->
-                                    Task.fail UsernameTaken
-
-                                Nothing ->
-                                    create { userId = userId, username = normalized } database secureContext
-                                        |> Task.mapError StorageError
-                                        |> Task.map (\_ -> {})
-                        )
+                    |> Task.map (Maybe.map .userId)
+        )
+    , insert =
+        (\{ userId, value } database secureContext ->
+            create { userId = userId, username = normalize value } database secureContext
+                |> Task.map (\_ -> {})
         )
     }

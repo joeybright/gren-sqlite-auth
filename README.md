@@ -31,16 +31,16 @@ Workflows compose them:
 - **`Auth.Simple.Credential.Password.Reset`** — single-use, expiring reset
   tokens for the forgotten-password case (delivery is your job).
 
-Workflows record `auth_events` rows (`user_registered`, `user_logged_in`,
-`login_failed`, `password_changed`) best-effort as they go.
+The package does no logging of its own — what (if anything) to record about
+registrations, logins, and password changes is your application's decision.
 
 ## Tables
 
 You own the `users` table — `Auth.Simple.migrationV1` bootstraps a minimal one
 (`id`, `created_at`, `updated_at`) with `IF NOT EXISTS`, and you may extend it
 freely. The package owns the rest, each foreign-keyed to `users.id`:
-`usernames`, `passwords` + `password_reset_tokens`, `sessions`, and
-`auth_events`. Run the migrations of the pieces you use, base first:
+`usernames`, `passwords` + `password_reset_tokens`, and `sessions`. Run the
+migrations of the pieces you use, base first:
 
 ```gren
 migrations =
@@ -87,22 +87,13 @@ login { username, password } =
         { identifier = username, secret = Password.fromString password }
 
 -- Verify a request: Nothing for unknown, expired, or revoked tokens.
+-- A successful verify bumps the session's last_used_at.
 authenticate cookie =
     Session.verifyToken cookie database secureContext
 
--- Logout: revoke the session and note it in the audit log.
-logout cookie userId =
+-- Logout: revoke the session (the row is kept, marked revoked).
+logout cookie =
     Session.revoke cookie database secureContext
-        |> Task.andThen
-            (\_ ->
-                Auth.Simple.AuthEvent.create
-                    { userId = Just userId
-                    , eventType = Auth.Simple.AuthEvent.UserLoggedOut
-                    , metadata = Nothing
-                    }
-                    database
-                    secureContext
-            )
 ```
 
 ## Tests

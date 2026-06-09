@@ -20,13 +20,16 @@ functions: the `Sqlite.Database` and `Crypto.SecureContext` are supplied per cal
 by whatever drives it (e.g. [`Auth.Simple.Login`](Auth.Simple.Login)), so it holds
 no config of its own. `value` is the identifier type the consumer supplies at
 login; `error` is the failure type `resolve` surfaces. `resolve` succeeds with
-`Nothing` when no user owns that identifier.
+`Nothing` when no user owns that identifier, and fails for a value that could
+never resolve (e.g. a blank username) as well as for storage faults.
 
-`resolve` answers "who owns this identifier value?"; `insert` writes a new
-identifier value for a user (account creation, adding an identifier). `remove`
-remains a future seam.
+`insert` writes a new identifier value for a user (account creation, adding an
+identifier). It is a plain database write — `Sqlite.Error`, no custom error — so
+workflows can run it inside [`Sqlite.inTransaction`](Sqlite#inTransaction);
+domain checks (is the value well-formed? is it already taken?) belong to
+`resolve`, which workflows run before opening the transaction.
 -}
 type alias Identifier error value =
     { resolve : value -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe String)
-    , insert : { userId : String, value : value } -> Sqlite.Database -> Crypto.SecureContext -> Task error {}
+    , insert : { userId : String, value : value } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
     }

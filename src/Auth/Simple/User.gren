@@ -186,8 +186,7 @@ update id database =
 {-| Delete a user by `id`.
 
 Foreign keys reference `users(id)`, so deleting a user cascades to its sessions,
-usernames, and password rows (and sets `auth_events.user_id` to null) per the
-schema in [`Auth.Simple`](Auth.Simple).
+usernames, and password rows.
 -}
 delete : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
 delete id database =

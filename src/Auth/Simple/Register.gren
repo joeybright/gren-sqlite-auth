@@ -16,49 +16,39 @@ reserved username, an unconfirmed email — login through it simply fails until 
 credential exists). [`register`](#register) is the convenience that does a user, an
 identifier, and a credential together.
 
+Each registration first checks the identifier value is available (via the
+bundle's `resolve`), then runs its writes inside one
+[`Sqlite.inTransaction`](Sqlite#inTransaction) so a half-finished account (a user
+with no identifier, an identifier with no credential) never lands. The
+identifier's unique constraint remains the backstop should two registrations
+race past the availability check.
+
 @docs identifier, credential, register, Error
 
 -}
 
-import Auth.Simple.AuthEvent as AuthEvent
 import Auth.Simple.Credential exposing ( Credential )
 import Auth.Simple.Identifier exposing ( Identifier )
-import Auth.Simple.Internal.Event as Event
-import Auth.Simple.Internal.Transaction as Transaction
 import Auth.Simple.User as User
 import Crypto
 import Sqlite
 import Task exposing ( Task )
 
 
-{-| Everything a registration can go wrong on: creating the user, writing the
-identifier (`identifierError`), or writing the credential (`credentialError`).
+{-| Everything a registration can go wrong on: resolving the identifier during
+the availability check (`identifierError`), the identifier value already
+belonging to a user (`IdentifierTaken`), or the transactional writes — user,
+identifier, credential, and the `BEGIN`/`COMMIT`/`ROLLBACK` around them are all
+plain database operations, so they share `TransactionError`.
 
-A single error type is shared by all three entry points; [`identifier`](#identifier)
-never produces a `CredentialError` and [`credential`](#credential) never produces an
-`IdentifierError`, so those calls leave the unused parameter polymorphic and unify
-cleanly when composed. `TransactionError` is the failure of a `BEGIN`/`COMMIT`/
-`ROLLBACK` itself.
+[`credential`](#credential) involves no identifier and never produces the
+identifier variants; it leaves the parameter polymorphic and unifies cleanly
+when composed.
 -}
-type Error identifierError credentialError
-    = UserError Sqlite.Error
-    | IdentifierError identifierError
-    | CredentialError credentialError
+type Error identifierError
+    = IdentifierError identifierError
+    | IdentifierTaken
     | TransactionError Sqlite.Error
-
-
-{-| Run a registration's writes inside one SQLite transaction (via
-[`Auth.Simple.Internal.Transaction`](Auth.Simple.Internal.Transaction)) so a
-half-finished account (a user with no identifier, an identifier with no
-credential) never lands. A failing `BEGIN`/`COMMIT`/`ROLLBACK` surfaces as
-[`TransactionError`](#Error).
--}
-withTransaction :
-    Sqlite.Database
-    -> Task (Error identifierError credentialError) a
-    -> Task (Error identifierError credentialError) a
-withTransaction =
-    Transaction.withTransaction TransactionError
 
 
 {-| Settle on the user to register against: use the supplied `userId`, or, when it
@@ -69,7 +59,7 @@ resolveUserId :
     Maybe String
     -> Sqlite.Database
     -> Crypto.SecureContext
-    -> Task (Error identifierError credentialError) String
+    -> Task Sqlite.Error String
 resolveUserId maybeUserId database secureContext =
     when maybeUserId is
         Just userId ->
@@ -77,8 +67,31 @@ resolveUserId maybeUserId database secureContext =
 
         Nothing ->
             User.create database secureContext
-                |> Task.mapError UserError
                 |> Task.map (\user -> user.id)
+
+
+{-| Check an identifier value is available before any write: resolve it, failing
+with [`IdentifierTaken`](#Error) when a user already owns it. Malformed values
+(e.g. a blank username) surface as the bundle's own `identifierError`.
+-}
+ensureAvailable :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Identifier identifierError value
+    -> value
+    -> Task (Error identifierError) {}
+ensureAvailable database secureContext theIdentifier value =
+    theIdentifier.resolve value database secureContext
+        |> Task.mapError IdentifierError
+        |> Task.andThen
+            (\existing ->
+                when existing is
+                    Just _ ->
+                        Task.fail IdentifierTaken
+
+                    Nothing ->
+                        Task.succeed {}
+            )
 
 
 {-| Register an [`Identifier`](Auth.Simple.Identifier) value for a user. Pass
@@ -90,20 +103,24 @@ identifier :
     -> Crypto.SecureContext
     -> Identifier identifierError value
     -> { userId : Maybe String, value : value }
-    -> Task (Error identifierError credentialError) { userId : String }
+    -> Task (Error identifierError) { userId : String }
 identifier database secureContext theIdentifier input =
-    withTransaction database
-        (resolveUserId input.userId database secureContext
-            |> Task.andThen
-                (\userId ->
-                    theIdentifier.insert
-                        { userId = userId, value = input.value }
-                        database
-                        secureContext
-                        |> Task.mapError IdentifierError
-                        |> Task.map (\_ -> { userId = userId })
-                )
-        )
+    ensureAvailable database secureContext theIdentifier input.value
+        |> Task.andThen
+            (\_ ->
+                Sqlite.inTransaction database
+                    (resolveUserId input.userId database secureContext
+                        |> Task.andThen
+                            (\userId ->
+                                theIdentifier.insert
+                                    { userId = userId, value = input.value }
+                                    database
+                                    secureContext
+                                    |> Task.map (\_ -> { userId = userId })
+                            )
+                    )
+                    |> Task.mapError TransactionError
+            )
 
 
 {-| Register a [`Credential`](Auth.Simple.Credential) secret for a user. The secret
@@ -116,9 +133,9 @@ credential :
     -> Crypto.SecureContext
     -> Credential credentialError candidate stored
     -> { userId : Maybe String, secret : stored }
-    -> Task (Error identifierError credentialError) { userId : String }
+    -> Task (Error identifierError) { userId : String }
 credential database secureContext theCredential input =
-    withTransaction database
+    Sqlite.inTransaction database
         (resolveUserId input.userId database secureContext
             |> Task.andThen
                 (\userId ->
@@ -126,19 +143,16 @@ credential database secureContext theCredential input =
                         { userId = userId, secret = input.secret }
                         database
                         secureContext
-                        |> Task.mapError CredentialError
                         |> Task.map (\_ -> { userId = userId })
                 )
         )
+        |> Task.mapError TransactionError
 
 
 {-| Register an identifier and a credential for the same user in one task. Pass
 `userId = Nothing` to create the user first, or `Just id` to attach both to an
 existing user. The user is resolved once and both writes share it; on success returns
 that user's id.
-
-A successful registration records a `user_registered` row in `auth_events`,
-best-effort: a failure to write the audit row never fails the registration.
 -}
 register :
     Sqlite.Database
@@ -146,29 +160,28 @@ register :
     -> Identifier identifierError value
     -> Credential credentialError candidate stored
     -> { userId : Maybe String, value : value, secret : stored }
-    -> Task (Error identifierError credentialError) { userId : String }
+    -> Task (Error identifierError) { userId : String }
 register database secureContext theIdentifier theCredential input =
-    withTransaction database
-        (resolveUserId input.userId database secureContext
-            |> Task.andThen
-                (\userId ->
-                    theIdentifier.insert
-                        { userId = userId, value = input.value }
-                        database
-                        secureContext
-                        |> Task.mapError IdentifierError
+    ensureAvailable database secureContext theIdentifier input.value
+        |> Task.andThen
+            (\_ ->
+                Sqlite.inTransaction database
+                    (resolveUserId input.userId database secureContext
                         |> Task.andThen
-                            (\_ ->
-                                theCredential.insert
-                                    { userId = userId, secret = input.secret }
+                            (\userId ->
+                                theIdentifier.insert
+                                    { userId = userId, value = input.value }
                                     database
                                     secureContext
-                                    |> Task.mapError CredentialError
+                                    |> Task.andThen
+                                        (\_ ->
+                                            theCredential.insert
+                                                { userId = userId, secret = input.secret }
+                                                database
+                                                secureContext
+                                        )
+                                    |> Task.map (\_ -> { userId = userId })
                             )
-                        |> Task.andThen
-                            (\_ ->
-                                Event.record database secureContext { userId = Just userId, eventType = AuthEvent.UserRegistered }
-                            )
-                        |> Task.map (\_ -> { userId = userId })
-                )
-        )
+                    )
+                    |> Task.mapError TransactionError
+            )

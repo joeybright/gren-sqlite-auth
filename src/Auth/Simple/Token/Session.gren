@@ -314,32 +314,40 @@ as no session at all. This is the `verify` of the [`token`](#token) bundle —
 unlike [`getByToken`](#getByToken), a row that exists but is no longer live
 yields `Nothing`.
 
-Verification is read-only: it does not bump `last_used_at`. Apps that want
-touch-on-use can follow a successful verify with [`update`](#update).
+A successful verification touches the session: `last_used_at` is bumped to now,
+and the returned [`Session`](#Session) reflects it.
 -}
 verifyToken : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error (Maybe Session)
 verifyToken rawToken database secureContext =
     Task.map2
-        (\maybeSession now -> { maybeSession = maybeSession, now = now })
+        (\maybeSession now -> { maybeSession = maybeSession, now = Time.posixToMillis now })
         (getByToken rawToken database secureContext)
         Time.now
-        |> Task.map
+        |> Task.andThen
             (\{ maybeSession, now } ->
                 when maybeSession is
                     Nothing ->
-                        Nothing
+                        Task.succeed Nothing
 
                     Just session ->
                         when session.revokedAt is
                             Just _ ->
-                                Nothing
+                                Task.succeed Nothing
 
                             Nothing ->
-                                if session.expiresAt > Time.posixToMillis now then
-                                    Just session
+                                if session.expiresAt > now then
+                                    update
+                                        { rawToken = rawToken
+                                        , expiresAt = session.expiresAt
+                                        , lastUsedAt = now
+                                        , revokedAt = Nothing
+                                        }
+                                        database
+                                        secureContext
+                                        |> Task.map (\_ -> Just { session | lastUsedAt = now })
 
                                 else
-                                    Nothing
+                                    Task.succeed Nothing
             )
 
 
@@ -462,7 +470,7 @@ migrationV1 =
 {-| Migration SQL for adding a `sessions` table.
 
 `revoked_at` is nullable so explicit logout/revocation can mark a row without
-deleting it, preserving the `auth_events` audit trail.
+deleting it, leaving a trace of the session's lifecycle.
 -}
 addSessionsTableMigrationSQL : String
 addSessionsTableMigrationSQL =
