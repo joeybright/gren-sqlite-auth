@@ -1,24 +1,27 @@
 module Tests.Register exposing ( tests )
 
-{-| End-to-end tests for the registration hardening in
-[`Auth.Simple.UsernamePassword.create`](Auth.Simple.UsernamePassword), run against
-the on-disk `tests/test.sqlite`.
+{-| End-to-end tests for registration through the modular
+[`Auth.Simple.Register`](Auth.Simple.Register) workflow, run against the on-disk
+`tests/test.sqlite`.
 
-Covers the input validation and typed errors layered around the (already sound)
-hashing core: a too-short password and a blank username are rejected before any
-write, a repeated username is reported as `UsernameTaken`, and — because usernames
-are normalized — a case/whitespace variant of an existing username is *also*
-`UsernameTaken`. A clean registration still succeeds. The database persists across
-runs, so each run derives unique usernames from a fresh UUID.
+Covers the typed errors around the (already sound) hashing core: a too-short
+password is rejected by
+[`Password.validateLength`](Auth.Simple.Credential.Password) before any write, a
+blank username is rejected as `UsernameBlank`, a repeated username is reported as
+`UsernameTaken`, and — because the username identifier normalizes — a
+case/whitespace variant of an existing username is *also* `UsernameTaken`. A
+clean registration still succeeds. The database persists across runs, so each
+run derives unique usernames from a fresh UUID.
 
 @docs tests
 
 -}
 
 import Auth.Simple
-import Auth.Simple.Identifier.Username
-import Auth.Simple.Credential.Password
-import Auth.Simple.UsernamePassword
+import Auth.Simple.Credential.Password as Password
+import Auth.Simple.Identifier.Username as Username
+import Auth.Simple.Register as Register
+import Auth.Simple.Token.Session as Session
 import Crypto
 import Expect
 import FileSystem
@@ -29,7 +32,40 @@ import Task exposing ( Task )
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
 
 
-{-| Exercise `create`'s validation, duplicate handling, and case-insensitive
+{-| The ways setting up an account can fail: hashing the password, or the
+registration writes that [`Auth.Simple.Register.register`](Auth.Simple.Register)
+drives.
+-}
+type SetupError
+    = HashError Password.HashPasswordError
+    | RegisterError (Register.Error Username.AsIdentifierError Password.AsCredentialError)
+
+
+{-| Hash the password, then register the username + password combo through
+[`Auth.Simple.Register.register`](Auth.Simple.Register).
+-}
+doRegister :
+    { username : String, password : String }
+    -> Sqlite.Database
+    -> Crypto.SecureContext
+    -> Task SetupError { userId : String }
+doRegister { username, password } database secureContext =
+    Password.hashWithDefaults (Password.fromString password) secureContext
+        |> Task.mapError HashError
+        |> Task.andThen
+            (\hashedPassword ->
+                Register.register database secureContext
+                    Username.identifier
+                    Password.credential
+                    { userId = Nothing
+                    , value = username
+                    , secret = hashedPassword
+                    }
+                    |> Task.mapError RegisterError
+            )
+
+
+{-| Exercise registration's validation, duplicate handling, and case-insensitive
 uniqueness against a real database.
 -}
 tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
@@ -42,24 +78,15 @@ tests fsPermission secureContext =
         migrations : Array Sqlite.Migrate.Migration
         migrations =
             [ Auth.Simple.migrationV1
-            , Auth.Simple.Identifier.Username.migration.v1
-            , Auth.Simple.Credential.Password.migrationV1
+            , Username.migration.v1
+            , Password.migrationV1
+            , Session.migration.v1
             ]
     in
     await
         "Open the on-disk test database (registration)"
         (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test.sqlite"))
         (\database ->
-            let
-                register : String -> String -> Task Auth.Simple.UsernamePassword.CreateError { userId : String }
-                register name pw =
-                    Auth.Simple.UsernamePassword.create
-                        { username = name
-                        , password = pw
-                        }
-                        database
-                        secureContext
-            in
             await
                 "Apply migrations (registration)"
                 (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
@@ -69,42 +96,45 @@ tests fsPermission secureContext =
                         (Crypto.randomUuidV4 secureContext)
                         (\suffix ->
                             concat
-                                [ -- Validation: too-short password, rejected before any write.
-                                  awaitError
-                                    "Register with a 7-character password"
-                                    (register ("short-pw-" ++ suffix) "1234567")
-                                    (\error ->
-                                        test "a password under the minimum is rejected with PasswordTooShort"
-                                            (\_ ->
-                                                Expect.equal
-                                                    (Auth.Simple.UsernamePassword.PasswordTooShort { minimum = 8, actual = 7 })
-                                                    error
-                                            )
+                                [ -- Validation: too-short password, rejected before any hashing or write.
+                                  test "a password under the minimum is rejected by validateLength"
+                                    (\_ ->
+                                        Expect.equal
+                                            (Err { minimum = 8, actual = 7 })
+                                            (Password.validateLength (Password.fromString "1234567"))
+                                    )
+
+                                , -- Validation: a password at the minimum passes.
+                                  test "a password at the minimum passes validateLength"
+                                    (\_ ->
+                                        Expect.equal
+                                            (Ok (Password.fromString "12345678"))
+                                            (Password.validateLength (Password.fromString "12345678"))
                                     )
 
                                 , -- Validation: blank (whitespace-only) username.
                                   awaitError
                                     "Register with a whitespace-only username"
-                                    (register "   " password)
+                                    (doRegister { username = "   ", password = password } database secureContext)
                                     (\error ->
                                         test "a blank username is rejected with UsernameBlank"
-                                            (\_ -> Expect.equal Auth.Simple.UsernamePassword.UsernameBlank error)
+                                            (\_ -> Expect.equal (RegisterError (Register.IdentifierError Username.UsernameBlank)) error)
                                     )
 
                                 , -- Happy path, then an exact-duplicate registration.
                                   await
                                     "Register a fresh user"
-                                    (register ("dup-" ++ suffix) password)
+                                    (doRegister { username = "dup-" ++ suffix, password = password } database secureContext)
                                     (\created ->
                                         concat
                                             [ test "a clean registration returns a non-empty userId"
                                                 (\_ -> Expect.notEqual "" created.userId)
                                             , awaitError
                                                 "Register the same username again"
-                                                (register ("dup-" ++ suffix) password)
+                                                (doRegister { username = "dup-" ++ suffix, password = password } database secureContext)
                                                 (\error ->
                                                     test "a duplicate username is rejected with UsernameTaken"
-                                                        (\_ -> Expect.equal Auth.Simple.UsernamePassword.UsernameTaken error)
+                                                        (\_ -> Expect.equal (RegisterError (Register.IdentifierError Username.UsernameTaken)) error)
                                                 )
                                             ]
                                     )
@@ -113,14 +143,14 @@ tests fsPermission secureContext =
                                   -- lower-case, whitespace-padded variant collide as one account.
                                   await
                                     "Register a mixed-case username"
-                                    (register ("CaseTest-" ++ suffix) password)
+                                    (doRegister { username = "CaseTest-" ++ suffix, password = password } database secureContext)
                                     (\_ ->
                                         awaitError
                                             "Register a case/whitespace variant of it"
-                                            (register ("  casetest-" ++ suffix ++ "  ") password)
+                                            (doRegister { username = "  casetest-" ++ suffix ++ "  ", password = password } database secureContext)
                                             (\error ->
                                                 test "a case/whitespace variant is rejected with UsernameTaken"
-                                                    (\_ -> Expect.equal Auth.Simple.UsernamePassword.UsernameTaken error)
+                                                    (\_ -> Expect.equal (RegisterError (Register.IdentifierError Username.UsernameTaken)) error)
                                             )
                                     )
                                 ]

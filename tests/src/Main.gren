@@ -10,6 +10,7 @@ import Test.Runner.Effectful exposing ( await, concat )
 import Tests.PhcString
 import Tests.Register
 import Tests.CredentialLogin
+import Tests.PasswordChange
 
 
 {-|-}
@@ -25,6 +26,7 @@ main =
                                 [ Test.Runner.Effectful.wrap Tests.PhcString.tests
                                 , Tests.Register.tests fsPermission secureContext
                                 , Tests.CredentialLogin.tests fsPermission secureContext
+                                , Tests.PasswordChange.tests fsPermission secureContext
                                 ]
                         )
                         |> Test.Runner.Effectful.run env

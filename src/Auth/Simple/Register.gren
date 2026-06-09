@@ -20,8 +20,11 @@ identifier, and a credential together.
 
 -}
 
+import Auth.Simple.AuthEvent as AuthEvent
 import Auth.Simple.Credential exposing ( Credential )
 import Auth.Simple.Identifier exposing ( Identifier )
+import Auth.Simple.Internal.Event as Event
+import Auth.Simple.Internal.Transaction as Transaction
 import Auth.Simple.User as User
 import Crypto
 import Sqlite
@@ -44,35 +47,18 @@ type Error identifierError credentialError
     | TransactionError Sqlite.Error
 
 
-{-| Run a registration's writes inside one SQLite transaction: `BEGIN`, the writes,
-then `COMMIT` — or, if any write fails, `ROLLBACK` and re-raise the original error so
-a half-finished account (a user with no identifier, an identifier with no credential)
-never lands. A failing `BEGIN`/`COMMIT`/`ROLLBACK` surfaces as
+{-| Run a registration's writes inside one SQLite transaction (via
+[`Auth.Simple.Internal.Transaction`](Auth.Simple.Internal.Transaction)) so a
+half-finished account (a user with no identifier, an identifier with no
+credential) never lands. A failing `BEGIN`/`COMMIT`/`ROLLBACK` surfaces as
 [`TransactionError`](#Error).
 -}
 withTransaction :
     Sqlite.Database
     -> Task (Error identifierError credentialError) a
     -> Task (Error identifierError credentialError) a
-withTransaction database task =
-    Sqlite.executeScript database "BEGIN TRANSACTION"
-        |> Task.mapError TransactionError
-        |> Task.andThen
-            (\_ ->
-                task
-                    |> Task.andThen
-                        (\result ->
-                            Sqlite.executeScript database "COMMIT"
-                                |> Task.mapError TransactionError
-                                |> Task.map (\_ -> result)
-                        )
-                    |> Task.onError
-                        (\err ->
-                            Sqlite.executeScript database "ROLLBACK"
-                                |> Task.mapError TransactionError
-                                |> Task.andThen (\_ -> Task.fail err)
-                        )
-            )
+withTransaction =
+    Transaction.withTransaction TransactionError
 
 
 {-| Settle on the user to register against: use the supplied `userId`, or, when it
@@ -150,6 +136,9 @@ credential database secureContext theCredential input =
 `userId = Nothing` to create the user first, or `Just id` to attach both to an
 existing user. The user is resolved once and both writes share it; on success returns
 that user's id.
+
+A successful registration records a `user_registered` row in `auth_events`,
+best-effort: a failure to write the audit row never fails the registration.
 -}
 register :
     Sqlite.Database
@@ -175,6 +164,10 @@ register database secureContext theIdentifier theCredential input =
                                     database
                                     secureContext
                                     |> Task.mapError CredentialError
+                            )
+                        |> Task.andThen
+                            (\_ ->
+                                Event.record database secureContext { userId = Just userId, eventType = AuthEvent.UserRegistered }
                             )
                         |> Task.map (\_ -> { userId = userId })
                 )

@@ -7,14 +7,17 @@
     "version": "1.0.0",
     "exposed-modules": [
         "Auth.Simple",
+        "Auth.Simple.AuthEvent",
         "Auth.Simple.Login",
         "Auth.Simple.Register",
+        "Auth.Simple.Change",
         "Auth.Simple.Token",
         "Auth.Simple.Token.Session",
         "Auth.Simple.Identifier",
         "Auth.Simple.Identifier.Username",
         "Auth.Simple.Credential",
-        "Auth.Simple.Credential.Password"
+        "Auth.Simple.Credential.Password",
+        "Auth.Simple.Credential.Password.Reset"
     ],
     "gren-version": "0.6.0 <= v < 0.7.0",
     "dependencies": {

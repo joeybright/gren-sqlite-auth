@@ -7,6 +7,7 @@ module Auth.Simple.Token.Session exposing
     , create
     , insert
     , getByToken
+    , verifyToken
     , update
     , revoke
     , delete
@@ -34,6 +35,7 @@ deleting it.
 @docs create
 @docs insert
 @docs getByToken
+@docs verifyToken
 @docs update
 @docs revoke
 @docs delete
@@ -73,7 +75,8 @@ interface: issue a session with [`create`](#create), verify a presented token wi
 the token argument to [`Auth.Simple.Login.login`](Auth.Simple.Login).
 
 `issue` returns `{ session, token }` — hand `token` to the client, keep nothing
-else. `verify` resolves a raw token to its stored [`Session`](#Session).
+else. `verify` resolves a raw token to its stored [`Session`](#Session) via
+[`verifyToken`](#verifyToken), treating revoked and expired rows as no session.
 -}
 token : Token Sqlite.Error { session : Session, token : String } Session
 token =
@@ -90,7 +93,7 @@ token =
                             secureContext
                     )
         )
-    , verify = getByToken
+    , verify = verifyToken
     , revoke = revoke
     }
 
@@ -302,6 +305,41 @@ getByToken rawToken database secureContext =
                         ]
                     , rowDecoder = decoder
                     }
+            )
+
+
+{-| Verify a presented raw token: resolve it via [`getByToken`](#getByToken),
+then treat a revoked (`revoked_at` set) or expired (`expires_at` in the past) row
+as no session at all. This is the `verify` of the [`token`](#token) bundle —
+unlike [`getByToken`](#getByToken), a row that exists but is no longer live
+yields `Nothing`.
+
+Verification is read-only: it does not bump `last_used_at`. Apps that want
+touch-on-use can follow a successful verify with [`update`](#update).
+-}
+verifyToken : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error (Maybe Session)
+verifyToken rawToken database secureContext =
+    Task.map2
+        (\maybeSession now -> { maybeSession = maybeSession, now = now })
+        (getByToken rawToken database secureContext)
+        Time.now
+        |> Task.map
+            (\{ maybeSession, now } ->
+                when maybeSession is
+                    Nothing ->
+                        Nothing
+
+                    Just session ->
+                        when session.revokedAt is
+                            Just _ ->
+                                Nothing
+
+                            Nothing ->
+                                if session.expiresAt > Time.posixToMillis now then
+                                    Just session
+
+                                else
+                                    Nothing
             )
 
 

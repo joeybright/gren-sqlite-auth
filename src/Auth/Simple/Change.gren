@@ -1,0 +1,87 @@
+module Auth.Simple.Change exposing ( change, Error(..) )
+
+{-| Drive a [`Credential`](Auth.Simple.Credential) into a change workflow:
+prove the user holds the current secret, then replace it with a new one.
+
+Like [`Auth.Simple.Login`](Auth.Simple.Login), this holds no storage logic of
+its own — the credential's own `validate`, `remove`, and `insert` do the work,
+so it changes a password today and any future credential the same way. For
+replacing a *forgotten* password, where there is no current secret to prove,
+see [`Auth.Simple.Credential.Password.Reset`](Auth.Simple.Credential.Password.Reset).
+
+@docs change, Error
+
+-}
+
+import Auth.Simple.AuthEvent as AuthEvent
+import Auth.Simple.Credential as Credential exposing ( Credential )
+import Auth.Simple.Internal.Event as Event
+import Auth.Simple.Internal.Transaction as Transaction
+import Crypto
+import Sqlite
+import Task exposing ( Task )
+
+
+{-| Everything a credential change can go wrong on: the current secret didn't
+match (`InvalidCredentials`), the credential is locked after repeated failures
+(`Locked`), a real fault in the credential itself (`credentialError`), or a
+failing `BEGIN`/`COMMIT`/`ROLLBACK` around the replacement (`TransactionError`).
+-}
+type Error credentialError
+    = InvalidCredentials
+    | Locked
+    | CredentialError credentialError
+    | TransactionError Sqlite.Error
+
+
+{-| Replace a user's stored secret after validating the current one.
+
+The replacement is the credential's `remove` followed by its `insert`, run
+inside one transaction so the user is never left without a secret. Replacing
+rather than mutating deliberately resets the credential's bookkeeping (creation
+time, failure counters) — correct for a fresh secret.
+
+The new secret is the credential's `stored` type (e.g. an already-hashed
+password), prepared by the caller. A successful change records a
+`password_changed` row in `auth_events`, best-effort.
+-}
+change :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Credential credentialError candidate stored
+    -> { userId : String, current : candidate, new : stored }
+    -> Task (Error credentialError) {}
+change database secureContext credential input =
+    credential.validate
+        { userId = input.userId, secret = input.current }
+        database
+        secureContext
+        |> Task.mapError CredentialError
+        |> Task.andThen
+            (\validity ->
+                when validity is
+                    Credential.Valid ->
+                        Transaction.withTransaction TransactionError
+                            database
+                            (credential.remove { userId = input.userId } database secureContext
+                                |> Task.mapError CredentialError
+                                |> Task.andThen
+                                    (\_ ->
+                                        credential.insert
+                                            { userId = input.userId, secret = input.new }
+                                            database
+                                            secureContext
+                                            |> Task.mapError CredentialError
+                                    )
+                                |> Task.andThen
+                                    (\_ ->
+                                        Event.record database secureContext { userId = Just input.userId, eventType = AuthEvent.PasswordChanged }
+                                    )
+                            )
+
+                    Credential.Invalid ->
+                        Task.fail InvalidCredentials
+
+                    Credential.Locked ->
+                        Task.fail Locked
+            )

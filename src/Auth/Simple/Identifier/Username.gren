@@ -1,6 +1,7 @@
 module Auth.Simple.Identifier.Username exposing
     ( migration
     , Username
+    , normalize
     , create
     , insert
     , get
@@ -8,6 +9,7 @@ module Auth.Simple.Identifier.Username exposing
     , update
     , delete
     , identifier
+    , AsIdentifierError(..)
     )
 
 {-| The username identifier: its schema migration and CRUD access to the
@@ -15,10 +17,12 @@ module Auth.Simple.Identifier.Username exposing
 
 Each row links a `username` (unique across the table) to a `user_id`. This module
 is a thin, reusable data-access layer over those columns; CRUD functions are keyed
-on the row `id`.
+on the row `id` and store their input literally — normalization happens in the
+[`identifier`](#identifier) bundle, which is what workflows should drive.
 
 @docs migration
 @docs Username
+@docs normalize
 @docs create
 @docs insert
 @docs get
@@ -26,6 +30,7 @@ on the row `id`.
 @docs update
 @docs delete
 @docs identifier
+@docs AsIdentifierError
 
 -}
 
@@ -278,20 +283,69 @@ delete id database =
 --- as an identifier
 
 
+{-| Normalize a username for both storage and lookup: trim surrounding whitespace
+and lowercase it, so `"Alice"`, `" alice "`, and `"ALICE"` all resolve to one
+account. Applied by both halves of the [`identifier`](#identifier) bundle; the
+raw CRUD functions store and match their input literally.
+-}
+normalize : String -> String
+normalize =
+    String.trim >> String.toLower
+
+
+{-| Failure modes when driving the `usernames` table through the generic
+[`Identifier`](Auth.Simple.Identifier) interface: a database fault, a username
+that is blank after [`normalize`](#normalize), or one that another user already
+holds.
+-}
+type AsIdentifierError
+    = StorageError Sqlite.Error
+    | UsernameBlank
+    | UsernameTaken
+
+
 {-| Expose usernames as a generic [`Identifier`](Auth.Simple.Identifier): `resolve`
 maps a username string to the owning user's id via [`getByUsername`](#getByUsername),
-and `insert` registers a new username for a user via [`create`](#create).
+and `insert` registers a new username for a user via [`create`](#create). Both
+run the input through [`normalize`](#normalize) first.
+
+`insert` rejects a blank username (`UsernameBlank`) and one that already exists
+(`UsernameTaken`). The taken-check is a read-before-write;
+[`Auth.Simple.Register`](Auth.Simple.Register) runs it inside a transaction, and
+the table's `UNIQUE (username)` constraint remains the backstop for a race —
+surfacing as `StorageError`.
 -}
-identifier : Identifier Sqlite.Error String
+identifier : Identifier AsIdentifierError String
 identifier =
     { resolve =
         (\username database _ ->
-            getByUsername username database
+            getByUsername (normalize username) database
+                |> Task.mapError StorageError
                 |> Task.map (Maybe.map .userId)
         )
     , insert =
         (\{ userId, value } database secureContext ->
-            create { userId = userId, username = value } database secureContext
-                |> Task.map (\_ -> {})
+            let
+                normalized : String
+                normalized =
+                    normalize value
+            in
+            if String.isEmpty normalized then
+                Task.fail UsernameBlank
+
+            else
+                getByUsername normalized database
+                    |> Task.mapError StorageError
+                    |> Task.andThen
+                        (\existing ->
+                            when existing is
+                                Just _ ->
+                                    Task.fail UsernameTaken
+
+                                Nothing ->
+                                    create { userId = userId, username = normalized } database secureContext
+                                        |> Task.mapError StorageError
+                                        |> Task.map (\_ -> {})
+                        )
         )
     }

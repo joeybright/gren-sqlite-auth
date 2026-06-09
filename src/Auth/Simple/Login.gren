@@ -9,25 +9,33 @@ issue a token.
 
 -}
 
-import Auth.Simple.Credential exposing ( Credential )
+import Auth.Simple.AuthEvent as AuthEvent
+import Auth.Simple.Credential as Credential exposing ( Credential )
 import Auth.Simple.Identifier exposing ( Identifier )
+import Auth.Simple.Internal.Event as Event
 import Auth.Simple.Token exposing ( Token )
 import Crypto
 import Sqlite
 import Task exposing ( Task )
 
 
-{-| Everything a login can go wrong on: resolving the identifier (`identifierError`),
-no user owning that identifier, validating the credential (`credentialError`), or
-issuing the token (`tokenError`).
+{-| Everything a login can go wrong on.
 
-These are kept distinct for clarity during development; collapsing them into one
-opaque "invalid credentials" (to resist user enumeration) is a later hardening
-step.
+`InvalidCredentials` deliberately covers both "no user owns that identifier" and
+"the secret didn't match", so a caller (or an attacker reading its responses)
+cannot tell whether an account exists. `Locked` is distinct: it is only reachable
+after repeated observable failures against an identifier that therefore is known
+to exist, and a locked-out user with the *correct* secret deserves a better
+answer than a shrug.
+
+The remaining variants are real faults from the underlying pieces: resolving the
+identifier (`identifierError`), validating the credential (`credentialError`), or
+issuing the token (`tokenError`).
 -}
 type Error identifierError credentialError tokenError
-    = IdentifierError identifierError
-    | IdentifierNotFound
+    = InvalidCredentials
+    | Locked
+    | IdentifierError identifierError
     | CredentialError credentialError
     | TokenError tokenError
 
@@ -49,6 +57,12 @@ with a runtime identifier value and secret:
 On success it issues a token and returns whatever the [`Token`](Auth.Simple.Token)
 produces — for the database-stored session that is `{ session, token }`; hand
 `token` to the client, keep nothing else.
+
+The workflow resists user enumeration: an unknown identifier runs the
+credential's `burn` (the cost of a real validation) before failing, and fails
+with the same [`InvalidCredentials`](#Error) as a wrong secret. Successful and
+failed logins are recorded in `auth_events` best-effort — a failure to write the
+audit row never changes the login's outcome.
 -}
 login :
     Sqlite.Database
@@ -65,7 +79,13 @@ login database secureContext identifier credential token input =
             (\maybeUserId ->
                 when maybeUserId is
                     Nothing ->
-                        Task.fail IdentifierNotFound
+                        credential.burn input.secret database secureContext
+                            |> Task.mapError CredentialError
+                            |> Task.andThen
+                                (\_ ->
+                                    Event.record database secureContext { userId = Nothing, eventType = AuthEvent.LoginFailed }
+                                        |> Task.andThen (\_ -> Task.fail InvalidCredentials)
+                                )
 
                     Just userId ->
                         credential.validate
@@ -74,8 +94,23 @@ login database secureContext identifier credential token input =
                             secureContext
                             |> Task.mapError CredentialError
                             |> Task.andThen
-                                (\_ ->
-                                    token.issue { userId = userId } database secureContext
-                                        |> Task.mapError TokenError
+                                (\validity ->
+                                    when validity is
+                                        Credential.Valid ->
+                                            token.issue { userId = userId } database secureContext
+                                                |> Task.mapError TokenError
+                                                |> Task.andThen
+                                                    (\issued ->
+                                                        Event.record database secureContext { userId = Just userId, eventType = AuthEvent.UserLoggedIn }
+                                                            |> Task.map (\_ -> issued)
+                                                    )
+
+                                        Credential.Invalid ->
+                                            Event.record database secureContext { userId = Just userId, eventType = AuthEvent.LoginFailed }
+                                                |> Task.andThen (\_ -> Task.fail InvalidCredentials)
+
+                                        Credential.Locked ->
+                                            Event.record database secureContext { userId = Just userId, eventType = AuthEvent.LoginFailed }
+                                                |> Task.andThen (\_ -> Task.fail Locked)
                                 )
             )
