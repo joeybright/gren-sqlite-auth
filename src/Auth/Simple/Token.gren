@@ -1,19 +1,11 @@
 module Auth.Simple.Token exposing ( Token )
 
-{-| The artifact a successful login hands back: the thing a client presents on
-later requests to prove it already authenticated.
+{-| The artifact a successful login hands back. This `Token` is intended to be 
+proof of authentication for future requests.
 
-This is the third pluggable abstraction in the package, alongside
-[`Identifier`](Auth.Simple.Identifier) (who you are) and
-[`Credential`](Auth.Simple.Credential) (how you prove it). You combine an
-`Identifier` with a `Credential` to obtain a `Token`. A `Token` is the genus; a
-database-stored session ([`Auth.Simple.Token.Session`](Auth.Simple.Token.Session))
-is its first species, a JWT a future one.
-
-Like the other abstractions, a `Token` is a plain bundle of functions held per
-call — it carries no stored configuration. Each species owns its own migrations as
-a separate module export (a JWT species may need none), so they are not a field
-here.
+Currently, the only type of token supported is a database-stored session 
+([`Auth.Simple.Token.Session`](Auth.Simple.Token.Session)). Other types of tokens
+may be supported in the future such as JWT tokens.
 
 @docs Token
 
@@ -24,18 +16,23 @@ import Sqlite
 import Task exposing ( Task )
 
 
-{-| A bundle of functions describing one way to issue, verify, and revoke the
-token a login hands back.
+{-| A bundle of functions describing one way to issue, verify, and revoke a token.
 
-- `error` — the species' failure type (a stored session uses `Sqlite.Error`).
-- `issued` — what `issue` returns, i.e. what `login` hands the caller (a stored
-  session returns `{ session, token }`).
-- `verified` — what a presented token resolves to on success (a stored session
-  resolves to its `Session` row).
+A `Token` type has three parameters:
 
-`issue` takes only `{ userId }`: lifetime and expiry policy live inside the
-implementation, not the caller. `verify` and `revoke` take the raw bearer string
-the client holds — uniform across sessions and JWTs.
+- `error` is the tokens failure type.
+- `issued` is the type of the token that will be returned when a token is successfully
+issued.
+- `verified` is what a presented token resolves to on success.
+
+The three functions required for a `Token` are:
+
+- `issue` which takes a `{ userId }` and issues a token for that user id. This does not
+  control lifetime and expiry as those policies live inside the implementation.
+- `verify` takes the raw bearer string the client holds and produces the `verified` type
+  if the bearer string is a valid session. If not valid, returns a successful `Task` but
+  the result is `Nothing`.
+- `revoke` takes the raw bearer string the client holds and revokes that token.
 -}
 type alias Token error issued verified =
     { issue : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error issued

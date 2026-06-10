@@ -1,5 +1,13 @@
 # gren-sqlite-auth
 
+- There are no utilities for helping you access or otherwise change any user
+data records. It's assumed that any user-specific data is handled soley by the
+consumer of this package and, ideally, is done in a separate table from the
+users table handling auth. For example, if you want a user profile, create a
+`user_profile` table with a foreign key relationship to the `users` table that
+this package generates. This ensures you don't accidentaly edit or remove data
+required to properly handle authentication.
+
 Composable username/password authentication for Gren node applications, backed
 by SQLite.
 

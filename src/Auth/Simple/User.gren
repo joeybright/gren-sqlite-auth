@@ -16,11 +16,8 @@ schema itself is owned by [`Auth.Simple.migrationV1`](Auth.Simple); nothing here
 creates or alters the table.
 
 @docs User
-@docs create
-@docs insert
-@docs get
-@docs update
-@docs delete
+
+@docs create, insert, get, update, delete
 
 -}
 
@@ -59,10 +56,6 @@ decoder =
                         )
                 )
         )
-
-
-
---- creating users
 
 
 {-| Create a new user and save it to the database.
@@ -127,10 +120,6 @@ insert database { id, createdAt } =
         }
 
 
-
---- reading users
-
-
 {-| Read a single user by `id`, returning `Nothing` when no such row exists.
 -}
 get : String -> Sqlite.Database -> Task Sqlite.Error (Maybe User)
@@ -147,10 +136,6 @@ get id database =
             ]
         , rowDecoder = decoder
         }
-
-
-
---- updating users
 
 
 {-| Touch a user, bumping its `updated_at` to the current time.
@@ -177,10 +162,6 @@ update id database =
                         ]
                     }
             )
-
-
-
---- deleting users
 
 
 {-| Delete a user by `id`.

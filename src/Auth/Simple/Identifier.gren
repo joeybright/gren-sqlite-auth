@@ -1,7 +1,6 @@
 module Auth.Simple.Identifier exposing ( Identifier )
 
-{-| A generic identifier: how to resolve an identifier value to the user it
-belongs to.
+{-| A generic identifier for a user.
 
 @docs Identifier
 
