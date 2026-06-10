@@ -9,11 +9,10 @@
         "Auth.Simple",
         "Auth.Simple.Login",
         "Auth.Simple.Register",
-        "Auth.Simple.Change",
         "Auth.Simple.Token.Session",
         "Auth.Simple.Identifier.Username",
         "Auth.Simple.Credential.Password",
-        "Auth.Simple.Credential.Password.Reset"
+        "Auth.Simple.Credential.Code"
     ],
     "gren-version": "0.6.0 <= v < 0.7.0",
     "dependencies": {

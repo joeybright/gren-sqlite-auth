@@ -11,6 +11,7 @@ import Tests.PhcString
 import Tests.Register
 import Tests.CredentialLogin
 import Tests.PasswordChange
+import Tests.CodeLogin
 
 
 {-|-}
@@ -27,6 +28,7 @@ main =
                                 , Tests.Register.tests fsPermission secureContext
                                 , Tests.CredentialLogin.tests fsPermission secureContext
                                 , Tests.PasswordChange.tests fsPermission secureContext
+                                , Tests.CodeLogin.tests fsPermission secureContext
                                 ]
                         )
                         |> Test.Runner.Effectful.run env

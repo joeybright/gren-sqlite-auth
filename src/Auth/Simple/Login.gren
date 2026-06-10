@@ -5,6 +5,11 @@ module Auth.Simple.Login exposing ( login, Error(..) )
 login workflow: resolve the identifier to a user, validate the credential, and
 issue a token.
 
+This one function covers every credential. A credential needing a first phase
+(an emailed one-time code) carries it on its own module — e.g.
+[`Auth.Simple.Credential.Code.request`](Auth.Simple.Credential.Code) mints the
+code, and the user comes back through this [`login`](#login) with it.
+
 @docs login, Error
 
 -}
@@ -64,7 +69,7 @@ login :
     Sqlite.Database
     -> Crypto.SecureContext
     -> Identifier identifierError identifierValue
-    -> Credential credentialError candidateCredential storedCredential
+    -> Credential credentialError candidateCredential
     -> Token tokenError issued verified
     -> { identifier : identifierValue, secret : candidateCredential }
     -> Task (Error identifierError credentialError tokenError) issued

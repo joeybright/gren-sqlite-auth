@@ -18,6 +18,7 @@ run derives unique usernames from a fresh UUID.
 -}
 
 import Auth.Simple
+import Auth.Simple.Credential.Code as Code
 import Auth.Simple.Credential.Password as Password
 import Auth.Simple.Identifier.Username as Username
 import Auth.Simple.Register as Register
@@ -56,7 +57,7 @@ doRegister { username, password } database secureContext =
             (\hashedPassword ->
                 Register.register database secureContext
                     Username.identifier
-                    Password.credential
+                    Password.stored
                     { userId = Nothing
                     , value = username
                     , secret = hashedPassword
@@ -81,6 +82,7 @@ tests fsPermission secureContext =
             , Username.migration.v1
             , Password.migrationV1
             , Session.migration.v1
+            , Code.migration.v1
             ]
     in
     await

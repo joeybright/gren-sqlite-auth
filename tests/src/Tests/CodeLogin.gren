@@ -1,0 +1,227 @@
+module Tests.CodeLogin exposing ( tests )
+
+{-| End-to-end tests for logging in with a one-time code
+([`Auth.Simple.Credential.Code`](Auth.Simple.Credential.Code)): a user
+registered with only a username identifier requests a code via
+[`Code.request`](Auth.Simple.Credential.Code) and logs in with it through
+the same [`Auth.Simple.Login.login`](Auth.Simple.Login) passwords use.
+
+Covers the code lifecycle: a fresh code is six digits and logs in exactly once;
+a wrong code fails uniformly with `InvalidCredentials`; re-requesting kills the
+previous code; five wrong guesses kill the live code even for the correct
+guesser; requesting for an unknown username yields `Nothing`.
+
+The database persists across runs, so each run derives a unique username from a
+fresh UUID.
+
+@docs tests
+
+-}
+
+import Auth.Simple
+import Auth.Simple.Credential.Code as Code
+import Auth.Simple.Credential.Password as Password
+import Auth.Simple.Identifier.Username as Username
+import Auth.Simple.Login as Login
+import Auth.Simple.Register as Register
+import Auth.Simple.Token.Session as Session
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Sqlite
+import Sqlite.Migrate
+import Task exposing ( Task )
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
+
+
+{-|-}
+doLogin :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> { identifier : String
+    , secret : String
+    }
+    -> Task
+        (Login.Error Username.AsIdentifierError Code.AsCredentialError Sqlite.Error)
+        { session : Session.Session
+        , token : String
+        }
+doLogin database secureContext =
+    Login.login database secureContext
+        Username.identifier
+        Code.credential
+        Session.token
+
+
+{-| Request a fresh code for `username`, failing the task when no code comes
+back (the user should exist in these tests unless stated otherwise).
+-}
+requestCode :
+    String
+    -> Sqlite.Database
+    -> Crypto.SecureContext
+    -> Task (Code.RequestError Username.AsIdentifierError) { code : String }
+requestCode username database secureContext =
+    Code.request database secureContext Username.identifier { identifier = username }
+        |> Task.andThen
+            (\maybeDeliverable ->
+                when maybeDeliverable is
+                    Just deliverable ->
+                        Task.succeed deliverable
+
+                    Nothing ->
+                        Task.fail (Code.IssueError Sqlite.NoResultsError)
+            )
+
+
+{-| A code guaranteed to differ from the given one.
+-}
+wrongCodeFor : String -> String
+wrongCodeFor code =
+    if code == "000000" then
+        "000001"
+
+    else
+        "000000"
+
+
+{-| Run one wrong-code login and swallow the expected failure, for stacking
+attempts against the attempt cap.
+-}
+wrongLogin : Sqlite.Database -> Crypto.SecureContext -> { username : String, code : String } -> Task x {}
+wrongLogin database secureContext { username, code } =
+    doLogin database secureContext { identifier = username, secret = wrongCodeFor code }
+        |> Task.map (\_ -> {})
+        |> Task.onError (\_ -> Task.succeed {})
+
+
+{-| Register a code-only account (just a username identifier, no stored
+credential), then exercise the request → deliver → login lifecycle.
+-}
+tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests fsPermission secureContext =
+    let
+        migrations : Array Sqlite.Migrate.Migration
+        migrations =
+            [ Auth.Simple.migrationV1
+            , Username.migration.v1
+            , Password.migrationV1
+            , Session.migration.v1
+            , Code.migration.v1
+            ]
+    in
+    await
+        "Open the on-disk test database (code login)"
+        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test.sqlite"))
+        (\database ->
+            await
+                "Apply migrations (code login)"
+                (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
+                (\_ ->
+                    await
+                        "Generate a unique username suffix (code login)"
+                        (Crypto.randomUuidV4 secureContext)
+                        (\suffix ->
+                            let
+                                username : String
+                                username =
+                                    "codeuser-" ++ suffix
+                            in
+                            concat
+                                [ await
+                                    "Request a code for a username that does not exist"
+                                    (Code.request database secureContext Username.identifier { identifier = "ghost-" ++ suffix })
+                                    (\maybeDeliverable ->
+                                        test "an unknown username yields Nothing (no code minted)"
+                                            (\_ -> Expect.equal Nothing (Maybe.map (\_ -> {}) maybeDeliverable))
+                                    )
+                                , await
+                                    "Register a code-only account (identifier, no credential)"
+                                    (Register.identifier database secureContext Username.identifier { userId = Nothing, value = username })
+                                    (\created ->
+                                        await
+                                            "Request a code"
+                                            (requestCode username database secureContext)
+                                            (\first ->
+                                                concat
+                                                    [ test "a code is six characters"
+                                                        (\_ -> Expect.equal 6 (String.count first.code))
+                                                    , test "a code is numeric"
+                                                        (\_ -> Expect.notEqual Nothing (String.toInt first.code))
+                                                    , awaitError
+                                                        "Log in with a wrong code"
+                                                        (doLogin database secureContext { identifier = username, secret = wrongCodeFor first.code })
+                                                        (\error ->
+                                                            test "a wrong code fails with InvalidCredentials"
+                                                                (\_ -> Expect.equal Login.InvalidCredentials error)
+                                                        )
+                                                    , await
+                                                        "Log in with the correct code"
+                                                        (doLogin database secureContext { identifier = username, secret = first.code })
+                                                        (\result ->
+                                                            concat
+                                                                [ test "the session belongs to the code-only user"
+                                                                    (\_ -> Expect.equal created.userId result.session.userId)
+                                                                , awaitError
+                                                                    "Log in again with the same code"
+                                                                    (doLogin database secureContext { identifier = username, secret = first.code })
+                                                                    (\error ->
+                                                                        test "a consumed code fails with InvalidCredentials"
+                                                                            (\_ -> Expect.equal Login.InvalidCredentials error)
+                                                                    )
+                                                                ]
+                                                        )
+                                                    , await
+                                                        "Request two codes in a row"
+                                                        (requestCode username database secureContext
+                                                            |> Task.andThen
+                                                                (\old ->
+                                                                    requestCode username database secureContext
+                                                                        |> Task.map (\new -> { old = old.code, new = new.code })
+                                                                )
+                                                        )
+                                                        (\pair ->
+                                                            concat
+                                                                [ awaitError
+                                                                    "Log in with the superseded code"
+                                                                    (doLogin database secureContext { identifier = username, secret = pair.old })
+                                                                    (\error ->
+                                                                        test "re-requesting invalidates the previous code"
+                                                                            (\_ -> Expect.equal Login.InvalidCredentials error)
+                                                                    )
+                                                                , await
+                                                                    "Log in with the latest code"
+                                                                    (doLogin database secureContext { identifier = username, secret = pair.new })
+                                                                    (\result ->
+                                                                        test "the latest code logs in"
+                                                                            (\_ -> Expect.equal created.userId result.session.userId)
+                                                                    )
+                                                                ]
+                                                        )
+                                                    , await
+                                                        "Request a code and burn five wrong guesses"
+                                                        (requestCode username database secureContext
+                                                            |> Task.andThen
+                                                                (\fresh ->
+                                                                    Task.sequence
+                                                                        (Array.repeat 5 (wrongLogin database secureContext { username = username, code = fresh.code }))
+                                                                        |> Task.map (\_ -> fresh)
+                                                                )
+                                                        )
+                                                        (\fresh ->
+                                                            awaitError
+                                                                "Log in with the correct but exhausted code"
+                                                                (doLogin database secureContext { identifier = username, secret = fresh.code })
+                                                                (\error ->
+                                                                    test "five wrong guesses kill the code even for the correct guesser"
+                                                                        (\_ -> Expect.equal Login.InvalidCredentials error)
+                                                                )
+                                                        )
+                                                    ]
+                                            )
+                                    )
+                                ]
+                        )
+                )
+        )

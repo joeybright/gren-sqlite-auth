@@ -1,8 +1,9 @@
 module Auth.Simple.Register exposing ( identifier, credential, register, Error(..) )
 
 {-| Drive an [`Identifier`](Auth.Simple.Identifier) and/or a
-[`Credential`](Auth.Simple.Credential) into a registration workflow: optionally
-create the user, then write the identifier and/or the credential against that user.
+[`Stored`](Auth.Simple.Credential.Stored) credential into a registration
+workflow: optionally create the user, then write the identifier and/or the
+credential against that user.
 
 This is the counterpart to [`Auth.Simple.Login`](Auth.Simple.Login). Like login, it
 holds no storage logic of its own — it calls the `insert` function each bundle
@@ -27,7 +28,7 @@ race past the availability check.
 
 -}
 
-import Auth.Simple.Credential exposing ( Credential )
+import Auth.Simple.Credential.Stored exposing ( Stored )
 import Auth.Simple.Identifier exposing ( Identifier )
 import Auth.Simple.User as User
 import Crypto
@@ -123,15 +124,20 @@ identifier database secureContext theIdentifier input =
             )
 
 
-{-| Register a [`Credential`](Auth.Simple.Credential) secret for a user. The secret
-is the credential's `stored` type (e.g. an already-hashed password), prepared by the
-caller. Pass `userId = Nothing` to create the user first, or `Just id` to add the
-credential to an existing user. Returns the user the credential now belongs to.
+{-| Register a [`Stored`](Auth.Simple.Credential.Stored) credential secret for a
+user. The secret is the credential's `stored` type (e.g. an already-hashed
+password), prepared by the caller. Pass `userId = Nothing` to create the user
+first, or `Just id` to add the credential to an existing user. Returns the user
+the credential now belongs to.
+
+One-time codes are never registered — they are minted per login by
+[`Auth.Simple.Credential.Code.request`](Auth.Simple.Credential.Code); a
+code-only user registers just an identifier via [`identifier`](#identifier).
 -}
 credential :
     Sqlite.Database
     -> Crypto.SecureContext
-    -> Credential credentialError candidate stored
+    -> Stored stored
     -> { userId : Maybe String, secret : stored }
     -> Task (Error identifierError) { userId : String }
 credential database secureContext theCredential input =
@@ -158,7 +164,7 @@ register :
     Sqlite.Database
     -> Crypto.SecureContext
     -> Identifier identifierError value
-    -> Credential credentialError candidate stored
+    -> Stored stored
     -> { userId : Maybe String, value : value, secret : stored }
     -> Task (Error identifierError) { userId : String }
 register database secureContext theIdentifier theCredential input =
