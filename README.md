@@ -30,6 +30,9 @@ without touching the workflows:
 - **`Auth.Simple.Token`** — what a successful login issues.
   `Auth.Simple.Token.Session` stores sessions in SQLite, keeping only the
   SHA-256 hash of the token, and refuses expired or revoked sessions on verify.
+  Every token species can also revoke everything a user holds at once — the
+  hook password change and reset use to make sure a stolen session never
+  survives them.
 
 Workflows compose them:
 
@@ -40,11 +43,14 @@ Workflows compose them:
   secrets both cost a full validation round and both fail with the same
   `InvalidCredentials`, so callers can't be used to enumerate accounts.
 
-The remaining verbs live on the concrete modules: `Code.request` mints a code
-for you to deliver (the first phase of a code login, or of a reset), and
-`Password.change` replaces a password after proving identity — the proof is
-itself a credential: the current password (a change), or a one-time code (a
-forgotten-password reset).
+The remaining verbs live on the concrete modules, and each temporary credential
+carries a single intent: `Code.request` mints a code for you to deliver (the
+first phase of a code login — codes only log in), `Password.change` replaces a
+password after proving the current one, and `Password.requestReset` /
+`Password.reset` handle the forgotten-password flow with their own dedicated
+tokens — 32 random bytes, URL-safe, hashed at rest, 30-minute expiry,
+single-use — meant to be emailed as a link. A reset token can't log in; a login
+code can't reset.
 
 The package does no logging of its own — what (if anything) to record about
 registrations, logins, and password changes is your application's decision.
@@ -53,9 +59,10 @@ registrations, logins, and password changes is your application's decision.
 
 You own the `users` table — `Auth.Simple.migrationV1` bootstraps a minimal one
 (`id`, `created_at`, `updated_at`) with `IF NOT EXISTS`, and you may extend it
-freely. The package owns the rest, each foreign-keyed to `users.id`:
-`usernames`, `passwords`, `codes`, and `sessions`. Run the migrations of the
-pieces you use, base first:
+freely. The package owns the rest, each prefixed `auth_` and foreign-keyed to
+`users.id`: `auth_usernames`, `auth_passwords`, `auth_password_reset_tokens`,
+`auth_codes`, and `auth_sessions`. Run the migrations of the pieces you use,
+base first:
 
 ```gren
 migrations =
@@ -118,17 +125,27 @@ loginWithCode { username, code } =
         Session.token
         { identifier = username, secret = code }
 
--- Change a password by proving the current one...
+-- Change a password by proving the current one. Every session the user
+-- holds is revoked — including this device's — so log them in again after.
 changePassword { userId, current, newHashed } =
     Password.change database secureContext
-        Password.credential
-        { userId = userId, proof = Password.fromString current, new = newHashed }
+        Session.token
+        { userId = userId, current = Password.fromString current, new = newHashed }
 
--- ...or reset a forgotten one by proving with an emailed code.
-resetPassword { userId, code, newHashed } =
-    Password.change database secureContext
-        Code.credential
-        { userId = userId, proof = code, new = newHashed }
+-- Forgot the password? Phase 1: mint a reset token to email as a link.
+-- Nothing means no such user — respond identically either way.
+requestPasswordReset { username } =
+    Password.requestReset database secureContext
+        Username.identifier
+        { identifier = username }
+
+-- Phase 2: redeem the token from the link. No userId needed — the token
+-- resolves the user and returns { userId }. All the user's sessions are
+-- revoked, so anything stolen dies with the reset.
+resetPassword { token, newHashed } =
+    Password.reset database secureContext
+        Session.token
+        { token = token, new = newHashed }
 
 -- Verify a request: Nothing for unknown, expired, or revoked tokens.
 -- A successful verify bumps the session's last_used_at.

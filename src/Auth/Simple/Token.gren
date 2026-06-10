@@ -25,7 +25,7 @@ A `Token` type has three parameters:
 issued.
 - `verified` is what a presented token resolves to on success.
 
-The three functions required for a `Token` are:
+The four functions required for a `Token` are:
 
 - `issue` which takes a `{ userId }` and issues a token for that user id. This does not
   control lifetime and expiry as those policies live inside the implementation.
@@ -33,9 +33,19 @@ The three functions required for a `Token` are:
   if the bearer string is a valid session. If not valid, returns a successful `Task` but
   the result is `Nothing`.
 - `revoke` takes the raw bearer string the client holds and revokes that token.
+- `revokeAllForUser` invalidates every token the user holds — the "credential changed"
+  hook, driven by workflows like
+  [`Auth.Simple.Credential.Password.change`](Auth.Simple.Credential.Password) and
+  [`Auth.Simple.Credential.Password.reset`](Auth.Simple.Credential.Password) so a stolen
+  token never survives the action meant to lock it out. It is pinned to `Sqlite.Error`
+  (not the generic `error`) so workflows can run it inside
+  [`Sqlite.inTransaction`](Sqlite#inTransaction); a species without per-token rows (a
+  future JWT) would implement it with whatever SQLite state backs its invalidation (a
+  denylist, a key-version row).
 -}
 type alias Token error issued verified =
     { issue : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error issued
     , verify : String -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe verified)
     , revoke : String -> Sqlite.Database -> Crypto.SecureContext -> Task error {}
+    , revokeAllForUser : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
     }

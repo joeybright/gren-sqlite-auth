@@ -17,19 +17,20 @@ to work at all.
 The artifact issued on login owns its own table. The database-stored token
 ([`Auth.Simple.Token.Session`](Auth.Simple.Token.Session)) brings:
 
-- `sessions` - login session; created by `Auth.Simple.Token.Session.migration`
+- `auth_sessions` - login session; created by `Auth.Simple.Token.Session.migration`
 
 ## Identifier-specific
 
-- `usernames` - created by `Auth.Simple.Identifier.Username.migration`
+- `auth_usernames` - created by `Auth.Simple.Identifier.Username.migration`
 
-## Password-specific method
+## Credential-specific
 
-These are only needed if the password auth method is added to the
-database.
+Each credential owns its own table, created by its module's migration:
 
-- `passwords`
-- `password_reset_tokens`
+- `auth_passwords` - created by `Auth.Simple.Credential.Password.migration`
+- `auth_password_reset_tokens` - forgotten-password reset links; created by
+  `Auth.Simple.Credential.Password.migration` alongside `auth_passwords`
+- `auth_codes` - created by `Auth.Simple.Credential.Code.migration`
 
 # Migrations
 

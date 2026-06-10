@@ -4,7 +4,6 @@ module Auth.Simple.Identifier.Username exposing
     , normalize
     , create
     , insert
-    , get
     , getByUsername
     , update
     , delete
@@ -13,19 +12,19 @@ module Auth.Simple.Identifier.Username exposing
     )
 
 {-| The username identifier: its schema migration and CRUD access to the
-`usernames` table.
+`auth_usernames` table.
 
-Each row links a `username` (unique across the table) to a `user_id`. This module
-is a thin, reusable data-access layer over those columns; CRUD functions are keyed
-on the row `id` and store their input literally — normalization happens in the
-[`identifier`](#identifier) bundle, which is what workflows should drive.
+Each row links a `username` to a `user_id`; the username itself is the primary
+key. This module is a thin, reusable data-access layer over those columns; CRUD
+functions are keyed on the `username` and store their input literally —
+normalization happens in the [`identifier`](#identifier) bundle, which is what
+workflows should drive.
 
 @docs migration
 @docs Username
 @docs normalize
 @docs create
 @docs insert
-@docs get
 @docs getByUsername
 @docs update
 @docs delete
@@ -35,7 +34,6 @@ on the row `id` and store their input literally — normalization happens in the
 -}
 
 import Auth.Simple.Identifier exposing ( Identifier )
-import Crypto
 import Sqlite
 import Sqlite.Decode
 import Sqlite.Encode
@@ -53,7 +51,7 @@ migration =
 {-|-}
 migrationV1 : { name : String, statements : Array String }
 migrationV1 =
-    { name = "`Auth.Simple.Identifier.Username.migrationV1` - Add usernames table"
+    { name = "`Auth.Simple.Identifier.Username.migrationV1` - Add auth_usernames table"
     , statements =
         [ addUsersTableMigrationSQL
         ]
@@ -68,16 +66,14 @@ migrationV1 =
 addUsersTableMigrationSQL : String
 addUsersTableMigrationSQL =
     """
-    CREATE TABLE IF NOT EXISTS usernames (
-        id TEXT PRIMARY KEY NOT NULL,
+    CREATE TABLE IF NOT EXISTS auth_usernames (
+        username TEXT PRIMARY KEY NOT NULL,
         user_id TEXT NOT NULL,
-        username TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         FOREIGN KEY (user_id)
             REFERENCES users(id)
-            ON DELETE CASCADE,
-        UNIQUE (username)
+            ON DELETE CASCADE
     );
     """
 
@@ -86,39 +82,34 @@ addUsersTableMigrationSQL =
 --- username rows
 
 
-{-| A row from the `usernames` table.
+{-| A row from the `auth_usernames` table.
 -}
 type alias Username =
-    { id : String
-    , userId : String
+    { userId : String
     , username : String
     , createdAt : Int
     , updatedAt : Int
     }
 
 
-{-| Decode a single `usernames` row into a [`Username`](#Username).
+{-| Decode a single `auth_usernames` row into a [`Username`](#Username).
 -}
 decoder : Sqlite.Decode.Decoder Username
 decoder =
-    Sqlite.Decode.string "id"
-        (\id ->
-            Sqlite.Decode.string "user_id"
-                (\userId ->
-                    Sqlite.Decode.string "username"
-                        (\username ->
-                            Sqlite.Decode.int "created_at"
-                                (\createdAt ->
-                                    Sqlite.Decode.int "updated_at"
-                                        (\updatedAt ->
-                                            Sqlite.Decode.succeed
-                                                { id = id
-                                                , userId = userId
-                                                , username = username
-                                                , createdAt = createdAt
-                                                , updatedAt = updatedAt
-                                                }
-                                        )
+    Sqlite.Decode.string "user_id"
+        (\userId ->
+            Sqlite.Decode.string "username"
+                (\username ->
+                    Sqlite.Decode.int "created_at"
+                        (\createdAt ->
+                            Sqlite.Decode.int "updated_at"
+                                (\updatedAt ->
+                                    Sqlite.Decode.succeed
+                                        { userId = userId
+                                        , username = username
+                                        , createdAt = createdAt
+                                        , updatedAt = updatedAt
+                                        }
                                 )
                         )
                 )
@@ -132,52 +123,48 @@ decoder =
 {-| Create a username for an existing user, identified by their `userId`, and
 save it to the database.
 
-Generates a fresh row id and timestamp, then inserts the row. To insert a
-username inside an existing transaction with a shared id and timestamp, use
-[`insert`](#insert) directly.
+Stamps the row with the current time, then inserts it. To insert a username
+inside an existing transaction with a shared timestamp, use [`insert`](#insert)
+directly.
 -}
 create :
     { userId : String, username : String }
     -> Sqlite.Database
-    -> Crypto.SecureContext
     -> Task Sqlite.Error Sqlite.ExecutionSummary
-create { userId, username } database secureContext =
-    Task.map
-        (\id now ->
-            { id = id
-            , userId = userId
-            , username = username
-            , createdAt = Time.posixToMillis now
-            }
-        )
-        (Crypto.randomUuidV4 secureContext)
-        |> Task.andMap Time.now
-        |> Task.andThen (insert database)
+create { userId, username } database =
+    Time.now
+        |> Task.andThen
+            (\now ->
+                insert database
+                    { userId = userId
+                    , username = username
+                    , createdAt = Time.posixToMillis now
+                    }
+            )
 
 
-{-| Insert a username row into the `usernames` table, using the given row `id`
-and `createdAt` timestamp. Both `created_at` and `updated_at` are set to
+{-| Insert a username row into the `auth_usernames` table, using the given
+`createdAt` timestamp. Both `created_at` and `updated_at` are set to
 `createdAt`.
 -}
 insert :
     Sqlite.Database
-    -> { id : String, userId : String, username : String, createdAt : Int }
+    -> { userId : String, username : String, createdAt : Int }
     -> Task Sqlite.Error Sqlite.ExecutionSummary
-insert database { id, userId, username, createdAt } =
+insert database { userId, username, createdAt } =
     let
         statement : String
         statement =
             """
-            INSERT INTO usernames (id, user_id, username, created_at, updated_at)
-            VALUES (:id, :user_id, :username, :created_at, :updated_at)
+            INSERT INTO auth_usernames (username, user_id, created_at, updated_at)
+            VALUES (:username, :user_id, :created_at, :updated_at)
             """
     in
     Sqlite.execute database
         { statement = statement
         , parameters =
-            [ Sqlite.Encode.string "id" id
+            [ Sqlite.Encode.string "username" username
             , Sqlite.Encode.string "user_id" userId
-            , Sqlite.Encode.string "username" username
             , Sqlite.Encode.int "created_at" createdAt
             , Sqlite.Encode.int "updated_at" createdAt
             ]
@@ -188,25 +175,6 @@ insert database { id, userId, username, createdAt } =
 --- reading usernames
 
 
-{-| Read a single username row by `id`, returning `Nothing` when no such row
-exists.
--}
-get : String -> Sqlite.Database -> Task Sqlite.Error (Maybe Username)
-get id database =
-    Sqlite.getMaybeOne database
-        { query =
-            """
-            SELECT id, user_id, username, created_at, updated_at
-            FROM usernames
-            WHERE id = :id
-            """
-        , parameters =
-            [ Sqlite.Encode.string "id" id
-            ]
-        , rowDecoder = decoder
-        }
-
-
 {-| Read a single username row by its `username` value, returning `Nothing` when
 no such row exists.
 -}
@@ -215,8 +183,8 @@ getByUsername username database =
     Sqlite.getMaybeOne database
         { query =
             """
-            SELECT id, user_id, username, created_at, updated_at
-            FROM usernames
+            SELECT user_id, username, created_at, updated_at
+            FROM auth_usernames
             WHERE username = :username
             """
         , parameters =
@@ -230,30 +198,30 @@ getByUsername username database =
 --- updating usernames
 
 
-{-| Rename a username row by `id`, bumping `updated_at` to now.
+{-| Rename a username row from its current value to a new one, bumping
+`updated_at` to now.
 
-`username` is unique across the table, so this fails if the new value is already
-taken.
+`username` is the primary key, so this fails if the new value is already taken.
 -}
 update :
-    { id : String, username : String }
+    { username : String, newUsername : String }
     -> Sqlite.Database
     -> Task Sqlite.Error Sqlite.ExecutionSummary
-update { id, username } database =
+update { username, newUsername } database =
     Time.now
         |> Task.andThen
             (\now ->
                 Sqlite.execute database
                     { statement =
                         """
-                        UPDATE usernames
-                        SET username = :username, updated_at = :updated_at
-                        WHERE id = :id
+                        UPDATE auth_usernames
+                        SET username = :new_username, updated_at = :updated_at
+                        WHERE username = :username
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "username" username
+                        [ Sqlite.Encode.string "new_username" newUsername
                         , Sqlite.Encode.int "updated_at" (Time.posixToMillis now)
-                        , Sqlite.Encode.string "id" id
+                        , Sqlite.Encode.string "username" username
                         ]
                     }
             )
@@ -263,18 +231,18 @@ update { id, username } database =
 --- deleting usernames
 
 
-{-| Delete a username row by `id`.
+{-| Delete a username row by its `username` value.
 -}
 delete : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
-delete id database =
+delete username database =
     Sqlite.execute database
         { statement =
             """
-            DELETE FROM usernames
-            WHERE id = :id
+            DELETE FROM auth_usernames
+            WHERE username = :username
             """
         , parameters =
-            [ Sqlite.Encode.string "id" id
+            [ Sqlite.Encode.string "username" username
             ]
         }
 
@@ -293,7 +261,7 @@ normalize =
     String.trim >> String.toLower
 
 
-{-| Failure modes when driving the `usernames` table through the generic
+{-| Failure modes when driving the `auth_usernames` table through the generic
 [`Identifier`](Auth.Simple.Identifier) interface: a database fault, or a
 username that is blank after [`normalize`](#normalize) — a value that can never
 resolve to a user nor be registered.
@@ -311,7 +279,7 @@ run the input through [`normalize`](#normalize) first.
 `resolve` rejects a blank username (`UsernameBlank`) — malformed input, distinct
 from `Nothing` (well-formed but unknown). `insert` is a plain write;
 [`Auth.Simple.Register`](Auth.Simple.Register) checks availability via `resolve`
-before inserting, and the table's `UNIQUE (username)` constraint remains the
+before inserting, and the table's primary key on `username` remains the
 backstop for a race.
 -}
 identifier : Identifier AsIdentifierError String
@@ -332,8 +300,8 @@ identifier =
                     |> Task.map (Maybe.map .userId)
         )
     , insert =
-        (\{ userId, value } database secureContext ->
-            create { userId = userId, username = normalize value } database secureContext
+        (\{ userId, value } database _ ->
+            create { userId = userId, username = normalize value } database
                 |> Task.map (\_ -> {})
         )
     }

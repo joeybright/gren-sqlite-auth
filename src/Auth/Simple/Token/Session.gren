@@ -10,22 +10,24 @@ module Auth.Simple.Token.Session exposing
     , verifyToken
     , update
     , revoke
+    , revokeAllForUser
     , delete
     , migration
     , migrationV1
     )
 
 {-| The database-stored [`Token`](Auth.Simple.Token) species, plus CRUD access to
-the `sessions` table that backs it.
+the `auth_sessions` table that backs it.
 
 A session is a login token tied to a user. The raw token is handed to the client
-once (as a cookie); only its SHA-256 hash is stored in `sessions.id`, so a stolen
+once (as a cookie); only its SHA-256 hash is stored in `auth_sessions.session_token`, so a stolen
 database can't be replayed as live sessions. Functions that take a token hash it
 at the boundary. `revoked_at` is nullable so logout can mark a row instead of
 deleting it.
 
-[`token`](#token) bundles `create`/`getByToken`/`revoke` into the pluggable
-`Token` interface; this module owns the `sessions` table via [`migration`](#migration).
+[`token`](#token) bundles `create`/`verifyToken`/`revoke`/`revokeAllForUser`
+into the pluggable `Token` interface; this module owns the `auth_sessions`
+table via [`migration`](#migration).
 
 @docs Session
 @docs token
@@ -38,6 +40,7 @@ deleting it.
 @docs verifyToken
 @docs update
 @docs revoke
+@docs revokeAllForUser
 @docs delete
 @docs migration
 @docs migrationV1
@@ -56,11 +59,11 @@ import Task exposing ( Task )
 import Time
 
 
-{-| A row from the `sessions` table. `revokedAt` is `Nothing` for a live session
+{-| A row from the `auth_sessions` table. `revokedAt` is `Nothing` for a live session
 and `Just` the revocation time once it has been explicitly revoked.
 -}
 type alias Session =
-    { id : String
+    { sessionToken : String
     , userId : String
     , createdAt : Int
     , expiresAt : Int
@@ -77,6 +80,8 @@ the token argument to [`Auth.Simple.Login.login`](Auth.Simple.Login).
 `issue` returns `{ session, token }` — hand `token` to the client, keep nothing
 else. `verify` resolves a raw token to its stored [`Session`](#Session) via
 [`verifyToken`](#verifyToken), treating revoked and expired rows as no session.
+`revokeAllForUser` revokes every live session a user holds, which is how
+password change/reset kick out stolen sessions.
 -}
 token : Token Sqlite.Error { session : Session, token : String } Session
 token =
@@ -95,6 +100,7 @@ token =
         )
     , verify = verifyToken
     , revoke = revoke
+    , revokeAllForUser = revokeAllForUser
     }
 
 
@@ -107,12 +113,12 @@ sessionLifetimeMillis =
     30 * 24 * 60 * 60 * 1000
 
 
-{-| Decode a single `sessions` row into a [`Session`](#Session).
+{-| Decode a single `auth_sessions` row into a [`Session`](#Session).
 -}
 decoder : Sqlite.Decode.Decoder Session
 decoder =
-    Sqlite.Decode.string "id"
-        (\id ->
+    Sqlite.Decode.string "session_token"
+        (\sessionToken ->
             Sqlite.Decode.string "user_id"
                 (\userId ->
                     Sqlite.Decode.int "created_at"
@@ -124,7 +130,7 @@ decoder =
                                             Sqlite.Decode.maybe Sqlite.Decode.int "revoked_at"
                                                 (\revokedAt ->
                                                     Sqlite.Decode.succeed
-                                                        { id = id
+                                                        { sessionToken = sessionToken
                                                         , userId = userId
                                                         , createdAt = createdAt
                                                         , expiresAt = expiresAt
@@ -145,11 +151,11 @@ decoder =
 
 {-| Open a new session for `userId`, expiring at `expiresAt`, and save it.
 
-Generates a random token, stores only its SHA-256 hash as the row `id`, and
+Generates a random token, stores only its SHA-256 hash as the row's `session_token` value, and
 returns `{ session, token }`: the stored [`Session`](#Session) plus the raw
 `token` for the client's cookie. The raw token is never persisted. To insert
 inside an existing transaction with caller-supplied values, use
-[`insert`](#insert) (passing an already-hashed `id`).
+[`insert`](#insert) (passing an already-hashed `sessionToken`).
 -}
 create :
     { userId : String, expiresAt : Int }
@@ -169,7 +175,7 @@ create { userId, expiresAt } database secureContext =
                             let
                                 session : Session
                                 session =
-                                    { id = hashedToken
+                                    { sessionToken = hashedToken
                                     , userId = userId
                                     , createdAt = Time.posixToMillis now
                                     , expiresAt = expiresAt
@@ -185,7 +191,7 @@ create { userId, expiresAt } database secureContext =
 
 {-| Generate a fresh session token: 32 cryptographically-random bytes. These are
 the canonical token — [`encodeToken`](#encodeToken) turns them into a string,
-[`hashToken`](#hashToken) into the stored id.
+[`hashToken`](#hashToken) into the stored `session_token` value.
 -}
 generateTokenBytes : Task x Bytes
 generateTokenBytes =
@@ -201,7 +207,7 @@ encodeToken tokenBytes =
         |> Base64.Encode.encode
 
 
-{-| Hash raw token bytes into the value stored in `sessions.id`.
+{-| Hash raw token bytes into the value stored in `auth_sessions.session_token`.
 
 Tokens are full-entropy random bytes, so a single SHA-256 (no salt, no stretching)
 makes the stored value useless as a cookie while staying reproducible for lookups.
@@ -229,7 +235,7 @@ decodeToken rawToken =
             Nothing
 
 
-{-| Map a base64 token string to the value stored in `sessions.id`. Decode it to raw
+{-| Map a base64 token string to the value stored in `auth_sessions.session_token`. Decode it to raw
 bytes, then [`hashToken`](#hashToken). The boundary used by
 [`getByToken`](#getByToken), [`update`](#update), [`revoke`](#revoke), and
 [`delete`](#delete). An undecodable cookie is passed through verbatim and simply
@@ -245,12 +251,12 @@ hashTokenString secureContext rawToken =
             Task.succeed rawToken
 
 
-{-| Insert a session row into the `sessions` table using caller-supplied values.
+{-| Insert a session row into the `auth_sessions` table using caller-supplied values.
 -}
 insert :
     Sqlite.Database
     ->
-        { id : String
+        { sessionToken : String
         , userId : String
         , createdAt : Int
         , expiresAt : Int
@@ -258,19 +264,19 @@ insert :
         , revokedAt : Maybe Int
         }
     -> Task Sqlite.Error Sqlite.ExecutionSummary
-insert database { id, userId, createdAt, expiresAt, lastUsedAt, revokedAt } =
+insert database { sessionToken, userId, createdAt, expiresAt, lastUsedAt, revokedAt } =
     let
         statement : String
         statement =
             """
-            INSERT INTO sessions (id, user_id, created_at, expires_at, last_used_at, revoked_at)
-            VALUES (:id, :user_id, :created_at, :expires_at, :last_used_at, :revoked_at)
+            INSERT INTO auth_sessions (session_token, user_id, created_at, expires_at, last_used_at, revoked_at)
+            VALUES (:session_token, :user_id, :created_at, :expires_at, :last_used_at, :revoked_at)
             """
     in
     Sqlite.execute database
         { statement = statement
         , parameters =
-            [ Sqlite.Encode.string "id" id
+            [ Sqlite.Encode.string "session_token" sessionToken
             , Sqlite.Encode.string "user_id" userId
             , Sqlite.Encode.int "created_at" createdAt
             , Sqlite.Encode.int "expires_at" expiresAt
@@ -285,7 +291,7 @@ insert database { id, userId, createdAt, expiresAt, lastUsedAt, revokedAt } =
 
 
 {-| Read a single session by its raw token, returning `Nothing` when no row
-matches. The token is mapped to the stored id via
+matches. The token is mapped to the stored `session_token` via
 [`hashTokenString`](#hashTokenString) before matching.
 -}
 getByToken : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error (Maybe Session)
@@ -296,12 +302,12 @@ getByToken rawToken database secureContext =
                 Sqlite.getMaybeOne database
                     { query =
                         """
-                        SELECT id, user_id, created_at, expires_at, last_used_at, revoked_at
-                        FROM sessions
-                        WHERE id = :id
+                        SELECT session_token, user_id, created_at, expires_at, last_used_at, revoked_at
+                        FROM auth_sessions
+                        WHERE session_token = :session_token
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "id" hashedToken
+                        [ Sqlite.Encode.string "session_token" hashedToken
                         ]
                     , rowDecoder = decoder
                     }
@@ -359,7 +365,7 @@ verifyToken rawToken database secureContext =
 
 Covers "touch on use" (bump `lastUsedAt`) and lifetime changes (`expiresAt`); for
 logout use [`revoke`](#revoke). Pass `Nothing` for `revokedAt` to keep the session
-live. The `rawToken` is mapped to the stored id via
+live. The `rawToken` is mapped to the stored `session_token` via
 [`hashTokenString`](#hashTokenString) before matching.
 -}
 update :
@@ -374,15 +380,15 @@ update { rawToken, expiresAt, lastUsedAt, revokedAt } database secureContext =
                 Sqlite.execute database
                     { statement =
                         """
-                        UPDATE sessions
+                        UPDATE auth_sessions
                         SET expires_at = :expires_at, last_used_at = :last_used_at, revoked_at = :revoked_at
-                        WHERE id = :id
+                        WHERE session_token = :session_token
                         """
                     , parameters =
                         [ Sqlite.Encode.int "expires_at" expiresAt
                         , Sqlite.Encode.int "last_used_at" lastUsedAt
                         , Sqlite.Encode.maybe Sqlite.Encode.int "revoked_at" revokedAt
-                        , Sqlite.Encode.string "id" hashedToken
+                        , Sqlite.Encode.string "session_token" hashedToken
                         ]
                     }
             )
@@ -391,7 +397,7 @@ update { rawToken, expiresAt, lastUsedAt, revokedAt } database secureContext =
 {-| Revoke a session by its raw token, stamping `revoked_at` with the current
 time. Idempotent: a token matching no row simply updates nothing. The row is kept
 for auditing — to hard-delete instead, use [`delete`](#delete). The `rawToken` is
-mapped to the stored id via [`hashTokenString`](#hashTokenString) before matching.
+mapped to the stored `session_token` via [`hashTokenString`](#hashTokenString) before matching.
 -}
 revoke : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
 revoke rawToken database secureContext =
@@ -404,13 +410,42 @@ revoke rawToken database secureContext =
                 Sqlite.execute database
                     { statement =
                         """
-                        UPDATE sessions
+                        UPDATE auth_sessions
                         SET revoked_at = :revoked_at
-                        WHERE id = :id
+                        WHERE session_token = :session_token
                         """
                     , parameters =
                         [ Sqlite.Encode.int "revoked_at" (Time.posixToMillis now)
-                        , Sqlite.Encode.string "id" hashedToken
+                        , Sqlite.Encode.string "session_token" hashedToken
+                        ]
+                    }
+            )
+        |> Task.map (\_ -> {})
+
+
+{-| Revoke every live session a user holds, stamping `revoked_at` with the
+current time. The `revokeAllForUser` of the [`token`](#token) bundle — driven by
+[`Auth.Simple.Credential.Password.change`](Auth.Simple.Credential.Password) and
+[`Auth.Simple.Credential.Password.reset`](Auth.Simple.Credential.Password) so a
+stolen session never survives a credential change. Idempotent; rows are kept for
+auditing, like [`revoke`](#revoke). The secure context is unused — sessions
+revoke by a plain database write.
+-}
+revokeAllForUser : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
+revokeAllForUser { userId } database _ =
+    Time.now
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        UPDATE auth_sessions
+                        SET revoked_at = :revoked_at
+                        WHERE user_id = :user_id AND revoked_at IS NULL
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.int "revoked_at" (Time.posixToMillis now)
+                        , Sqlite.Encode.string "user_id" userId
                         ]
                     }
             )
@@ -422,7 +457,7 @@ revoke rawToken database secureContext =
 
 
 {-| Hard-delete a session by its raw token. To keep the row for auditing, use
-[`revoke`](#revoke) instead. The `rawToken` is mapped to the stored id via
+[`revoke`](#revoke) instead. The `rawToken` is mapped to the stored `session_token` via
 [`hashTokenString`](#hashTokenString) before matching.
 -}
 delete : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Sqlite.ExecutionSummary
@@ -433,11 +468,11 @@ delete rawToken database secureContext =
                 Sqlite.execute database
                     { statement =
                         """
-                        DELETE FROM sessions
-                        WHERE id = :id
+                        DELETE FROM auth_sessions
+                        WHERE session_token = :session_token
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "id" hashedToken
+                        [ Sqlite.Encode.string "session_token" hashedToken
                         ]
                     }
             )
@@ -455,19 +490,19 @@ migration =
     }
 
 
-{-| Create the `sessions` table backing the database-stored token. Run after
+{-| Create the `auth_sessions` table backing the database-stored token. Run after
 [`Auth.Simple.migrationV1`](Auth.Simple) (it references `users`).
 -}
 migrationV1 : { name : String, statements : Array String }
 migrationV1 =
-    { name = "`Auth.Simple.Token.Session.migrationV1` - Add sessions table"
+    { name = "`Auth.Simple.Token.Session.migrationV1` - Add auth_sessions table"
     , statements =
         [ addSessionsTableMigrationSQL
         ]
     }
 
 
-{-| Migration SQL for adding a `sessions` table.
+{-| Migration SQL for adding a `auth_sessions` table.
 
 `revoked_at` is nullable so explicit logout/revocation can mark a row without
 deleting it, leaving a trace of the session's lifecycle.
@@ -475,8 +510,8 @@ deleting it, leaving a trace of the session's lifecycle.
 addSessionsTableMigrationSQL : String
 addSessionsTableMigrationSQL =
     """
-    CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+        session_token TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
