@@ -29,6 +29,6 @@ domain checks (is the value well-formed? is it already taken?) belong to
 `resolve`, which workflows run before opening the transaction.
 -}
 type alias Identifier error value =
-    { resolve : value -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe String)
+    { resolve : { value : value } -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe String)
     , insert : { userId : String, value : value } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
     }

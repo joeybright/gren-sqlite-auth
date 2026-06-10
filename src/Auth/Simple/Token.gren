@@ -29,10 +29,11 @@ The four functions required for a `Token` are:
 
 - `issue` which takes a `{ userId }` and issues a token for that user id. This does not
   control lifetime and expiry as those policies live inside the implementation.
-- `verify` takes the raw bearer string the client holds and produces the `verified` type
-  if the bearer string is a valid session. If not valid, returns a successful `Task` but
-  the result is `Nothing`.
-- `revoke` takes the raw bearer string the client holds and revokes that token.
+- `verify` takes the raw bearer string the client holds (`{ token }`) and produces the
+  `verified` type if it is valid. If not valid, returns a successful `Task` but the
+  result is `Nothing`.
+- `revoke` takes the raw bearer string the client holds (`{ token }`) and revokes that
+  token.
 - `revokeAllForUser` invalidates every token the user holds — the "credential changed"
   hook, driven by workflows like
   [`Auth.Simple.Credential.Password.change`](Auth.Simple.Credential.Password) and
@@ -45,7 +46,7 @@ The four functions required for a `Token` are:
 -}
 type alias Token error issued verified =
     { issue : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error issued
-    , verify : String -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe verified)
-    , revoke : String -> Sqlite.Database -> Crypto.SecureContext -> Task error {}
+    , verify : { token : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe verified)
+    , revoke : { token : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error {}
     , revokeAllForUser : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
     }

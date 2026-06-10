@@ -74,13 +74,13 @@ login :
     -> { identifier : identifierValue, secret : candidateCredential }
     -> Task (Error identifierError credentialError tokenError) issued
 login database secureContext identifier credential token input =
-    identifier.resolve input.identifier database secureContext
+    identifier.resolve { value = input.identifier } database secureContext
         |> Task.mapError IdentifierError
         |> Task.andThen
             (\maybeUserId ->
                 when maybeUserId is
                     Nothing ->
-                        credential.burn input.secret database secureContext
+                        credential.burn { secret = input.secret } database secureContext
                             |> Task.mapError CredentialError
                             |> Task.andThen (\_ -> Task.fail InvalidCredentials)
 

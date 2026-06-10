@@ -82,7 +82,7 @@ ensureAvailable :
     -> value
     -> Task (Error identifierError) {}
 ensureAvailable database secureContext theIdentifier value =
-    theIdentifier.resolve value database secureContext
+    theIdentifier.resolve { value = value } database secureContext
         |> Task.mapError IdentifierError
         |> Task.andThen
             (\existing ->

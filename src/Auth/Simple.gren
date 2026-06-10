@@ -102,7 +102,7 @@ order declared by `requiredUsersColumns`).
 -}
 checkUsersTableSchema : Sqlite.Database -> Task SchemaCheckError {}
 checkUsersTableSchema =
-    checkTableSchema "users" requiredUsersColumns
+    checkTableSchema { table = "users", requiredColumns = requiredUsersColumns }
 
 
 
@@ -111,13 +111,13 @@ checkUsersTableSchema =
 
 {-| Shared body for the per-table `check*TableSchema` functions.
 
-Runs `PRAGMA table_info` on `tableName`, then fails with
+Runs `PRAGMA table_info` on `table`, then fails with
 `MissingRequiredColumns` listing any names from `requiredColumns` that
 are absent from the live table (preserving the order given).
 -}
-checkTableSchema : String -> Array String -> Sqlite.Database -> Task SchemaCheckError {}
-checkTableSchema tableName requiredColumns db =
-    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery tableName
+checkTableSchema : { table : String, requiredColumns : Array String } -> Sqlite.Database -> Task SchemaCheckError {}
+checkTableSchema { table, requiredColumns } db =
+    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery { table = table }
         |> Sqlite.getAll db
         |> Task.mapError SchemaQueryFailed
         |> Task.andThen

@@ -294,9 +294,9 @@ insert database { sessionToken, userId, createdAt, expiresAt, lastUsedAt, revoke
 matches. The token is mapped to the stored `session_token` via
 [`hashTokenString`](#hashTokenString) before matching.
 -}
-getByToken : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error (Maybe Session)
-getByToken rawToken database secureContext =
-    hashTokenString secureContext rawToken
+getByToken : { token : String } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error (Maybe Session)
+getByToken input database secureContext =
+    hashTokenString secureContext input.token
         |> Task.andThen
             (\hashedToken ->
                 Sqlite.getMaybeOne database
@@ -323,11 +323,11 @@ yields `Nothing`.
 A successful verification touches the session: `last_used_at` is bumped to now,
 and the returned [`Session`](#Session) reflects it.
 -}
-verifyToken : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error (Maybe Session)
-verifyToken rawToken database secureContext =
+verifyToken : { token : String } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error (Maybe Session)
+verifyToken input database secureContext =
     Task.map2
         (\maybeSession now -> { maybeSession = maybeSession, now = Time.posixToMillis now })
-        (getByToken rawToken database secureContext)
+        (getByToken input database secureContext)
         Time.now
         |> Task.andThen
             (\{ maybeSession, now } ->
@@ -343,7 +343,7 @@ verifyToken rawToken database secureContext =
                             Nothing ->
                                 if session.expiresAt > now then
                                     update
-                                        { rawToken = rawToken
+                                        { token = input.token
                                         , expiresAt = session.expiresAt
                                         , lastUsedAt = now
                                         , revokedAt = Nothing
@@ -365,16 +365,16 @@ verifyToken rawToken database secureContext =
 
 Covers "touch on use" (bump `lastUsedAt`) and lifetime changes (`expiresAt`); for
 logout use [`revoke`](#revoke). Pass `Nothing` for `revokedAt` to keep the session
-live. The `rawToken` is mapped to the stored `session_token` via
+live. The `token` is mapped to the stored `session_token` via
 [`hashTokenString`](#hashTokenString) before matching.
 -}
 update :
-    { rawToken : String, expiresAt : Int, lastUsedAt : Int, revokedAt : Maybe Int }
+    { token : String, expiresAt : Int, lastUsedAt : Int, revokedAt : Maybe Int }
     -> Sqlite.Database
     -> Crypto.SecureContext
     -> Task Sqlite.Error Sqlite.ExecutionSummary
-update { rawToken, expiresAt, lastUsedAt, revokedAt } database secureContext =
-    hashTokenString secureContext rawToken
+update input database secureContext =
+    hashTokenString secureContext input.token
         |> Task.andThen
             (\hashedToken ->
                 Sqlite.execute database
@@ -385,9 +385,9 @@ update { rawToken, expiresAt, lastUsedAt, revokedAt } database secureContext =
                         WHERE session_token = :session_token
                         """
                     , parameters =
-                        [ Sqlite.Encode.int "expires_at" expiresAt
-                        , Sqlite.Encode.int "last_used_at" lastUsedAt
-                        , Sqlite.Encode.maybe Sqlite.Encode.int "revoked_at" revokedAt
+                        [ Sqlite.Encode.int "expires_at" input.expiresAt
+                        , Sqlite.Encode.int "last_used_at" input.lastUsedAt
+                        , Sqlite.Encode.maybe Sqlite.Encode.int "revoked_at" input.revokedAt
                         , Sqlite.Encode.string "session_token" hashedToken
                         ]
                     }
@@ -396,14 +396,14 @@ update { rawToken, expiresAt, lastUsedAt, revokedAt } database secureContext =
 
 {-| Revoke a session by its raw token, stamping `revoked_at` with the current
 time. Idempotent: a token matching no row simply updates nothing. The row is kept
-for auditing — to hard-delete instead, use [`delete`](#delete). The `rawToken` is
+for auditing — to hard-delete instead, use [`delete`](#delete). The `token` is
 mapped to the stored `session_token` via [`hashTokenString`](#hashTokenString) before matching.
 -}
-revoke : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
-revoke rawToken database secureContext =
+revoke : { token : String } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
+revoke input database secureContext =
     Task.map2
         (\hashedToken now -> { hashedToken = hashedToken, now = now })
-        (hashTokenString secureContext rawToken)
+        (hashTokenString secureContext input.token)
         Time.now
         |> Task.andThen
             (\{ hashedToken, now } ->
@@ -457,12 +457,12 @@ revokeAllForUser { userId } database _ =
 
 
 {-| Hard-delete a session by its raw token. To keep the row for auditing, use
-[`revoke`](#revoke) instead. The `rawToken` is mapped to the stored `session_token` via
+[`revoke`](#revoke) instead. The `token` is mapped to the stored `session_token` via
 [`hashTokenString`](#hashTokenString) before matching.
 -}
-delete : String -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Sqlite.ExecutionSummary
-delete rawToken database secureContext =
-    hashTokenString secureContext rawToken
+delete : { token : String } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Sqlite.ExecutionSummary
+delete input database secureContext =
+    hashTokenString secureContext input.token
         |> Task.andThen
             (\hashedToken ->
                 Sqlite.execute database

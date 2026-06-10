@@ -178,8 +178,8 @@ insert database { userId, username, createdAt } =
 {-| Read a single username row by its `username` value, returning `Nothing` when
 no such row exists.
 -}
-getByUsername : String -> Sqlite.Database -> Task Sqlite.Error (Maybe Username)
-getByUsername username database =
+getByUsername : { username : String } -> Sqlite.Database -> Task Sqlite.Error (Maybe Username)
+getByUsername { username } database =
     Sqlite.getMaybeOne database
         { query =
             """
@@ -233,8 +233,8 @@ update { username, newUsername } database =
 
 {-| Delete a username row by its `username` value.
 -}
-delete : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
-delete username database =
+delete : { username : String } -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
+delete { username } database =
     Sqlite.execute database
         { statement =
             """
@@ -285,17 +285,17 @@ backstop for a race.
 identifier : Identifier AsIdentifierError String
 identifier =
     { resolve =
-        (\username database _ ->
+        (\{ value } database _ ->
             let
                 normalized : String
                 normalized =
-                    normalize username
+                    normalize value
             in
             if String.isEmpty normalized then
                 Task.fail UsernameBlank
 
             else
-                getByUsername normalized database
+                getByUsername { username = normalized } database
                     |> Task.mapError StorageError
                     |> Task.map (Maybe.map .userId)
         )

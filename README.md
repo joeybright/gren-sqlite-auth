@@ -150,11 +150,11 @@ resetPassword { token, newHashed } =
 -- Verify a request: Nothing for unknown, expired, or revoked tokens.
 -- A successful verify bumps the session's last_used_at.
 authenticate cookie =
-    Session.verifyToken cookie database secureContext
+    Session.verifyToken { token = cookie } database secureContext
 
 -- Logout: revoke the session (the row is kept, marked revoked).
 logout cookie =
-    Session.revoke cookie database secureContext
+    Session.revoke { token = cookie } database secureContext
 ```
 
 ## Tests

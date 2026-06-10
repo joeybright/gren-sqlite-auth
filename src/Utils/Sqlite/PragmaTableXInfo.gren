@@ -58,15 +58,15 @@ type Visibility
 
 {-| Query the schema of any table by name.
 
-    Sqlite.getAll db (Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery "users")
+    Sqlite.getAll db (Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery { table = "users" })
 
 resolves to `Task Sqlite.Error (Array Column)`.
 -}
-tableSchemaQuery : String -> Sqlite.Query Column
-tableSchemaQuery tableName =
+tableSchemaQuery : { table : String } -> Sqlite.Query Column
+tableSchemaQuery { table } =
     { query = tableSchemaSql
     , parameters =
-        [ Sqlite.Encode.string "table" tableName ]
+        [ Sqlite.Encode.string "table" table ]
     , rowDecoder = columnDecoder
     }
 

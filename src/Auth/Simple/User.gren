@@ -122,8 +122,8 @@ insert database { id, createdAt } =
 
 {-| Read a single user by `id`, returning `Nothing` when no such row exists.
 -}
-get : String -> Sqlite.Database -> Task Sqlite.Error (Maybe User)
-get id database =
+get : { id : String } -> Sqlite.Database -> Task Sqlite.Error (Maybe User)
+get { id } database =
     Sqlite.getMaybeOne database
         { query =
             """
@@ -144,8 +144,8 @@ The minimal `users` schema has no other mutable column, so updating a user means
 refreshing its `updated_at` timestamp. Consumers that have extended the table
 with their own columns should write their own update queries for those.
 -}
-update : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
-update id database =
+update : { id : String } -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
+update { id } database =
     Time.now
         |> Task.andThen
             (\now ->
@@ -169,8 +169,8 @@ update id database =
 Foreign keys reference `users(id)`, so deleting a user cascades to its sessions,
 usernames, and password rows.
 -}
-delete : String -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
-delete id database =
+delete : { id : String } -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
+delete { id } database =
     Sqlite.execute database
         { statement =
             """
