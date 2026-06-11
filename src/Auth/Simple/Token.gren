@@ -45,8 +45,8 @@ The four functions required for a `Token` are:
   denylist, a key-version row).
 -}
 type alias Token error issued verified =
-    { issue : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error issued
-    , verify : { token : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error (Maybe verified)
-    , revoke : { token : String } -> Sqlite.Database -> Crypto.SecureContext -> Task error {}
-    , revokeAllForUser : { userId : String } -> Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error {}
+    { issue : Sqlite.Database -> Crypto.SecureContext -> { userId : String } -> Task error issued
+    , verify : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task error (Maybe verified)
+    , revoke : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task error {}
+    , revokeAllForUser : Sqlite.Database -> Crypto.SecureContext -> { userId : String } -> Task Sqlite.Error {}
     }

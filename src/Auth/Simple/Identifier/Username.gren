@@ -15,10 +15,10 @@ module Auth.Simple.Identifier.Username exposing
 `auth_usernames` table.
 
 Each row links a `username` to a `user_id`; the username itself is the primary
-key. This module is a thin, reusable data-access layer over those columns; CRUD
-functions are keyed on the `username` and store their input literally —
-normalization happens in the [`identifier`](#identifier) bundle, which is what
-workflows should drive.
+key. This module is a thin, reusable data-access layer over those columns.
+Every function runs its username input through [`normalize`](#normalize) —
+writes and lookups can never disagree about case or whitespace, whichever door
+a username comes in through.
 
 @docs migration
 @docs Username
@@ -123,15 +123,15 @@ decoder =
 {-| Create a username for an existing user, identified by their `userId`, and
 save it to the database.
 
-Stamps the row with the current time, then inserts it. To insert a username
-inside an existing transaction with a shared timestamp, use [`insert`](#insert)
-directly.
+Stamps the row with the current time, then inserts it (normalizing the
+username). To insert a username inside an existing transaction with a shared
+timestamp, use [`insert`](#insert) directly.
 -}
 create :
-    { userId : String, username : String }
-    -> Sqlite.Database
+    Sqlite.Database
+    -> { userId : String, username : String }
     -> Task Sqlite.Error Sqlite.ExecutionSummary
-create { userId, username } database =
+create database { userId, username } =
     Time.now
         |> Task.andThen
             (\now ->
@@ -145,7 +145,7 @@ create { userId, username } database =
 
 {-| Insert a username row into the `auth_usernames` table, using the given
 `createdAt` timestamp. Both `created_at` and `updated_at` are set to
-`createdAt`.
+`createdAt`; the username is stored [`normalize`](#normalize)d.
 -}
 insert :
     Sqlite.Database
@@ -163,7 +163,7 @@ insert database { userId, username, createdAt } =
     Sqlite.execute database
         { statement = statement
         , parameters =
-            [ Sqlite.Encode.string "username" username
+            [ Sqlite.Encode.string "username" (normalize username)
             , Sqlite.Encode.string "user_id" userId
             , Sqlite.Encode.int "created_at" createdAt
             , Sqlite.Encode.int "updated_at" createdAt
@@ -175,11 +175,11 @@ insert database { userId, username, createdAt } =
 --- reading usernames
 
 
-{-| Read a single username row by its `username` value, returning `Nothing` when
-no such row exists.
+{-| Read a single username row by its `username` value (normalized before
+matching), returning `Nothing` when no such row exists.
 -}
-getByUsername : { username : String } -> Sqlite.Database -> Task Sqlite.Error (Maybe Username)
-getByUsername { username } database =
+getByUsername : Sqlite.Database -> { username : String } -> Task Sqlite.Error (Maybe Username)
+getByUsername database { username } =
     Sqlite.getMaybeOne database
         { query =
             """
@@ -188,7 +188,7 @@ getByUsername { username } database =
             WHERE username = :username
             """
         , parameters =
-            [ Sqlite.Encode.string "username" username
+            [ Sqlite.Encode.string "username" (normalize username)
             ]
         , rowDecoder = decoder
         }
@@ -198,16 +198,16 @@ getByUsername { username } database =
 --- updating usernames
 
 
-{-| Rename a username row from its current value to a new one, bumping
-`updated_at` to now.
+{-| Rename a username row from its current value to a new one (both normalized),
+bumping `updated_at` to now.
 
 `username` is the primary key, so this fails if the new value is already taken.
 -}
 update :
-    { username : String, newUsername : String }
-    -> Sqlite.Database
+    Sqlite.Database
+    -> { username : String, newUsername : String }
     -> Task Sqlite.Error Sqlite.ExecutionSummary
-update { username, newUsername } database =
+update database { username, newUsername } =
     Time.now
         |> Task.andThen
             (\now ->
@@ -219,9 +219,9 @@ update { username, newUsername } database =
                         WHERE username = :username
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "new_username" newUsername
+                        [ Sqlite.Encode.string "new_username" (normalize newUsername)
                         , Sqlite.Encode.int "updated_at" (Time.posixToMillis now)
-                        , Sqlite.Encode.string "username" username
+                        , Sqlite.Encode.string "username" (normalize username)
                         ]
                     }
             )
@@ -231,10 +231,10 @@ update { username, newUsername } database =
 --- deleting usernames
 
 
-{-| Delete a username row by its `username` value.
+{-| Delete a username row by its `username` value (normalized before matching).
 -}
-delete : { username : String } -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
-delete { username } database =
+delete : Sqlite.Database -> { username : String } -> Task Sqlite.Error Sqlite.ExecutionSummary
+delete database { username } =
     Sqlite.execute database
         { statement =
             """
@@ -242,7 +242,7 @@ delete { username } database =
             WHERE username = :username
             """
         , parameters =
-            [ Sqlite.Encode.string "username" username
+            [ Sqlite.Encode.string "username" (normalize username)
             ]
         }
 
@@ -253,8 +253,8 @@ delete { username } database =
 
 {-| Normalize a username for both storage and lookup: trim surrounding whitespace
 and lowercase it, so `"Alice"`, `" alice "`, and `"ALICE"` all resolve to one
-account. Applied by both halves of the [`identifier`](#identifier) bundle; the
-raw CRUD functions store and match their input literally.
+account. Every function in this module applies it to its username input, so a
+value can neither be stored nor matched un-normalized.
 -}
 normalize : String -> String
 normalize =
@@ -273,8 +273,8 @@ type AsIdentifierError
 
 {-| Expose usernames as a generic [`Identifier`](Auth.Simple.Identifier): `resolve`
 maps a username string to the owning user's id via [`getByUsername`](#getByUsername),
-and `insert` registers a new username for a user via [`create`](#create). Both
-run the input through [`normalize`](#normalize) first.
+and `insert` registers a new username for a user via [`create`](#create) —
+normalization is handled by those functions themselves.
 
 `resolve` rejects a blank username (`UsernameBlank`) — malformed input, distinct
 from `Nothing` (well-formed but unknown). `insert` is a plain write;
@@ -285,23 +285,18 @@ backstop for a race.
 identifier : Identifier AsIdentifierError String
 identifier =
     { resolve =
-        (\{ value } database _ ->
-            let
-                normalized : String
-                normalized =
-                    normalize value
-            in
-            if String.isEmpty normalized then
+        (\database _ { value } ->
+            if String.isEmpty (normalize value) then
                 Task.fail UsernameBlank
 
             else
-                getByUsername { username = normalized } database
+                getByUsername database { username = value }
                     |> Task.mapError StorageError
                     |> Task.map (Maybe.map .userId)
         )
     , insert =
-        (\{ userId, value } database _ ->
-            create { userId = userId, username = normalize value } database
+        (\database _ { userId, value } ->
+            create database { userId = userId, username = value }
                 |> Task.map (\_ -> {})
         )
     }

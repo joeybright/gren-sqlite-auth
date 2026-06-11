@@ -76,6 +76,13 @@ migrations =
 
 ## Example
 
+Every function takes its setup first — database, secure context, config,
+bundles — and the value it acts on last, so you can partially apply your way to
+an app-specific helper and then just pass tokens and usernames to it. Policy
+(lockout, lifetimes, minimum lengths) lives in per-module `Config` records;
+each module exports a `defaultConfig`, and a record update on it overrides one
+knob:
+
 ```gren
 import Auth.Simple.Credential.Code as Code
 import Auth.Simple.Credential.Password as Password
@@ -84,15 +91,24 @@ import Auth.Simple.Login as Login
 import Auth.Simple.Register as Register
 import Auth.Simple.Token.Session as Session
 
+-- The bundles, built once from config. Defaults shown for password;
+-- sessions here get a custom one-week lifetime instead of the 30-day default.
+passwordCredential =
+    Password.credential Password.defaultConfig
+
+sessionToken =
+    Session.token
+        { sessionLifetimeMillis = 7 * 24 * 60 * 60 * 1000 }
+
 -- Register: validate and hash the new password, then write
 -- user + username + password in one transaction.
 register { username, password } =
-    when Password.validateLength (Password.fromString password) is
+    when Password.validateLength Password.defaultConfig (Password.fromString password) is
         Err tooShort ->
             Task.fail (ShowLengthError tooShort)
 
         Ok validated ->
-            Password.hashWithDefaults validated secureContext
+            Password.hashWithDefaults secureContext validated
                 |> Task.andThen
                     (\hashed ->
                         Register.register database secureContext
@@ -102,18 +118,19 @@ register { username, password } =
                     )
 
 -- Login: returns { session, token } — hand `token` to the client
--- as a cookie, keep nothing else.
+-- as a cookie, keep nothing else. Issuing also sweeps dead session rows.
 login { username, password } =
     Login.login database secureContext
         Username.identifier
-        Password.credential
-        Session.token
+        passwordCredential
+        sessionToken
         { identifier = username, secret = Password.fromString password }
 
 -- Email-code login, phase 1: mint a code for you to deliver.
 -- Nothing means no such user — respond identically either way.
 requestCode { username } =
     Code.request database secureContext
+        Code.defaultConfig
         Username.identifier
         { identifier = username }
 
@@ -121,21 +138,23 @@ requestCode { username } =
 loginWithCode { username, code } =
     Login.login database secureContext
         Username.identifier
-        Code.credential
-        Session.token
+        (Code.credential Code.defaultConfig)
+        sessionToken
         { identifier = username, secret = code }
 
 -- Change a password by proving the current one. Every session the user
 -- holds is revoked — including this device's — so log them in again after.
 changePassword { userId, current, newHashed } =
     Password.change database secureContext
-        Session.token
+        Password.defaultConfig
+        sessionToken
         { userId = userId, current = Password.fromString current, new = newHashed }
 
 -- Forgot the password? Phase 1: mint a reset token to email as a link.
 -- Nothing means no such user — respond identically either way.
 requestPasswordReset { username } =
     Password.requestReset database secureContext
+        Password.defaultConfig
         Username.identifier
         { identifier = username }
 
@@ -144,17 +163,18 @@ requestPasswordReset { username } =
 -- revoked, so anything stolen dies with the reset.
 resetPassword { token, newHashed } =
     Password.reset database secureContext
-        Session.token
+        sessionToken
         { token = token, new = newHashed }
 
 -- Verify a request: Nothing for unknown, expired, or revoked tokens.
--- A successful verify bumps the session's last_used_at.
-authenticate cookie =
-    Session.verifyToken { token = cookie } database secureContext
+-- A successful verify bumps the session's last_used_at. Partially applied,
+-- so handlers just call `authenticate { token = cookie }`.
+authenticate =
+    Session.verifyToken database secureContext
 
--- Logout: revoke the session (the row is kept, marked revoked).
+-- Logout: revoke the session, then sweep dead rows out of the table.
 logout cookie =
-    Session.revoke { token = cookie } database secureContext
+    Session.revoke database secureContext { token = cookie }
 ```
 
 ## Tests

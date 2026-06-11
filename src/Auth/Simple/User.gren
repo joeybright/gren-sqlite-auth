@@ -10,7 +10,8 @@ module Auth.Simple.User exposing
 {-| CRUD access to the `users` table.
 
 The `users` table holds the minimal user record this package depends on (`id`,
-`created_at`, `updated_at`); consumers may extend it with additional columns.
+`created_at`, `updated_at`). Consumers may extend it with additional columns.
+
 This module is a thin, reusable data-access layer over those base columns. The
 schema itself is owned by [`Auth.Simple.migrationV1`](Auth.Simple); nothing here
 creates or alters the table.
@@ -122,8 +123,8 @@ insert database { id, createdAt } =
 
 {-| Read a single user by `id`, returning `Nothing` when no such row exists.
 -}
-get : { id : String } -> Sqlite.Database -> Task Sqlite.Error (Maybe User)
-get { id } database =
+get : Sqlite.Database -> { id : String } -> Task Sqlite.Error (Maybe User)
+get database { id } =
     Sqlite.getMaybeOne database
         { query =
             """
@@ -144,8 +145,8 @@ The minimal `users` schema has no other mutable column, so updating a user means
 refreshing its `updated_at` timestamp. Consumers that have extended the table
 with their own columns should write their own update queries for those.
 -}
-update : { id : String } -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
-update { id } database =
+update : Sqlite.Database -> { id : String } -> Task Sqlite.Error Sqlite.ExecutionSummary
+update database { id } =
     Time.now
         |> Task.andThen
             (\now ->
@@ -169,8 +170,8 @@ update { id } database =
 Foreign keys reference `users(id)`, so deleting a user cascades to its sessions,
 usernames, and password rows.
 -}
-delete : { id : String } -> Sqlite.Database -> Task Sqlite.Error Sqlite.ExecutionSummary
-delete { id } database =
+delete : Sqlite.Database -> { id : String } -> Task Sqlite.Error Sqlite.ExecutionSummary
+delete database { id } =
     Sqlite.execute database
         { statement =
             """

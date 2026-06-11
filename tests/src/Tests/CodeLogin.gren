@@ -50,8 +50,8 @@ doLogin :
 doLogin database secureContext =
     Login.login database secureContext
         Username.identifier
-        Code.credential
-        Session.token
+        (Code.credential Code.defaultConfig)
+        (Session.token Session.defaultConfig)
 
 
 {-| Request a fresh code for `username`, failing the task when no code comes
@@ -63,7 +63,7 @@ requestCode :
     -> Crypto.SecureContext
     -> Task (Code.RequestError Username.AsIdentifierError) { code : String }
 requestCode username database secureContext =
-    Code.request database secureContext Username.identifier { identifier = username }
+    Code.request database secureContext Code.defaultConfig Username.identifier { identifier = username }
         |> Task.andThen
             (\maybeDeliverable ->
                 when maybeDeliverable is
@@ -131,7 +131,7 @@ tests fsPermission secureContext =
                             concat
                                 [ await
                                     "Request a code for a username that does not exist"
-                                    (Code.request database secureContext Username.identifier { identifier = "ghost-" ++ suffix })
+                                    (Code.request database secureContext Code.defaultConfig Username.identifier { identifier = "ghost-" ++ suffix })
                                     (\maybeDeliverable ->
                                         test "an unknown username yields Nothing (no code minted)"
                                             (\_ -> Expect.equal Nothing (Maybe.map (\_ -> {}) maybeDeliverable))

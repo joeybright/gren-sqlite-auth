@@ -1,40 +1,23 @@
 module Auth.Simple exposing ( migrationV1, addUsersTableMigrationSQL )
 
-{-| Exploring the structure of the package...
+{-| Simple authentication for SQLite databases in Gren.
 
-# Tables
-
-## Base tables
-
-These tables are the tables that are necessary to be created
-and exist with a specific schema (minimal schema) for the auth
-to work at all.
-
-- `users` - user data, can be augmented after this with more data
-
-## Token-specific
-
-The artifact issued on login owns its own table. The database-stored token
-([`Auth.Simple.Token.Session`](Auth.Simple.Token.Session)) brings:
-
-- `auth_sessions` - login session; created by `Auth.Simple.Token.Session.migration`
-
-## Identifier-specific
-
-- `auth_usernames` - created by `Auth.Simple.Identifier.Username.migration`
-
-## Credential-specific
-
-Each credential owns its own table, created by its module's migration:
-
-- `auth_passwords` - created by `Auth.Simple.Credential.Password.migration`
-- `auth_password_reset_tokens` - forgotten-password reset links; created by
-  `Auth.Simple.Credential.Password.migration` alongside `auth_passwords`
-- `auth_codes` - created by `Auth.Simple.Credential.Code.migration`
+This module exposes the base-level migrations and SQL required to run the
+authentication functionality in the package.
 
 # Migrations
 
-@docs migrationV1, addUsersTableMigrationSQL
+## Migration (v1)
+
+The initial migration that must be run for this package to operate properly
+on a given SQLite database.
+
+@docs migrationV1
+
+The `migrationV1` runs these SQL strings. They are exposed here for ease of 
+use outside of the `gren-sqlite-migrate` package.
+
+@docs addUsersTableMigrationSQL
 -}
 
 
@@ -52,9 +35,15 @@ type SchemaCheckError
     | SchemaQueryFailed Sqlite.Error
 
 
-{-| The migration necessary to support basic authentication.
+{-| The migration necessary to support basic authentication. This assumes 
+a `users` table does not already exist. This migration
+ 
+The migration runs the SQL found in `addUsersTableMigrationSQL`. It provides
+the minimum schema this package needs to operate.
 
-This should be run prior to any authentication-specific migrations.
+This migration is structured to be dropped in and used with the 
+`gren-sqlite-migrate` package. If you want to migrate through some other method,
+the SQL for this package is exposed as the `addUsersTableMigrationSQL` variable.
 -}
 migrationV1 : { name : String, statements : Array String }
 migrationV1 =
@@ -65,12 +54,13 @@ migrationV1 =
     }
 
 
+{-| SQL for adding the bare `users` table to a database:
 
---- `users` table
-
-
-{-| Migration SQL for adding a users table for this package
-to interact with.
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
 -}
 addUsersTableMigrationSQL : String
 addUsersTableMigrationSQL =
@@ -81,59 +71,3 @@ addUsersTableMigrationSQL =
         updated_at INTEGER NOT NULL
     );
     """
-
-
-{-| The columns the `users` table must contain for this package to function.
-
-Consumers can extend the table with additional columns; only these names are
-checked for presence.
--}
-requiredUsersColumns : Array String
-requiredUsersColumns =
-    [ "id", "created_at", "updated_at" ]
-
-
-{-| Confirm the live `users` table has every column this package depends on.
-
-Run as part of application initiation. Succeeds with `{}` when every name in
-`requiredUsersColumns` is present in the live table; fails with
-`MissingRequiredColumns` carrying the names of the missing columns (in the
-order declared by `requiredUsersColumns`).
--}
-checkUsersTableSchema : Sqlite.Database -> Task SchemaCheckError {}
-checkUsersTableSchema =
-    checkTableSchema { table = "users", requiredColumns = requiredUsersColumns }
-
-
-
---- Utilities
-
-
-{-| Shared body for the per-table `check*TableSchema` functions.
-
-Runs `PRAGMA table_info` on `table`, then fails with
-`MissingRequiredColumns` listing any names from `requiredColumns` that
-are absent from the live table (preserving the order given).
--}
-checkTableSchema : { table : String, requiredColumns : Array String } -> Sqlite.Database -> Task SchemaCheckError {}
-checkTableSchema { table, requiredColumns } db =
-    Utils.Sqlite.PragmaTableXInfo.tableSchemaQuery { table = table }
-        |> Sqlite.getAll db
-        |> Task.mapError SchemaQueryFailed
-        |> Task.andThen
-            (\columns ->
-                let
-                    presentNames =
-                        Array.map .name columns
-
-                    missing =
-                        Array.keepIf
-                            (\required -> not (Array.member required presentNames))
-                            requiredColumns
-                in
-                if Array.isEmpty missing then
-                    Task.succeed {}
-
-                else
-                    Task.fail (MissingRequiredColumns missing)
-            )

@@ -82,7 +82,7 @@ ensureAvailable :
     -> value
     -> Task (Error identifierError) {}
 ensureAvailable database secureContext theIdentifier value =
-    theIdentifier.resolve { value = value } database secureContext
+    theIdentifier.resolve database secureContext { value = value }
         |> Task.mapError IdentifierError
         |> Task.andThen
             (\existing ->
@@ -113,10 +113,9 @@ identifier database secureContext theIdentifier input =
                     (resolveUserId input.userId database secureContext
                         |> Task.andThen
                             (\userId ->
-                                theIdentifier.insert
-                                    { userId = userId, value = input.value }
-                                    database
+                                theIdentifier.insert database
                                     secureContext
+                                    { userId = userId, value = input.value }
                                     |> Task.map (\_ -> { userId = userId })
                             )
                     )
@@ -145,10 +144,9 @@ credential database secureContext theCredential input =
         (resolveUserId input.userId database secureContext
             |> Task.andThen
                 (\userId ->
-                    theCredential.insert
-                        { userId = userId, secret = input.secret }
-                        database
+                    theCredential.insert database
                         secureContext
+                        { userId = userId, secret = input.secret }
                         |> Task.map (\_ -> { userId = userId })
                 )
         )
@@ -175,16 +173,14 @@ register database secureContext theIdentifier theCredential input =
                     (resolveUserId input.userId database secureContext
                         |> Task.andThen
                             (\userId ->
-                                theIdentifier.insert
-                                    { userId = userId, value = input.value }
-                                    database
+                                theIdentifier.insert database
                                     secureContext
+                                    { userId = userId, value = input.value }
                                     |> Task.andThen
                                         (\_ ->
-                                            theCredential.insert
-                                                { userId = userId, secret = input.secret }
-                                                database
+                                            theCredential.insert database
                                                 secureContext
+                                                { userId = userId, secret = input.secret }
                                         )
                                     |> Task.map (\_ -> { userId = userId })
                             )

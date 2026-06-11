@@ -51,7 +51,7 @@ doRegister :
     -> Crypto.SecureContext
     -> Task SetupError { userId : String }
 doRegister { username, password } database secureContext =
-    Password.hashWithDefaults (Password.fromString password) secureContext
+    Password.hashWithDefaults secureContext (Password.fromString password)
         |> Task.mapError HashError
         |> Task.andThen
             (\hashedPassword ->
@@ -103,7 +103,7 @@ tests fsPermission secureContext =
                                     (\_ ->
                                         Expect.equal
                                             (Err { minimum = 8, actual = 7 })
-                                            (Password.validateLength (Password.fromString "1234567"))
+                                            (Password.validateLength Password.defaultConfig (Password.fromString "1234567"))
                                     )
 
                                 , -- Validation: a password at the minimum passes.
@@ -111,7 +111,7 @@ tests fsPermission secureContext =
                                     (\_ ->
                                         Expect.equal
                                             (Ok (Password.fromString "12345678"))
-                                            (Password.validateLength (Password.fromString "12345678"))
+                                            (Password.validateLength Password.defaultConfig (Password.fromString "12345678"))
                                     )
 
                                 , -- Validation: blank (whitespace-only) username.
