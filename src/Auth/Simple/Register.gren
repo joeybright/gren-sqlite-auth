@@ -1,28 +1,13 @@
 module Auth.Simple.Register exposing ( identifier, credential, register, Error(..) )
 
-{-| Drive an [`Identifier`](Auth.Simple.Identifier) and/or a
-[`Stored`](Auth.Simple.Credential.Stored) credential into a registration
-workflow: optionally create the user, then write the identifier and/or the
-credential against that user.
-
-This is the counterpart to [`Auth.Simple.Login`](Auth.Simple.Login). Like login, it
-holds no storage logic of its own — it calls the `insert` function each bundle
-carries, so the concrete module (e.g. [`Auth.Simple.Credential.Password`](Auth.Simple.Credential.Password))
-remains the only place that knows how to persist its own secret.
+{-| Register a new [username](Auth.Simple.Identifier.Username) identifier and/or a
+[password](Auth.Simple.Credential.Password) credential for a user.
 
 Registering an identifier and registering a credential are separate operations
 ([`identifier`](#identifier), [`credential`](#credential)) so a user can hold many
-identifiers, a single credential, or an identifier with no credential yet (a
-reserved username, an unconfirmed email — login through it simply fails until a
-credential exists). [`register`](#register) is the convenience that does a user, an
-identifier, and a credential together.
-
-Each registration first checks the identifier value is available (via the
-bundle's `resolve`), then runs its writes inside one
-[`Sqlite.inTransaction`](Sqlite#inTransaction) so a half-finished account (a user
-with no identifier, an identifier with no credential) never lands. The
-identifier's unique constraint remains the backstop should two registrations
-race past the availability check.
+identifiers, a single credential, or an identifier with no credential. 
+[`register`](#register) is the convenience that does a user, an identifier, and a 
+credential together.
 
 @docs identifier, credential, register, Error
 
@@ -41,10 +26,6 @@ the availability check (`identifierError`), the identifier value already
 belonging to a user (`IdentifierTaken`), or the transactional writes — user,
 identifier, credential, and the `BEGIN`/`COMMIT`/`ROLLBACK` around them are all
 plain database operations, so they share `TransactionError`.
-
-[`credential`](#credential) involves no identifier and never produces the
-identifier variants; it leaves the parameter polymorphic and unifies cleanly
-when composed.
 -}
 type Error identifierError
     = IdentifierError identifierError
@@ -81,8 +62,8 @@ ensureAvailable :
     -> Identifier identifierError value
     -> value
     -> Task (Error identifierError) {}
-ensureAvailable database secureContext theIdentifier value =
-    theIdentifier.resolve database secureContext { value = value }
+ensureAvailable database secureContext passedIdentifier value =
+    passedIdentifier.resolve database secureContext { value = value }
         |> Task.mapError IdentifierError
         |> Task.andThen
             (\existing ->
@@ -95,9 +76,23 @@ ensureAvailable database secureContext theIdentifier value =
             )
 
 
-{-| Register an [`Identifier`](Auth.Simple.Identifier) value for a user. Pass
-`userId = Nothing` to create the user first, or `Just id` to add the identifier to an
-existing user. Returns the user the identifier now belongs to.
+{-| Register an identifier (like a [username](Auth.Simple.Identifier.Username)) 
+for a user. 
+
+Pass `Nothing` to the `userId` to create a new user first, or `Just id` to add 
+the identifier to an existing user. Returns the user the identifier now belongs
+to.
+
+For example, to register a new username for an existing user, you can use the 
+following, where the given `userId` is the id of the existing user:
+
+    Auth.Simple.Register.identifier database secureContext
+        Auth.Simple.Identifier.Username.identifier
+        { userId = Just "826f1968-46d4-4dcc-aefb-ea1b55dfccf7"
+        , value = "new_username"
+        }
+
+This will create a username for the given user id (if it exists).
 -}
 identifier :
     Sqlite.Database
@@ -105,33 +100,52 @@ identifier :
     -> Identifier identifierError value
     -> { userId : Maybe String, value : value }
     -> Task (Error identifierError) { userId : String }
-identifier database secureContext theIdentifier input =
-    ensureAvailable database secureContext theIdentifier input.value
+identifier database secureContext passedIdentifier input =
+    ensureAvailable database secureContext passedIdentifier input.value
         |> Task.andThen
             (\_ ->
                 Sqlite.inTransaction database
                     (resolveUserId input.userId database secureContext
                         |> Task.andThen
                             (\userId ->
-                                theIdentifier.insert database
-                                    secureContext
-                                    { userId = userId, value = input.value }
-                                    |> Task.map (\_ -> { userId = userId })
+                                passedIdentifier.insert database secureContext
+                                    { userId = userId
+                                    , value = input.value 
+                                    }
+                                    |> Task.map (\_ -> 
+                                        { userId = userId 
+                                        }
+                                    )
                             )
                     )
                     |> Task.mapError TransactionError
             )
 
 
-{-| Register a [`Stored`](Auth.Simple.Credential.Stored) credential secret for a
-user. The secret is the credential's `stored` type (e.g. an already-hashed
-password), prepared by the caller. Pass `userId = Nothing` to create the user
-first, or `Just id` to add the credential to an existing user. Returns the user
-the credential now belongs to.
+{-| Register a credential (like a [password](Auth.Simple.Credential.Password)) 
+for a user. 
 
-One-time codes are never registered — they are minted per login by
-[`Auth.Simple.Credential.Code.request`](Auth.Simple.Credential.Code); a
-code-only user registers just an identifier via [`identifier`](#identifier).
+Pass `Nothing` to the `userId` to create a new user first, or `Just id` to add 
+the identifier to an existing user. Returns the user the identifier now belongs
+to.
+
+For example, to register a new password for an existing user, you can use the 
+following, where the given `userId` is the id of the existing user:
+
+    Auth.Simple.Register.credential database secureContext
+        Auth.Simple.Credential.Password.stored
+        { userId = Just "826f1968-46d4-4dcc-aefb-ea1b55dfccf7"
+        , value = 
+            "new_password"
+                |> Auth.Simple.Credential.Password.fromString
+                |> Auth.Simple.Credential.Password.hash Crypto.Sha256 Dict.empty
+        }
+
+This will create a password that's properly hashed for the given user id (if it
+exists) and stores it in the database.
+
+For more information on how to properly prepare a password for saving to the database,
+refer to the [Auth.Simple.Identifier.Passsword](Auth.Simple.Identifier.Password) module.
 -}
 credential :
     Sqlite.Database
@@ -153,10 +167,25 @@ credential database secureContext theCredential input =
         |> Task.mapError TransactionError
 
 
-{-| Register an identifier and a credential for the same user in one task. Pass
-`userId = Nothing` to create the user first, or `Just id` to attach both to an
-existing user. The user is resolved once and both writes share it; on success returns
-that user's id.
+{-| Register an identifier (like a [username](Auth.Identifier.Username)) and a 
+credential (like a [password](Auth.Simple.Credential.Password)) for a user. 
+
+Like `identifier` and `credential` functions in this module, pass `Nothing` to the 
+`userId` to create a new user first, or `Just id` to add the identifier to an 
+existing user.
+
+Example:
+
+    Auth.Simple.Register.register database secureContext
+        Auth.Simple.Identifier.Username.identifier
+        Auth.Simple.Credential.Password.stored
+        { userId = Just "826f1968-46d4-4dcc-aefb-ea1b55dfccf7"
+        , value = "new_username"
+        , secret = 
+            "new_password"
+                |> Auth.Simple.Credential.Password.fromString
+                |> Auth.Simple.Credential.Password.hash Crypto.Sha256 Dict.empty
+        }
 -}
 register :
     Sqlite.Database
@@ -165,20 +194,20 @@ register :
     -> Stored stored
     -> { userId : Maybe String, value : value, secret : stored }
     -> Task (Error identifierError) { userId : String }
-register database secureContext theIdentifier theCredential input =
-    ensureAvailable database secureContext theIdentifier input.value
+register database secureContext passedIdentifier passedCredential input =
+    ensureAvailable database secureContext passedIdentifier input.value
         |> Task.andThen
             (\_ ->
                 Sqlite.inTransaction database
                     (resolveUserId input.userId database secureContext
                         |> Task.andThen
                             (\userId ->
-                                theIdentifier.insert database
+                                passedIdentifier.insert database
                                     secureContext
                                     { userId = userId, value = input.value }
                                     |> Task.andThen
                                         (\_ ->
-                                            theCredential.insert database
+                                            passedCredential.insert database
                                                 secureContext
                                                 { userId = userId, secret = input.secret }
                                         )
