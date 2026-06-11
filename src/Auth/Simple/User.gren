@@ -1,7 +1,6 @@
 module Auth.Simple.User exposing
     ( User
     , create
-    , insert
     , get
     , update
     , delete
@@ -10,15 +9,15 @@ module Auth.Simple.User exposing
 {-| CRUD access to the `users` table.
 
 The `users` table holds the minimal user record this package depends on (`id`,
-`created_at`, `updated_at`). Consumers may extend it with additional columns.
+`created_at`, `updated_at`).
 
 This module is a thin, reusable data-access layer over those base columns. The
-schema itself is owned by [`Auth.Simple.migrationV1`](Auth.Simple); nothing here
+schema itself is owned by [`Auth.Simple.migrationV1`](Auth.Simple). Nothing here
 creates or alters the table.
 
 @docs User
 
-@docs create, insert, get, update, delete
+@docs create, get, update, delete
 
 -}
 
@@ -59,50 +58,13 @@ decoder =
         )
 
 
-{-| Create a new user and save it to the database.
-
-Generates a fresh `id` and timestamp, inserts the row (with `created_at` and
-`updated_at` both set to now), and returns the created [`User`](#User). To insert
-inside an existing transaction with a caller-supplied `id` and timestamp, use
-[`insert`](#insert) directly.
+{-| Create a new user and save it to the database, generating a new id.
 -}
 create :
     Sqlite.Database
     -> Crypto.SecureContext
     -> Task Sqlite.Error User
 create database secureContext =
-    Task.map2
-        (\id now ->
-            { id = id
-            , createdAt = Time.posixToMillis now
-            }
-        )
-        (Crypto.randomUuidV4 secureContext)
-        Time.now
-        |> Task.andThen
-            (\{ id, createdAt } ->
-                insert database 
-                    { id = id
-                    , createdAt = createdAt 
-                    }
-                    |> Task.map
-                        (\_ ->
-                            { id = id
-                            , createdAt = createdAt
-                            , updatedAt = createdAt
-                            }
-                        )
-            )
-
-
-{-| Insert a user row into the `users` table, using the given `id` and
-`createdAt` timestamp. Both `created_at` and `updated_at` are set to `createdAt`.
--}
-insert :
-    Sqlite.Database
-    -> { id : String, createdAt : Int }
-    -> Task Sqlite.Error Sqlite.ExecutionSummary
-insert database { id, createdAt } =
     let
         statement : String
         statement =
@@ -111,14 +73,31 @@ insert database { id, createdAt } =
             VALUES (:id, :created_at, :updated_at)
             """
     in
-    Sqlite.execute database
-        { statement = statement
-        , parameters =
-            [ Sqlite.Encode.string "id" id
-            , Sqlite.Encode.int "created_at" createdAt
-            , Sqlite.Encode.int "updated_at" createdAt
-            ]
-        }
+    Time.now
+        |> Task.andThen (\now ->
+            let
+                createdAt =
+                    Time.posixToMillis now
+            in
+            Crypto.randomUuidV4 secureContext
+                |> Task.andThen (\id ->
+                    Sqlite.execute database
+                        { statement = statement
+                        , parameters =
+                            [ Sqlite.Encode.string "id" id
+                            , Sqlite.Encode.int "created_at" createdAt
+                            , Sqlite.Encode.int "updated_at" createdAt
+                            ]
+                        }
+                        |> Task.map
+                            (\_ ->
+                                { id = id
+                                , createdAt = createdAt
+                                , updatedAt = createdAt
+                                }
+                            )
+                )
+        )
 
 
 {-| Read a single user by `id`, returning `Nothing` when no such row exists.
