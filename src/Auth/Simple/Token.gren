@@ -16,37 +16,46 @@ import Sqlite
 import Task exposing ( Task )
 
 
-{-| A bundle of functions describing one way to issue, verify, and revoke a token.
+{-| Functions describing one way to issue, verify, and revoke a token.
 
 A `Token` type has three parameters:
 
 - `error` is the tokens failure type.
-- `issued` is the type of the token that will be returned when a token is successfully
-issued.
+- `issued` is the token that will be returned when a token is successfully issued.
 - `verified` is what a presented token resolves to on success.
 
-The four functions required for a `Token` are:
-
-- `issue` which takes a `{ userId }` and issues a token for that user id. This does not
-  control lifetime and expiry as those policies live inside the implementation.
-- `verify` takes the raw bearer string the client holds (`{ token }`) and produces the
-  `verified` type if it is valid. If not valid, returns a successful `Task` but the
-  result is `Nothing`.
-- `revoke` takes the raw bearer string the client holds (`{ token }`) and revokes that
-  token.
-- `revokeAllForUser` invalidates every token the user holds — the "credential changed"
-  hook, driven by workflows like
-  [`Auth.Simple.Credential.Password.change`](Auth.Simple.Credential.Password) and
-  [`Auth.Simple.Credential.Password.reset`](Auth.Simple.Credential.Password) so a stolen
-  token never survives the action meant to lock it out. It is pinned to `Sqlite.Error`
-  (not the generic `error`) so workflows can run it inside
-  [`Sqlite.inTransaction`](Sqlite#inTransaction); a species without per-token rows (a
-  future JWT) would implement it with whatever SQLite state backs its invalidation (a
-  denylist, a key-version row).
+View `Auth.Simple.Token.Session.token` for an example implementation.
 -}
 type alias Token error issued verified =
-    { issue : Sqlite.Database -> Crypto.SecureContext -> { userId : String } -> Task error issued
-    , verify : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task error (Maybe verified)
-    , revoke : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task error {}
-    , revokeAllForUser : Sqlite.Database -> Crypto.SecureContext -> { userId : String } -> Task Sqlite.Error {}
+    { issue : IssueToken error issued
+    , verify : VerifyToken error verified
+    , revoke : RevokeToken error
+    , revokeAllForUser : RevokeAllToken
     }
+
+
+{-| Issues a token for the given `userId`.
+-}
+type alias IssueToken error issued =
+    Sqlite.Database -> Crypto.SecureContext -> { userId : String } -> Task error issued
+
+
+{-| Verifies the given `token`.
+-}
+type alias VerifyToken error verified =
+    Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task error (Maybe verified)
+
+
+{-| Revoke the given `token`.
+-}
+type alias RevokeToken error =
+    Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task error {}
+
+  
+{-| Revoke all sessions for the given `userId`.
+
+This is used to help invalidate all sessions when the user logs out, changes, their
+password, or performs some other action that should invalidate all of their sessions.
+-}
+type alias RevokeAllToken =
+    Sqlite.Database -> Crypto.SecureContext -> { userId : String } -> Task Sqlite.Error {}
