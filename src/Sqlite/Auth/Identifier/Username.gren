@@ -15,6 +15,6 @@ getUserId database secureContext { username } =
 {-| Add a username to a given user. On success, returns the 
 user for future operations.
 -}
-new : Sqlite.Database -> Crypto.SecureContext -> User.Internal -> String -> Task x User.Internal
+new : Sqlite.Database -> Crypto.SecureContext -> User.Internal.User -> String -> Task x User.Internal.User
 new database secureContext (User.Internal.User { userId }) =
     Debug.todo ""
