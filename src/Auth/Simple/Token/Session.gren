@@ -2,6 +2,7 @@ module Auth.Simple.Token.Session exposing
     ( Session
     , Config
     , defaultConfig
+    , issue
     , token
     , generateTokenBytes
     , encodeToken
@@ -37,6 +38,7 @@ table via [`migration`](#migration).
 @docs Session
 @docs Config
 @docs defaultConfig
+@docs issue
 @docs token
 @docs generateTokenBytes
 @docs encodeToken
@@ -55,6 +57,7 @@ table via [`migration`](#migration).
 
 -}
 
+import Auth.Simple.Proof as Proof
 import Auth.Simple.Token exposing ( Token )
 import Base64.Decode
 import Base64.Encode
@@ -103,8 +106,9 @@ defaultConfig =
 {-| The database-stored implementation of the [`Token`](Auth.Simple.Token)
 interface, built from a [`Config`](#Config): issue a session with
 [`create`](#create), verify a presented token with [`verifyToken`](#verifyToken),
-and revoke it with [`revoke`](#revoke). Pass this as the token argument to
-[`Auth.Simple.Login.login`](Auth.Simple.Login).
+and revoke it with [`revoke`](#revoke). Login pipelines use [`issue`](#issue)
+instead; this bundle remains for the workflows that revoke through it (e.g.
+[`Auth.Simple.Credential.Password.change`](Auth.Simple.Credential.Password#change)).
 
 `issue` returns `{ session, token }` — hand `token` to the client, keep nothing
 else; it also runs [`sweep`](#sweep) first, so every login doubles as a cleanup
@@ -115,23 +119,52 @@ password change/reset kick out stolen sessions.
 -}
 token : Config -> Token Sqlite.Error { session : Session, token : String } Session
 token config =
-    { issue =
-        (\database secureContext { userId } ->
-            sweep database
-                |> Task.andThen (\_ -> Time.now)
-                |> Task.andThen
-                    (\now ->
-                        create database
-                            secureContext
-                            { userId = userId
-                            , expiresAt = Time.posixToMillis now + config.sessionLifetimeMillis
-                            }
-                    )
-        )
+    { issue = issueForUserId config
     , verify = verifyToken
     , revoke = revoke
     , revokeAllForUser = revokeAllForUser
     }
+
+
+{-| Issue a session for an authenticated user — the final step of a login
+pipeline. Demands the [`Authenticated`](Auth.Simple.Proof#Authenticated) proof
+only a credential check (e.g.
+[`Auth.Simple.Credential.Password.check`](Auth.Simple.Credential.Password#check))
+can mint, so a session can never be issued for a user who was merely resolved.
+
+Returns `{ session, token }` — hand `token` to the client, keep nothing else.
+Runs [`sweep`](#sweep) first, so every login doubles as a cleanup pass.
+-}
+issue :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Config
+    -> Proof.Authenticated
+    -> Task Sqlite.Error { session : Session, token : String }
+issue database secureContext config proof =
+    issueForUserId config database secureContext { userId = Proof.userId proof }
+
+
+{-| The engine of [`issue`](#issue) and the [`token`](#token) bundle's issue:
+sweep dead rows, then open a session expiring one config lifetime from now.
+-}
+issueForUserId :
+    Config
+    -> Sqlite.Database
+    -> Crypto.SecureContext
+    -> { userId : String }
+    -> Task Sqlite.Error { session : Session, token : String }
+issueForUserId config database secureContext { userId } =
+    sweep database
+        |> Task.andThen (\_ -> Time.now)
+        |> Task.andThen
+            (\now ->
+                create database
+                    secureContext
+                    { userId = userId
+                    , expiresAt = Time.posixToMillis now + config.sessionLifetimeMillis
+                    }
+            )
 
 
 {-| Decode a single `auth_sessions` row into a [`Session`](#Session).

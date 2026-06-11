@@ -1,0 +1,27 @@
+module Sqlite.Auth.User exposing ( User(..), id )
+
+{-|
+
+@docs User, id
+
+-}
+
+import User.Internal
+
+
+{-|-}
+type User
+    = User User.Internal.User
+
+
+{-| Get the id of the given `User` as a `String`
+-}
+id : User -> String
+id (User (User.Internal.User { userId })) =
+    userId
+
+
+{-|-}
+get : Sqlite.Database -> Crypto.SecureContext -> { userId : String } -> Task x User 
+get database secureContext userId =
+    Debug.todo ""

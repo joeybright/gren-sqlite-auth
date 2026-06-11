@@ -7,6 +7,7 @@ module Auth.Simple.Identifier.Username exposing
     , getByUsername
     , update
     , delete
+    , resolve
     , identifier
     , AsIdentifierError(..)
     )
@@ -28,12 +29,15 @@ a username comes in through.
 @docs getByUsername
 @docs update
 @docs delete
+@docs resolve
 @docs identifier
 @docs AsIdentifierError
 
 -}
 
 import Auth.Simple.Identifier exposing ( Identifier )
+import Auth.Simple.Internal.Proof as Internal
+import Auth.Simple.Proof as Proof
 import Sqlite
 import Sqlite.Decode
 import Sqlite.Encode
@@ -269,6 +273,35 @@ resolve to a user nor be registered.
 type AsIdentifierError
     = StorageError Sqlite.Error
     | UsernameBlank
+
+
+{-| Resolve a username to proof that a user owns it — the first step of a login
+pipeline. Succeeds with `Nothing` when no user owns the username (pass that
+straight to a credential check, e.g.
+[`Auth.Simple.Credential.Password.check`](Auth.Simple.Credential.Password#check),
+which burns a validation round so unknown usernames cost the same as wrong
+secrets). Fails with `UsernameBlank` for a username that is blank after
+[`normalize`](#normalize) — malformed input, distinct from well-formed but
+unknown.
+
+    Auth.Simple.Identifier.Username.resolve database { username = "alice" }
+        |> Task.mapError ResolveProblem
+        |> Task.andThen
+            (Auth.Simple.Credential.Password.check database secureContext config
+                { password = candidate }
+                >> Task.mapError CheckProblem
+            )
+
+-}
+resolve : Sqlite.Database -> { username : String } -> Task AsIdentifierError (Maybe Proof.ResolvedUser)
+resolve database { username } =
+    if String.isEmpty (normalize username) then
+        Task.fail UsernameBlank
+
+    else
+        getByUsername database { username = username }
+            |> Task.mapError StorageError
+            |> Task.map (Maybe.map (\row -> Internal.ResolvedUser { userId = row.userId }))
 
 
 {-| Expose usernames as a generic [`Identifier`](Auth.Simple.Identifier): `resolve`

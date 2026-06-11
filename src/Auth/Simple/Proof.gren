@@ -1,0 +1,70 @@
+module Auth.Simple.Proof exposing ( ResolvedUser, Authenticated, Outcome(..), resolvedUserId, userId )
+
+{-| The witness types that keep a hand-rolled authentication pipeline honest.
+
+An identifier module's `resolve` returns a [`ResolvedUser`](#ResolvedUser); a
+credential module's `check` consumes it and, on success, returns an
+[`Authenticated`](#Authenticated) inside an [`Outcome`](#Outcome); token
+issuance (e.g. `Auth.Simple.Token.Session.issue`) demands the
+[`Authenticated`](#Authenticated). Neither type can be constructed outside this
+package, so a pipeline that skips a step — issuing a session for a user that
+was merely *resolved*, never *authenticated* — does not compile.
+
+You can read the user id out of either witness ([`resolvedUserId`](#resolvedUserId),
+[`userId`](#userId)); extraction is harmless, minting is what's gated.
+
+@docs ResolvedUser, Authenticated, Outcome, resolvedUserId, userId
+
+-}
+
+import Auth.Simple.Internal.Proof as Internal
+
+
+{-| Proof that an identifier (a username, an email, …) resolved to an existing
+user. Produced by identifier modules — e.g.
+`Auth.Simple.Identifier.Username.resolve` — and consumed by credential checks.
+Holding one means "this account exists", nothing more: it is not permission to
+issue a token.
+-}
+type alias ResolvedUser =
+    Internal.ResolvedUser
+
+
+{-| Proof that a credential check accepted a candidate secret for a user.
+Produced only by credential modules — e.g.
+`Auth.Simple.Credential.Password.check` — inside an [`Outcome`](#Outcome), and
+demanded by token issuance. If you hold one, the user proved who they are.
+-}
+type alias Authenticated =
+    Internal.Authenticated
+
+
+{-| The outcome of a credential check. An expected negative — the secret didn't
+match, or no user owned the identifier (`Rejected`), or the credential is
+temporarily locked after repeated failures (`Locked`) — is a value, not an
+error; a check's error type is reserved for real faults (database, crypto).
+
+`Rejected` deliberately covers both "unknown identifier" and "wrong secret", so
+a caller (or an attacker reading its responses) cannot tell whether an account
+exists. `Locked` is distinct: it is only reachable after repeated observable
+failures against an identifier that therefore is known to exist, and a
+locked-out user with the *correct* secret deserves a better answer than a shrug.
+-}
+type Outcome
+    = Accepted Authenticated
+    | Rejected
+    | Locked
+
+
+{-| The id of the user an identifier resolved to.
+-}
+resolvedUserId : ResolvedUser -> String
+resolvedUserId (Internal.ResolvedUser record) =
+    record.userId
+
+
+{-| The id of the user a credential check authenticated.
+-}
+userId : Authenticated -> String
+userId (Internal.Authenticated record) =
+    record.userId

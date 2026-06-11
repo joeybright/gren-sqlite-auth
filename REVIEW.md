@@ -29,6 +29,8 @@ This includes review code _and_ comments, especially comments that are public in
 
 `src/Auth.Simple.Credential`
 
+- [x] Deleted — replaced by pipeable `check` functions on the concrete credential modules (see "Pipeline redesign" below)
+
 `src/Auth.Simple.Token.Session`
 
 `src/Auth.Simple.Identifier.Username`
@@ -40,3 +42,15 @@ This includes review code _and_ comments, especially comments that are public in
 `src/Auth.Simple.Credential.Password`
 
 `src/Auth.Simple.Credential.Password.PhcString`
+
+## Pipeline redesign — phase 2
+
+Phase 1 (done) replaced the `Credential` bundle with concrete pipeable steps
+gated by the `Auth.Simple.Proof` witness types: `Username.resolve`,
+`Password.check`, `Code.check`, `Session.issue`, and the `Login.check` /
+`Login.issue` pipe combinators. Remaining migrations off the record bundles:
+
+- [ ] `Register`: migrate off the `Identifier`/`Stored` bundles (concrete insert functions + transaction)
+- [ ] `Code.request` / `Password.requestReset`: migrate off the `Identifier` bundle (likely take the `Maybe ResolvedUser` from a resolve step)
+- [ ] `Password.change` / `Password.reset`: migrate off the `Token` bundle (take a revoke-all function or call `Session.revokeAllForUser` concretely)
+- [ ] Then delete `Auth.Simple.Identifier`, `Auth.Simple.Credential.Stored`, `Auth.Simple.Token`, and the `Username.identifier` / `Password.stored` / `Session.token` bundle constructors

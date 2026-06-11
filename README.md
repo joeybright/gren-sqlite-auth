@@ -13,35 +13,43 @@ by SQLite.
 
 ## How it's put together
 
-Three small abstractions, each a record of functions, so new methods plug in
-without touching the workflows:
+A login is a pipeline of three concrete steps, and the types make sure you
+can't assemble them wrong:
 
-- **`Auth.Simple.Identifier`** — something that names an account (a username
-  today; an email or phone number tomorrow). `Auth.Simple.Identifier.Username`
-  is the concrete one, normalizing (trim + lowercase) on both store and lookup.
-- **`Auth.Simple.Credential`** — a secret the user proves they hold. The core
-  is just `validate` + `burn` — what login needs — and every credential carries
-  a kind-specific half beside it: **stored** credentials are durable secrets
-  you write (`Auth.Simple.Credential.Password`: PBKDF2-SHA256, 600k iterations,
-  PHC strings, lockout after repeated failures), **temporary** credentials are
-  minted by the package and delivered by you (`Auth.Simple.Credential.Code`:
-  6-digit single-use codes, 10-minute expiry, 5 guesses, one live code per
-  user).
-- **`Auth.Simple.Token`** — what a successful login issues.
-  `Auth.Simple.Token.Session` stores sessions in SQLite, keeping only the
-  SHA-256 hash of the token, and refuses expired or revoked sessions on verify.
-  Every token species can also revoke everything a user holds at once — the
-  hook password change and reset use to make sure a stolen session never
-  survives them.
+1. **Resolve** an identifier — something that names an account (a username
+   today; an email or phone number tomorrow).
+   `Auth.Simple.Identifier.Username.resolve` maps a username (normalized: trim
+   + lowercase on both store and lookup) to a `Maybe ResolvedUser`.
+2. **Check** a credential — a secret the user proves they hold. Each kind
+   carries its own `check`: `Auth.Simple.Credential.Password.check`
+   (PBKDF2-SHA256, 600k iterations, PHC strings, lockout after repeated
+   failures) for durable secrets you write, and
+   `Auth.Simple.Credential.Code.check` (6-digit single-use codes, 10-minute
+   expiry, 5 guesses, one live code per user) for secrets the package mints and
+   you deliver. A check takes the *whole* `Maybe ResolvedUser` from resolve:
+   handed `Nothing`, it burns the cost of a real validation and answers
+   `Rejected`, so unknown identifiers cost the same as wrong secrets and
+   callers can't be used to enumerate accounts.
+3. **Issue** a token. `Auth.Simple.Token.Session.issue` stores a session in
+   SQLite, keeping only the SHA-256 hash of the token, and refuses expired or
+   revoked sessions on verify. Sessions can also be revoked all-at-once per
+   user — the hook password change and reset use to make sure a stolen session
+   never survives them.
 
-Workflows compose them:
+The steps thread together through the witness types in **`Auth.Simple.Proof`**:
+only an identifier module can mint a `ResolvedUser`, only a credential check
+can mint the `Authenticated` proof inside its `Outcome`, and token issuance
+demands that proof. A pipeline that skips a step — issuing a session for a user
+that was merely *resolved*, never *authenticated* — does not compile.
 
+Two workflows sit on top:
+
+- **`Auth.Simple.Login`** — the three steps composed for you, with every
+  failure collapsed into one uniform `Error` (`Rejected` from either cause
+  lands as the same `InvalidCredentials`). Pipe the steps yourself when you
+  need something it doesn't do.
 - **`Auth.Simple.Register`** — create a user with an identifier and/or a stored
   credential, transactionally. Code-only users register just an identifier.
-- **`Auth.Simple.Login`** — one `login` for every credential: resolve
-  identifier → validate credential → issue token. Unknown identifiers and wrong
-  secrets both cost a full validation round and both fail with the same
-  `InvalidCredentials`, so callers can't be used to enumerate accounts.
 
 The remaining verbs live on the concrete modules, and each temporary credential
 carries a single intent: `Code.request` mints a code for you to deliver (the
@@ -76,9 +84,9 @@ migrations =
 
 ## Example
 
-Every function takes its setup first — database, secure context, config,
-bundles — and the value it acts on last, so you can partially apply your way to
-an app-specific helper and then just pass tokens and usernames to it. Policy
+Every function takes its setup first — database, secure context, config — and
+the value it acts on last, so you can partially apply your way to an
+app-specific helper and then just pass tokens and usernames to it. Policy
 (lockout, lifetimes, minimum lengths) lives in per-module `Config` records;
 each module exports a `defaultConfig`, and a record update on it overrides one
 knob:
@@ -91,14 +99,9 @@ import Auth.Simple.Login as Login
 import Auth.Simple.Register as Register
 import Auth.Simple.Token.Session as Session
 
--- The bundles, built once from config. Defaults shown for password;
--- sessions here get a custom one-week lifetime instead of the 30-day default.
-passwordCredential =
-    Password.credential Password.defaultConfig
-
-sessionToken =
-    Session.token
-        { sessionLifetimeMillis = 7 * 24 * 60 * 60 * 1000 }
+-- Sessions here get a custom one-week lifetime instead of the 30-day default.
+sessionConfig =
+    { sessionLifetimeMillis = 7 * 24 * 60 * 60 * 1000 }
 
 -- Register: validate and hash the new password, then write
 -- user + username + password in one transaction.
@@ -120,11 +123,13 @@ register { username, password } =
 -- Login: returns { session, token } — hand `token` to the client
 -- as a cookie, keep nothing else. Issuing also sweeps dead session rows.
 login { username, password } =
-    Login.login database secureContext
-        Username.identifier
-        passwordCredential
-        sessionToken
-        { identifier = username, secret = Password.fromString password }
+    Login.login
+        { resolve = Username.resolve database { username = username }
+        , check =
+            Password.check database secureContext Password.defaultConfig
+                { password = Password.fromString password }
+        , issue = Session.issue database secureContext sessionConfig
+        }
 
 -- Email-code login, phase 1: mint a code for you to deliver.
 -- Nothing means no such user — respond identically either way.
@@ -134,20 +139,20 @@ requestCode { username } =
         Username.identifier
         { identifier = username }
 
--- Email-code login, phase 2: the same login function, different credential.
+-- Email-code login, phase 2: the same login composition, different check.
 loginWithCode { username, code } =
-    Login.login database secureContext
-        Username.identifier
-        (Code.credential Code.defaultConfig)
-        sessionToken
-        { identifier = username, secret = code }
+    Login.login
+        { resolve = Username.resolve database { username = username }
+        , check = Code.check database secureContext Code.defaultConfig { code = code }
+        , issue = Session.issue database secureContext sessionConfig
+        }
 
 -- Change a password by proving the current one. Every session the user
 -- holds is revoked — including this device's — so log them in again after.
 changePassword { userId, current, newHashed } =
     Password.change database secureContext
         Password.defaultConfig
-        sessionToken
+        (Session.token sessionConfig)
         { userId = userId, current = Password.fromString current, new = newHashed }
 
 -- Forgot the password? Phase 1: mint a reset token to email as a link.
@@ -163,7 +168,7 @@ requestPasswordReset { username } =
 -- revoked, so anything stolen dies with the reset.
 resetPassword { token, newHashed } =
     Password.reset database secureContext
-        sessionToken
+        (Session.token sessionConfig)
         { token = token, new = newHashed }
 
 -- Verify a request: Nothing for unknown, expired, or revoked tokens.

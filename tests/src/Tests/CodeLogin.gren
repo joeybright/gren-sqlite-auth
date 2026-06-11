@@ -4,7 +4,7 @@ module Tests.CodeLogin exposing ( tests )
 ([`Auth.Simple.Credential.Code`](Auth.Simple.Credential.Code)): a user
 registered with only a username identifier requests a code via
 [`Code.request`](Auth.Simple.Credential.Code) and logs in with it through
-the same [`Auth.Simple.Login.login`](Auth.Simple.Login) passwords use.
+the same [`Auth.Simple.Login`](Auth.Simple.Login) chain passwords use.
 
 Covers the code lifecycle: a fresh code is six digits and logs in exactly once;
 a wrong code fails uniformly with `InvalidCredentials`; re-requesting kills the
@@ -47,11 +47,10 @@ doLogin :
         { session : Session.Session
         , token : String
         }
-doLogin database secureContext =
-    Login.login database secureContext
-        Username.identifier
-        (Code.credential Code.defaultConfig)
-        (Session.token Session.defaultConfig)
+doLogin database secureContext { identifier, secret } =
+    Username.resolve database { username = identifier }
+        |> Login.check (Code.check database secureContext Code.defaultConfig { code = secret })
+        |> Login.issue (Session.issue database secureContext Session.defaultConfig)
 
 
 {-| Request a fresh code for `username`, failing the task when no code comes

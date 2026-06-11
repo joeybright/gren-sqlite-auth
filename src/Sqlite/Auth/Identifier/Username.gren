@@ -1,0 +1,20 @@
+module Sqlite.Auth.Identifier.Username exposing ( .. )
+
+{-|-}
+
+import User.Internal
+import User
+
+
+{-|-}
+getUserId : Sqlite.Database -> Crypto.SecureContext -> { username : String } -> Task x User.Internal.User
+getUserId database secureContext { username } =
+    Debug.todo ""
+
+
+{-| Add a username to a given user. On success, returns the 
+user for future operations.
+-}
+new : Sqlite.Database -> Crypto.SecureContext -> User.Internal -> String -> Task x User.Internal
+new database secureContext (User.Internal.User { userId }) =
+    Debug.todo ""

@@ -8,6 +8,7 @@
     "exposed-modules": [
         "Auth.Simple",
         "Auth.Simple.Login",
+        "Auth.Simple.Proof",
         "Auth.Simple.Register",
         "Auth.Simple.Token.Session",
         "Auth.Simple.Identifier.Username",
