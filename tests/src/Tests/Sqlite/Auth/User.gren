@@ -1,0 +1,158 @@
+module Tests.Sqlite.Auth.User exposing ( tests )
+
+{-| Tests isolated to `Sqlite.Auth.User` — its `new` insert and the `id`
+accessor on the witness it returns, exercised against an on-disk database.
+
+`User` exposes no lookup, so the persisted row is read back through a raw
+`Sqlite.getMaybeOne` query against the `users` table. `new` generates its own
+UUID id each call, so unlike the username suite there is nothing to collide and
+no per-run suffix is needed.
+
+@docs tests
+
+-}
+
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.User as User
+import Sqlite.Decode
+import Sqlite.Encode
+import Sqlite.Migrate
+import Task exposing ( Task )
+import Test
+import Test.Runner.Effectful exposing ( await, concat, test, wrap )
+
+
+{-| The persisted shape of a `users` row, read back to confirm what `new` wrote.
+-}
+type alias UserRow =
+    { id : String
+    , createdAt : Int
+    , updatedAt : Int
+    }
+
+
+{-| Read a `users` row back by id — the only way to observe `new`, since `User`
+exposes no lookup of its own.
+-}
+userRow : Sqlite.Database -> String -> Task Sqlite.Error (Maybe UserRow)
+userRow database userId =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT id, created_at, updated_at
+            FROM users
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "id" userId
+            ]
+        , rowDecoder =
+            Sqlite.Decode.string "id"
+                (\id ->
+                    Sqlite.Decode.int "created_at"
+                        (\createdAt ->
+                            Sqlite.Decode.int "updated_at"
+                                (\updatedAt ->
+                                    Sqlite.Decode.succeed
+                                        { id = id
+                                        , createdAt = createdAt
+                                        , updatedAt = updatedAt
+                                        }
+                                )
+                        )
+                )
+        }
+
+
+{-| Open the database, migrate, and run the pure and database-backed
+`Sqlite.Auth.User` tests.
+-}
+tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests fsPermission secureContext =
+    let
+        migrations : Array Sqlite.Migrate.Migration
+        migrations =
+            [ User.migrationV1
+            ]
+    in
+    await
+        "Open the on-disk test database (Sqlite.Auth.User)"
+        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth-user.sqlite"))
+        (\database ->
+            await
+                "Apply migrations (Sqlite.Auth.User)"
+                (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
+                (\_ ->
+                    concat
+                        [ wrap pureTests
+                        , newPersistsTests database secureContext
+                        , newUniqueTests database secureContext
+                        ]
+                )
+        )
+
+
+{-| `id` — no database needed.
+-}
+pureTests : Test.Test
+pureTests =
+    Test.describe "Sqlite.Auth.User pure tests"
+        [ Test.test "id returns the user's id string"
+            (\_ ->
+                User.id (Internal.User { userId = "user-123" })
+                    |> Expect.equal "user-123"
+            )
+        ]
+
+
+{-| `new` inserts a `users` row for the id it returns, stamping `created_at` and
+`updated_at` to the same instant.
+-}
+newPersistsTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+newPersistsTests database secureContext =
+    await
+        "Create a user (persists)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Look up the created user row"
+                (userRow database (User.id user))
+                (\maybeRow ->
+                    concat
+                        [ test "new persists a users row for the returned id"
+                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map .id maybeRow))
+                        , test "new stamps created_at equal to updated_at"
+                            (\_ ->
+                                when maybeRow is
+                                    Just row ->
+                                        Expect.equal row.createdAt row.updatedAt
+
+                                    Nothing ->
+                                        Expect.fail "expected the created user row to exist"
+                            )
+                        ]
+                )
+        )
+
+
+{-| Separate `new` calls mint distinct ids.
+-}
+newUniqueTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+newUniqueTests database secureContext =
+    await
+        "Create the first user (unique)"
+        (User.new database secureContext)
+        (\userA ->
+            await
+                "Create the second user (unique)"
+                (User.new database secureContext)
+                (\userB ->
+                    test "separate new calls produce distinct ids"
+                        (\_ -> Expect.notEqual (User.id userA) (User.id userB))
+                )
+        )

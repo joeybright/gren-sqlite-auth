@@ -8,6 +8,7 @@ import Init
 import Node
 import Test.Runner.Effectful exposing ( await, concat )
 import Tests.PhcString
+import Tests.Sqlite.Auth.User
 import Tests.Sqlite.Auth.Username
 import Tests.SqliteAuth
 
@@ -23,6 +24,7 @@ main =
                         (\secureContext ->
                             concat
                                 [ Test.Runner.Effectful.wrap Tests.PhcString.tests
+                                , Tests.Sqlite.Auth.User.tests fsPermission secureContext
                                 , Tests.Sqlite.Auth.Username.tests fsPermission secureContext
                                 , Tests.SqliteAuth.tests fsPermission secureContext
                                 ]
