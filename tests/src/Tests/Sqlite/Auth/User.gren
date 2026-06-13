@@ -24,7 +24,7 @@ import Sqlite.Encode
 import Sqlite.Migrate
 import Task exposing ( Task )
 import Test
-import Test.Runner.Effectful exposing ( await, concat, test, wrap )
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test, wrap )
 
 
 {-| The persisted shape of a `users` row, read back to confirm what `new` wrote.
@@ -91,6 +91,7 @@ tests fsPermission secureContext =
                     concat
                         [ wrap pureTests
                         , newPersistsTests database secureContext
+                        , getTests database secureContext
                         , newUniqueTests database secureContext
                         ]
                 )
@@ -134,6 +135,33 @@ newPersistsTests database secureContext =
 
                                     Nothing ->
                                         Expect.fail "expected the created user row to exist"
+                            )
+                        ]
+                )
+        )
+
+
+{-| `get` resolves an existing id to its user and fails on an unknown id.
+-}
+getTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+getTests database secureContext =
+    await
+        "Create a user (get)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Look up the created user by id"
+                (User.get database { id = User.id user })
+                (\found ->
+                    concat
+                        [ test "get resolves an existing id to its user"
+                            (\_ -> Expect.equal (User.id user) (User.id found))
+                        , awaitError
+                            "Look up an unknown id"
+                            (User.get database { id = "no-such-user" })
+                            (\_ ->
+                                test "get fails when no user has the id"
+                                    (\_ -> Expect.pass)
                             )
                         ]
                 )

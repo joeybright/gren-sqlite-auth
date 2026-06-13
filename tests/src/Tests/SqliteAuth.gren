@@ -1,29 +1,31 @@
 module Tests.SqliteAuth exposing ( tests )
 
-{-| End-to-end test of the new `Sqlite.Auth` functional pipeline, run against
-the on-disk `tests/test.sqlite`.
+{-| End-to-end tests of the `Sqlite.Auth` pipeline, run against the on-disk
+`tests/test-sqlite-auth.sqlite`.
 
-One pipeline drives all four steps from the README sketch: create a user, add
-a username, add a hashed password, validate the password to mint the opaque
-`Verified` witness, and issue a session with it. Assertions confirm the issued
-session belongs to the new user, the raw token is hashed at rest, and the raw
-token round-trips through `Session.verify`.
+This suite covers only *cross-module* behavior — the journeys and side effects no
+single-module suite can see. Each module's own behavior (token hashing at rest,
+`Session.verify`/`revoke`, username resolution, password validate outcomes,
+username rename resolution) lives in `Tests.Sqlite.Auth.{User,Username,Password,
+Session}`; the assertions that duplicated those have been removed.
 
-A second pipeline then logs that account in as an *existing* user — the
-real-world flow where all you hold is a typed username: `Username.user`
-resolves it to the `User` witness, `Password.validate` checks the candidate,
-and `Session.issue` mints a fresh session. An unknown username resolves to
-`Nothing`.
+What remains is integration:
 
-The remaining flows each get their own fresh account so they cannot interfere:
-logout (`Session.revoke`), password change (`Password.change`, gated by the
-`Verified` witness, revoking all sessions), the forgotten-password reset
-(`Password.requestReset` / `Password.reset`, single-use token, auto-login),
-and username rename (`Username.change`, also witness-gated).
+  - registration drives all four steps (user, username, password, session) and
+    asserts the issued session belongs to the created user — the `validate → issue`
+    witness handoff;
+  - login as an existing user resolves a typed username and issues a session, and
+    an unknown username is rejected exactly like a wrong password;
+  - a taken username rolls the whole registration transaction back, leaving no
+    orphaned user row and the username with its original owner;
+  - `Password.change` and `Password.reset` revoke the user's existing sessions,
+    the reset auto-logs-in from the redeemed token and the token is single-use,
+    and a reset for an unknown username mints nothing;
+  - a rename then logs in by the new username with the unchanged password.
 
-The suite runs against its own on-disk database file, which persists across
-runs, so each run derives a unique username from a fresh UUID. Session idle
-expiry is not covered — it is unobservable without injecting a clock.
+The database file persists across runs, so each run derives a unique username
+from a fresh UUID. Session idle expiry is not covered — it is unobservable
+without injecting a clock.
 
 @docs tests
 
@@ -340,7 +342,6 @@ tests fsPermission secureContext =
                             concat
                                 [ registrationAndLoginTests database secureContext suffix
                                 , duplicateRegistrationTests database secureContext suffix
-                                , logoutTests database secureContext suffix
                                 , passwordChangeTests database secureContext suffix
                                 , passwordResetTests database secureContext suffix
                                 , usernameChangeTests database secureContext suffix
@@ -366,21 +367,10 @@ registrationAndLoginTests database secureContext suffix =
         )
         (\result ->
             concat
-                [ await
-                    "Verify the session by its raw token"
-                    (Session.verify database secureContext Session.defaultOptions { token = result.token })
-                    (\maybeSession ->
-                        concat
-                            [ test "the issued session belongs to the user the pipeline created"
-                                (\_ -> Expect.equal (User.id result.user) result.session.userId)
-                            , test "issue returns a non-empty raw token"
-                                (\_ -> Expect.notEqual "" result.token)
-                            , test "the stored session token is a hash, not the raw token"
-                                (\_ -> Expect.notEqual result.token result.session.sessionToken)
-                            , test "verifying the raw token resolves the stored session"
-                                (\_ -> Expect.equal (Just result.session.sessionToken) (Maybe.map .sessionToken maybeSession))
-                            ]
-                    )
+                [ test "the issued session belongs to the user the pipeline created"
+                    (\_ -> Expect.equal (User.id result.user) result.session.userId)
+                , test "issue returns a non-empty raw token"
+                    (\_ -> Expect.notEqual "" result.token)
                 , await
                     "Log the existing user in by typed username and password"
                     (login database
@@ -392,13 +382,6 @@ registrationAndLoginTests database secureContext suffix =
                     (\loggedIn ->
                         test "logging in by username issues a session for the registered user"
                             (\_ -> Expect.equal (User.id result.user) loggedIn.session.userId)
-                    )
-                , await
-                    "Resolve a username nobody owns"
-                    (resolve database ("nobody-" ++ suffix))
-                    (\maybeUser ->
-                        test "an unknown username resolves to Nothing"
-                            (\_ -> Expect.equal Nothing (Maybe.map User.id maybeUser))
                     )
                 , awaitError
                     "Log in with a username nobody owns"
@@ -460,38 +443,8 @@ duplicateRegistrationTests database secureContext suffix =
         )
 
 
-{-| Log in, then log out: a revoked session must no longer verify.
--}
-logoutTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
-logoutTests database secureContext suffix =
-    await
-        "Register an account, log in, then log out"
-        (register database
-            secureContext
-            { username = "logout-" ++ suffix
-            , password = "example password"
-            }
-            |> Task.andThen
-                (\created ->
-                    Session.revoke database secureContext Session.defaultOptions { token = created.token }
-                        |> Task.mapError StorageError
-                        |> Task.map (\_ -> created.token)
-                )
-        )
-        (\revokedToken ->
-            await
-                "Verify the revoked token"
-                (Session.verify database secureContext Session.defaultOptions { token = revokedToken })
-                (\maybeSession ->
-                    test "a revoked session no longer verifies"
-                        (\_ -> Expect.equal Nothing maybeSession)
-                )
-        )
-
-
-{-| Change a password by proving the current one, then assert the change took:
-existing sessions are revoked, the old password is rejected, and the new one
-logs in.
+{-| Change a password by proving the current one, then assert the cross-module
+side effects: existing sessions are revoked, and the new password logs in.
 -}
 passwordChangeTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
 passwordChangeTests database secureContext suffix =
@@ -522,13 +475,6 @@ passwordChangeTests database secureContext suffix =
                     (\maybeSession ->
                         test "a password change revokes existing sessions"
                             (\_ -> Expect.equal Nothing maybeSession)
-                    )
-                , awaitError
-                    "Log in with the old password"
-                    (login database secureContext { username = username, password = "old password" })
-                    (\error ->
-                        test "the old password is rejected after a change"
-                            (\_ -> Expect.equal NotVerified error)
                     )
                 , await
                     "Log in with the new password"
@@ -591,20 +537,6 @@ passwordResetTests database secureContext suffix =
                                                 (\_ -> Expect.equal Nothing maybeSession)
                                         )
                                     , awaitError
-                                        "Log in with the pre-reset password"
-                                        (login database secureContext { username = username, password = "old password" })
-                                        (\error ->
-                                            test "the old password is rejected after a reset"
-                                                (\_ -> Expect.equal NotVerified error)
-                                        )
-                                    , await
-                                        "Log in with the reset password"
-                                        (login database secureContext { username = username, password = "reset password" })
-                                        (\reLoggedIn ->
-                                            test "the reset password logs in as the same user"
-                                                (\_ -> Expect.equal (User.id created.user) reLoggedIn.session.userId)
-                                        )
-                                    , awaitError
                                         "Redeem the same token again"
                                         (redeemReset database secureContext { token = resetToken.token, new = "another password" })
                                         (\error ->
@@ -617,8 +549,9 @@ passwordResetTests database secureContext suffix =
         ]
 
 
-{-| Rename a username by proving the password, then assert the old name no
-longer resolves and the new one resolves to the same user.
+{-| Rename a username by proving the password, then log in by the new name with
+the unchanged password — the rename-then-login journey across `Username`,
+`Password`, and `Session`.
 -}
 usernameChangeTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
 usernameChangeTests database secureContext suffix =
@@ -646,27 +579,11 @@ usernameChangeTests database secureContext suffix =
                 )
         )
         (\created ->
-            concat
-                [ await
-                    "Resolve the old username"
-                    (resolve database oldName)
-                    (\maybeUser ->
-                        test "the old username no longer resolves"
-                            (\_ -> Expect.equal Nothing (Maybe.map User.id maybeUser))
-                    )
-                , await
-                    "Resolve the new username"
-                    (resolve database newName)
-                    (\maybeUser ->
-                        test "the new username resolves to the same user"
-                            (\_ -> Expect.equal (Just (User.id created.user)) (Maybe.map User.id maybeUser))
-                    )
-                , await
-                    "Log in with the new username"
-                    (login database secureContext { username = newName, password = "example password" })
-                    (\loggedIn ->
-                        test "the renamed account logs in with its existing password"
-                            (\_ -> Expect.equal (User.id created.user) loggedIn.session.userId)
-                    )
-                ]
+            await
+                "Log in with the new username"
+                (login database secureContext { username = newName, password = "example password" })
+                (\loggedIn ->
+                    test "the renamed account logs in with its existing password"
+                        (\_ -> Expect.equal (User.id created.user) loggedIn.session.userId)
+                )
         )

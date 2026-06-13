@@ -1,0 +1,288 @@
+module Tests.Sqlite.Auth.Session exposing ( tests )
+
+{-| Tests isolated to `Sqlite.Auth.Session` — the session-token lifecycle:
+`issue`/`verify`/`validate`/`revoke`/`revokeAll`, exercised against an on-disk
+database.
+
+Behavior is observed through the module's own `verify`/`validate`, so no raw SQL
+is needed. Each group creates its own user (the `auth_sessions.user_id` foreign
+key) and mints the `Verified` witness `issue` demands directly from
+`Sqlite.Auth.Internal`. Expiry and idle timeout are forced deterministically by
+zeroing the relevant `Options` field rather than waiting on the clock.
+
+@docs tests
+
+-}
+
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.Session as Session
+import Sqlite.Auth.User as User
+import Sqlite.Migrate
+import Test
+import Test.Runner.Effectful exposing ( await, concat, test )
+
+
+{-| Mint the `Verified` witness for a user — the proof `Session.issue` demands.
+A credential check would mint this in production; the suite mints it directly.
+-}
+verifiedFor : Internal.User -> Internal.Verified
+verifiedFor user =
+    Internal.Verified { userId = User.id user }
+
+
+{-| Open the database, migrate, and run the database-backed
+`Sqlite.Auth.Session` tests.
+-}
+tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests fsPermission secureContext =
+    let
+        migrations : Array Sqlite.Migrate.Migration
+        migrations =
+            [ User.migrationV1
+            , Session.migrationV1
+            ]
+    in
+    await
+        "Open the on-disk test database (Sqlite.Auth.Session)"
+        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth-session.sqlite"))
+        (\database ->
+            await
+                "Apply migrations (Sqlite.Auth.Session)"
+                (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
+                (\_ ->
+                    concat
+                        [ issueAndVerifyTests database secureContext
+                        , verifyUnknownTests database secureContext
+                        , validateTests database secureContext
+                        , revokeTests database secureContext
+                        , revokeAllTests database secureContext
+                        , expiredSessionTests database secureContext
+                        , idleSessionTests database secureContext
+                        ]
+                )
+        )
+
+
+{-| A freshly issued token verifies to its session, and only the token's hash is
+stored.
+-}
+issueAndVerifyTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+issueAndVerifyTests database secureContext =
+    await
+        "Create a user (issue/verify)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Issue a session"
+                (Session.issue database secureContext Session.defaultOptions (verifiedFor user))
+                (\issued ->
+                    await
+                        "Verify the issued token"
+                        (Session.verify database secureContext Session.defaultOptions { token = issued.token })
+                        (\maybeSession ->
+                            concat
+                                [ test "verify resolves a live token to its session"
+                                    (\_ -> Expect.equal (Just (User.id user)) (Maybe.map .userId maybeSession))
+                                , test "the stored token is the hash, not the raw token"
+                                    (\_ -> Expect.notEqual issued.token issued.session.sessionToken)
+                                ]
+                        )
+                )
+        )
+
+
+{-| A token that matches no row verifies to `Nothing`.
+-}
+verifyUnknownTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+verifyUnknownTests database secureContext =
+    await
+        "Verify an unknown token"
+        (Session.verify database secureContext Session.defaultOptions { token = "not-a-real-token" })
+        (\maybeSession ->
+            test "an unknown token resolves to no session"
+                (\_ -> Expect.equal Nothing (Maybe.map .userId maybeSession))
+        )
+
+
+{-| `validate` mints the `Verified` witness for a live token and `Nothing` for an
+unknown one.
+-}
+validateTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+validateTests database secureContext =
+    await
+        "Create a user (validate)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Issue a session"
+                (Session.issue database secureContext Session.defaultOptions (verifiedFor user))
+                (\issued ->
+                    await
+                        "Validate the issued token"
+                        (Session.validate database secureContext Session.defaultOptions { token = issued.token })
+                        (\maybeProof ->
+                            concat
+                                [ test "validate mints the Verified witness for a live token"
+                                    (\_ -> Expect.equal (Just (verifiedFor user)) maybeProof)
+                                , await
+                                    "Validate an unknown token"
+                                    (Session.validate database secureContext Session.defaultOptions { token = "bogus" })
+                                    (\maybeUnknownProof ->
+                                        test "validate yields no witness for an unknown token"
+                                            (\_ -> Expect.equal Nothing maybeUnknownProof)
+                                    )
+                                ]
+                        )
+                )
+        )
+
+
+{-| A revoked token no longer verifies.
+-}
+revokeTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+revokeTests database secureContext =
+    await
+        "Create a user (revoke)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Issue a session"
+                (Session.issue database secureContext Session.defaultOptions (verifiedFor user))
+                (\issued ->
+                    await
+                        "Revoke the session"
+                        (Session.revoke database secureContext Session.defaultOptions { token = issued.token })
+                        (\_ ->
+                            await
+                                "Verify the revoked token"
+                                (Session.verify database secureContext Session.defaultOptions { token = issued.token })
+                                (\maybeSession ->
+                                    test "a revoked token no longer verifies"
+                                        (\_ -> Expect.equal Nothing (Maybe.map .userId maybeSession))
+                                )
+                        )
+                )
+        )
+
+
+{-| `revokeAll` kills every session the named user holds and leaves other users'
+sessions alone.
+-}
+revokeAllTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+revokeAllTests database secureContext =
+    await
+        "Create the target user (revokeAll)"
+        (User.new database secureContext)
+        (\userA ->
+            await
+                "Create a bystander user (revokeAll)"
+                (User.new database secureContext)
+                (\userB ->
+                    await
+                        "Issue the target's first session"
+                        (Session.issue database secureContext Session.defaultOptions (verifiedFor userA))
+                        (\issuedA1 ->
+                            await
+                                "Issue the target's second session"
+                                (Session.issue database secureContext Session.defaultOptions (verifiedFor userA))
+                                (\issuedA2 ->
+                                    await
+                                        "Issue the bystander's session"
+                                        (Session.issue database secureContext Session.defaultOptions (verifiedFor userB))
+                                        (\issuedB ->
+                                            await
+                                                "Revoke all of the target's sessions"
+                                                (Session.revokeAll database { userId = User.id userA })
+                                                (\_ ->
+                                                    await
+                                                        "Verify the target's first token after revokeAll"
+                                                        (Session.verify database secureContext Session.defaultOptions { token = issuedA1.token })
+                                                        (\maybeA1 ->
+                                                            await
+                                                                "Verify the target's second token after revokeAll"
+                                                                (Session.verify database secureContext Session.defaultOptions { token = issuedA2.token })
+                                                                (\maybeA2 ->
+                                                                    await
+                                                                        "Verify the bystander's token after revokeAll"
+                                                                        (Session.verify database secureContext Session.defaultOptions { token = issuedB.token })
+                                                                        (\maybeB ->
+                                                                            concat
+                                                                                [ test "revokeAll kills the target's first session"
+                                                                                    (\_ -> Expect.equal Nothing (Maybe.map .userId maybeA1))
+                                                                                , test "revokeAll kills the target's second session"
+                                                                                    (\_ -> Expect.equal Nothing (Maybe.map .userId maybeA2))
+                                                                                , test "revokeAll leaves a bystander's session live"
+                                                                                    (\_ -> Expect.equal (Just (User.id userB)) (Maybe.map .userId maybeB))
+                                                                                ]
+                                                                        )
+                                                                )
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| A session past its absolute lifetime no longer verifies — expiry is stored on
+the row, so even a default-options verify sees it.
+-}
+expiredSessionTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+expiredSessionTests database secureContext =
+    let
+        expiredOptions : Session.Options
+        expiredOptions =
+            { Session.defaultOptions | lifetimeMillis = 0 }
+    in
+    await
+        "Create a user (expired)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Issue a session that expires immediately"
+                (Session.issue database secureContext expiredOptions (verifiedFor user))
+                (\issued ->
+                    await
+                        "Verify the expired token"
+                        (Session.verify database secureContext Session.defaultOptions { token = issued.token })
+                        (\maybeSession ->
+                            test "an expired session no longer verifies"
+                                (\_ -> Expect.equal Nothing (Maybe.map .userId maybeSession))
+                        )
+                )
+        )
+
+
+{-| A session unused past the idle timeout no longer verifies — the idle window is
+read from the verifying call's options.
+-}
+idleSessionTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+idleSessionTests database secureContext =
+    let
+        idleOptions : Session.Options
+        idleOptions =
+            { Session.defaultOptions | idleTimeoutMillis = 0 }
+    in
+    await
+        "Create a user (idle)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Issue a session"
+                (Session.issue database secureContext Session.defaultOptions (verifiedFor user))
+                (\issued ->
+                    await
+                        "Verify the token with a zero idle window"
+                        (Session.verify database secureContext idleOptions { token = issued.token })
+                        (\maybeSession ->
+                            test "an idle-timed-out session no longer verifies"
+                                (\_ -> Expect.equal Nothing (Maybe.map .userId maybeSession))
+                        )
+                )
+        )
