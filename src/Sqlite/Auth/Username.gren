@@ -1,0 +1,245 @@
+module Sqlite.Auth.Username exposing
+    ( migrationV1
+    , Username
+    , Raw
+    , Normalized
+    , fromString
+    , normalize
+    , toString
+    , new
+    , change
+    , user
+    )
+
+{-| The username identifier: the `auth_usernames` table linking a username to
+its owning user.
+
+The username itself is the primary key, so uniqueness is enforced by the
+schema. A username enters as a [`Username Raw`](#Username) via
+[`fromString`](#fromString) and must pass through [`normalize`](#normalize)
+to become a `Username Normalized` — the only form [`new`](#new) accepts, so
+an un-normalized username can never reach the database and writes and lookups
+can never disagree about case or whitespace.
+
+@docs migrationV1
+
+# Usernames
+
+@docs Username, Raw, Normalized
+@docs fromString
+@docs normalize
+@docs toString
+
+# Pipeline steps
+
+@docs new
+@docs change
+
+# Getting users
+
+@docs user
+
+-}
+
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.Utilities as Utilities
+import Sqlite.Decode
+import Sqlite.Encode
+import Task exposing ( Task )
+
+
+{-| Create the `auth_usernames` table. Run after
+[`Sqlite.Auth.User.migrationV1`](Sqlite.Auth.User#migrationV1) (it references
+`users`).
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Sqlite.Auth.Username.migrationV1` - Add auth_usernames table"
+    , statements =
+        [ addUsernamesTableMigrationSQL
+        ]
+    }
+
+
+{-|-}
+addUsernamesTableMigrationSQL : String
+addUsernamesTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS auth_usernames (
+        username TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+    """
+
+
+
+-- usernames
+
+
+{-| A username exactly as the user typed it.
+-}
+type Raw
+    = Raw
+
+
+{-| A username that has been [`normalize`](#normalize)d and is safe to match
+or persist.
+-}
+type Normalized
+    = Normalized
+
+
+{-| A username, tagged with whether it is still [`Raw`](#Raw) or already
+[`Normalized`](#Normalized). Only the normalized form can reach the database.
+-}
+type Username state
+    = Username String
+
+
+{-| Turn a `String` into a raw [`Username`](#Username), ready to
+[`normalize`](#normalize).
+-}
+fromString : String -> Username Raw
+fromString =
+    Username
+
+
+{-| Normalize a username for both storage and lookup: trim surrounding
+whitespace and lowercase it, so `"Alice"`, `" alice "`, and `"ALICE"` all
+resolve to one account. This is the only way to produce the
+`Username Normalized` that [`new`](#new) demands.
+-}
+normalize : Username Raw -> Username Normalized
+normalize (Username string) =
+    Username (String.toLower (String.trim string))
+
+
+{-| Get the underlying `String` of a [`Username`](#Username) in either state.
+-}
+toString : Username state -> String
+toString (Username string) =
+    string
+
+
+
+-- pipeline steps
+
+
+{-| Add a username to the given user, returning the
+[`User`](Sqlite.Auth.User#User) witness for further pipeline steps:
+
+    User.new database secureContext
+        |> Task.andThen
+            (Username.new database
+                { username = Username.normalize (Username.fromString "Alice") }
+            )
+
+The phantom type guards this entry point — only a
+[`Username Normalized`](#Username) from [`normalize`](#normalize) can be
+persisted. A username that is already taken fails on the table's primary key.
+-}
+new : Sqlite.Database -> { username : Username Normalized } -> Internal.User -> Task Sqlite.Error Internal.User
+new database { username } ((Internal.User { userId }) as userWitness) =
+    Utilities.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        INSERT INTO auth_usernames (username, user_id, created_at, updated_at)
+                        VALUES (:username, :user_id, :created_at, :updated_at)
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.string "username" (toString username)
+                        , Sqlite.Encode.string "user_id" userId
+                        , Sqlite.Encode.int "created_at" now
+                        , Sqlite.Encode.int "updated_at" now
+                        ]
+                    }
+                    |> Task.map (\_ -> userWitness)
+            )
+
+
+{-| Rename a username — gated by the `Verified` witness, so the credential
+must be proven (e.g. via
+[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate)) before an
+identifier can be changed:
+
+    Password.validate database secureContext current (Just user)
+        |> Task.andThen
+            (\outcome ->
+                when outcome is
+                    Password.Verified proof ->
+                        Username.change database
+                            { from = currentUsername, to = newUsername }
+                            proof
+                    ...
+            )
+
+The write is scoped to the witness's user, so a held proof can only rename a
+username its own user owns — a `from` owned by someone else (or nobody)
+matches zero rows and changes nothing. A `to` that is already taken fails on
+the table's primary key. Returns the witness back for further steps.
+-}
+change : Sqlite.Database -> { from : Username Normalized, to : Username Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
+change database { from, to } ((Internal.Verified { userId }) as verified) =
+    Utilities.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        UPDATE auth_usernames
+                        SET username = :to, updated_at = :updated_at
+                        WHERE username = :from AND user_id = :user_id
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.string "to" (toString to)
+                        , Sqlite.Encode.int "updated_at" now
+                        , Sqlite.Encode.string "from" (toString from)
+                        , Sqlite.Encode.string "user_id" userId
+                        ]
+                    }
+                    |> Task.map (\_ -> verified)
+            )
+
+
+
+-- getting users
+
+
+{-| Get the user who owns the given username — the first step of logging in
+an existing user. Pass the whole `Maybe` to a credential check:
+
+    Username.user database
+        { username = Username.normalize (Username.fromString typedUsername) }
+        |> Task.andThen (Password.validate database secureContext candidate)
+
+Succeeds with `Nothing` when no user owns the username — an expected negative
+is a value, not an error.
+[`Password.validate`](Sqlite.Auth.Password#validate) burns a full hashing
+round on `Nothing`, so an unknown username costs (and answers) the same as a
+wrong password.
+-}
+user : Sqlite.Database -> { username : Username Normalized } -> Task Sqlite.Error (Maybe Internal.User)
+user database { username } =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT user_id
+            FROM auth_usernames
+            WHERE username = :username
+            """
+        , parameters =
+            [ Sqlite.Encode.string "username" (toString username)
+            ]
+        , rowDecoder =
+            Sqlite.Decode.string "user_id"
+                (\userId -> Sqlite.Decode.succeed (Internal.User { userId = userId }))
+        }

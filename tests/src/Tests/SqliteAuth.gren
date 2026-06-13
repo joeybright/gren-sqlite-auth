@@ -1,0 +1,580 @@
+module Tests.SqliteAuth exposing ( tests )
+
+{-| End-to-end test of the new `Sqlite.Auth` functional pipeline, run against
+the on-disk `tests/test.sqlite`.
+
+One pipeline drives all four steps from the README sketch: create a user, add
+a username, add a hashed password, validate the password to mint the opaque
+`Verified` witness, and issue a session with it. Assertions confirm the issued
+session belongs to the new user, the raw token is hashed at rest, and the raw
+token round-trips through `Session.verify`.
+
+A second pipeline then logs that account in as an *existing* user — the
+real-world flow where all you hold is a typed username: `Username.user`
+resolves it to the `User` witness, `Password.validate` checks the candidate,
+and `Session.issue` mints a fresh session. An unknown username resolves to
+`Nothing`.
+
+The remaining flows each get their own fresh account so they cannot interfere:
+logout (`Session.revoke`), password change (`Password.change`, gated by the
+`Verified` witness, revoking all sessions), the forgotten-password reset
+(`Password.requestReset` / `Password.reset`, single-use token, auto-login),
+and username rename (`Username.change`, also witness-gated).
+
+The new namespace gets its own database file — `Sqlite.Migrate` tracks one
+linear migration history per database, and `test.sqlite` already carries the
+`Auth.Simple` history. The database persists across runs, so each run derives
+a unique username from a fresh UUID.
+
+@docs tests
+
+-}
+
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.Password as Password
+import Sqlite.Auth.Session as Session
+import Sqlite.Auth.User as User
+import Sqlite.Auth.Username as Username
+import Sqlite.Migrate
+import Task exposing ( Task )
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
+
+
+{-| The ways the combined pipelines can fail: hashing the new password, a
+database fault on any write, a real fault while validating, or a validation
+that didn't verify. `NotVerified` covers unknown username and wrong password
+alike — `Password.validate` deliberately answers `Rejected` to both.
+-}
+type Error
+    = HashError Password.HashError
+    | StorageError Sqlite.Error
+    | ValidateError Password.ValidateError
+    | NotVerified
+    | ResetFailed Password.ResetError
+
+
+{-| Normalize a raw username string — the shape every `Sqlite.Auth.Username`
+entry point demands.
+-}
+normalized : String -> Username.Username Username.Normalized
+normalized =
+    Username.fromString >> Username.normalize
+
+
+{-| The README sketch's pipeline, verbatim: hash the password, create the
+user, attach the username and password, validate the candidate, and issue a
+session for the minted witness.
+-}
+register :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> { username : String, password : String }
+    -> Task Error { user : Internal.User, session : Session.Session, token : String }
+register database secureContext { username, password } =
+    Password.hash secureContext (Password.fromString password)
+        |> Task.mapError HashError
+        |> Task.andThen
+            (\hashedPassword ->
+                User.new database secureContext
+                    |> Task.andThen (Username.new database { username = normalized username })
+                    |> Task.andThen (Password.add database hashedPassword)
+                    |> Task.mapError StorageError
+            )
+        |> Task.andThen
+            (\user ->
+                validateAndIssue database secureContext { password = password } (Just user)
+                    |> Task.map
+                        (\issued ->
+                            { user = user
+                            , session = issued.session
+                            , token = issued.token
+                            }
+                        )
+            )
+
+
+{-| Log in an existing user from nothing but their typed credentials: resolve
+the username with `Username.user` and pipe the whole `Maybe` into the
+validate-and-issue tail — an unknown username burns a hash round inside
+`Password.validate` and is rejected exactly like a wrong password.
+-}
+login :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> { username : String, password : String }
+    -> Task Error { session : Session.Session, token : String }
+login database secureContext { username, password } =
+    Username.user database { username = normalized username }
+        |> Task.mapError StorageError
+        |> Task.andThen (validateAndIssue database secureContext { password = password })
+
+
+{-| Change an account's password the real way: resolve the username, prove the
+current password to mint the `Verified` witness, and hand it to
+`Password.change` with the new hash.
+-}
+changePassword :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> { username : String, current : String, new : String }
+    -> Task Error {}
+changePassword database secureContext { username, current, new } =
+    Task.map2
+        (\hashedNew maybeUser -> { hashedNew = hashedNew, maybeUser = maybeUser })
+        (Password.hash secureContext (Password.fromString new)
+            |> Task.mapError HashError
+        )
+        (Username.user database { username = normalized username }
+            |> Task.mapError StorageError
+        )
+        |> Task.andThen
+            (\{ hashedNew, maybeUser } ->
+                Password.validate database secureContext (Password.fromString current) maybeUser
+                    |> Task.mapError ValidateError
+                    |> Task.andThen
+                        (\outcome ->
+                            when outcome is
+                                Password.Verified proof ->
+                                    Password.change database hashedNew proof
+                                        |> Task.mapError StorageError
+                                        |> Task.map (\_ -> {})
+
+                                Password.Rejected ->
+                                    Task.fail NotVerified
+
+                                Password.Locked ->
+                                    Task.fail NotVerified
+                        )
+            )
+
+
+{-| Rename an account's username the real way: prove the password to mint the
+`Verified` witness, then hand it to `Username.change`.
+-}
+renameUsername :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> { from : String, to : String, password : String }
+    -> Task Error {}
+renameUsername database secureContext { from, to, password } =
+    Username.user database { username = normalized from }
+        |> Task.mapError StorageError
+        |> Task.andThen
+            (\maybeUser ->
+                Password.validate database secureContext (Password.fromString password) maybeUser
+                    |> Task.mapError ValidateError
+            )
+        |> Task.andThen
+            (\outcome ->
+                when outcome is
+                    Password.Verified proof ->
+                        Username.change database
+                            { from = normalized from, to = normalized to }
+                            proof
+                            |> Task.mapError StorageError
+                            |> Task.map (\_ -> {})
+
+                    Password.Rejected ->
+                        Task.fail NotVerified
+
+                    Password.Locked ->
+                        Task.fail NotVerified
+            )
+
+
+{-| Phase one of the forgotten-password flow: resolve the username and, when
+someone owns it, mint a reset token — the raw token to embed in an emailed
+link. A username nobody owns yields `Nothing`, and nothing is minted.
+-}
+requestResetFor :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> { username : String }
+    -> Task Error (Maybe { token : String })
+requestResetFor database secureContext { username } =
+    Username.user database { username = normalized username }
+        |> Task.mapError StorageError
+        |> Task.andThen
+            (\maybeUser ->
+                when maybeUser is
+                    Nothing ->
+                        Task.succeed Nothing
+
+                    Just user ->
+                        Password.requestReset database secureContext user
+                            |> Task.mapError StorageError
+                            |> Task.map Just
+            )
+
+
+{-| Phase two of the forgotten-password flow: hash the new password, redeem
+the token, and issue a session from the minted `Verified` witness — the
+auto-login a reset link lands on.
+-}
+redeemReset :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> { token : String, new : String }
+    -> Task Error { session : Session.Session, token : String }
+redeemReset database secureContext input =
+    Password.hash secureContext (Password.fromString input.new)
+        |> Task.mapError HashError
+        |> Task.andThen
+            (\hashedNew ->
+                Password.reset database secureContext { token = input.token, new = hashedNew }
+                    |> Task.mapError ResetFailed
+            )
+        |> Task.andThen
+            (Session.issue database secureContext
+                >> Task.mapError StorageError
+            )
+
+
+{-| The shared tail of both pipelines: validate the candidate password against
+the (maybe-resolved) user's stored hash and, on the `Verified` outcome, issue
+a session for the minted witness.
+-}
+validateAndIssue :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> { password : String }
+    -> Maybe Internal.User
+    -> Task Error { session : Session.Session, token : String }
+validateAndIssue database secureContext { password } maybeUser =
+    Password.validate database secureContext (Password.fromString password) maybeUser
+        |> Task.mapError ValidateError
+        |> Task.andThen
+            (\outcome ->
+                when outcome is
+                    Password.Verified proof ->
+                        Session.issue database secureContext proof
+                            |> Task.mapError StorageError
+
+                    Password.Rejected ->
+                        Task.fail NotVerified
+
+                    Password.Locked ->
+                        Task.fail NotVerified
+            )
+
+
+{-| Open the database, migrate, and run every `Sqlite.Auth` flow:
+registration + login, logout, password change, password reset, and username
+rename — each on its own account derived from a fresh UUID suffix.
+-}
+tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests fsPermission secureContext =
+    let
+        migrations : Array Sqlite.Migrate.Migration
+        migrations =
+            [ User.migrationV1
+            , Username.migrationV1
+            , Password.migrationV1
+            , Session.migrationV1
+            ]
+    in
+    await
+        "Open the on-disk test database (Sqlite.Auth)"
+        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth.sqlite"))
+        (\database ->
+            await
+                "Apply migrations (Sqlite.Auth)"
+                (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
+                (\_ ->
+                    await
+                        "Generate a unique username suffix (Sqlite.Auth)"
+                        (Crypto.randomUuidV4 secureContext)
+                        (\suffix ->
+                            concat
+                                [ registrationAndLoginTests database secureContext suffix
+                                , logoutTests database secureContext suffix
+                                , passwordChangeTests database secureContext suffix
+                                , passwordResetTests database secureContext suffix
+                                , usernameChangeTests database secureContext suffix
+                                ]
+                        )
+                )
+        )
+
+
+{-| The original end-to-end pipeline: register an account, assert the issued
+session is real and hashed at rest, then log the same account in as an
+existing user — including the rejected and unknown-username paths.
+-}
+registrationAndLoginTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+registrationAndLoginTests database secureContext suffix =
+    await
+        "Create a user with a username and password, then issue a session"
+        (register database
+            secureContext
+            { username = "pipeline-" ++ suffix
+            , password = "example password"
+            }
+        )
+        (\result ->
+            concat
+                [ await
+                    "Verify the session by its raw token"
+                    (Session.verify database secureContext { token = result.token })
+                    (\maybeSession ->
+                        concat
+                            [ test "the issued session belongs to the user the pipeline created"
+                                (\_ -> Expect.equal (User.id result.user) result.session.userId)
+                            , test "issue returns a non-empty raw token"
+                                (\_ -> Expect.notEqual "" result.token)
+                            , test "the stored session token is a hash, not the raw token"
+                                (\_ -> Expect.notEqual result.token result.session.sessionToken)
+                            , test "verifying the raw token resolves the stored session"
+                                (\_ -> Expect.equal (Just result.session.sessionToken) (Maybe.map .sessionToken maybeSession))
+                            ]
+                    )
+                , await
+                    "Log the existing user in by typed username and password"
+                    (login database
+                        secureContext
+                        { username = "Pipeline-" ++ suffix
+                        , password = "example password"
+                        }
+                    )
+                    (\loggedIn ->
+                        test "logging in by username issues a session for the registered user"
+                            (\_ -> Expect.equal (User.id result.user) loggedIn.session.userId)
+                    )
+                , await
+                    "Resolve a username nobody owns"
+                    (Username.user database { username = normalized ("nobody-" ++ suffix) })
+                    (\maybeUser ->
+                        test "an unknown username resolves to Nothing"
+                            (\_ -> Expect.equal Nothing (Maybe.map User.id maybeUser))
+                    )
+                , awaitError
+                    "Log in with a username nobody owns"
+                    (login database
+                        secureContext
+                        { username = "nobody-" ++ suffix
+                        , password = "example password"
+                        }
+                    )
+                    (\error ->
+                        test "an unknown username is rejected exactly like a wrong password"
+                            (\_ -> Expect.equal NotVerified error)
+                    )
+                ]
+        )
+
+
+{-| Log in, then log out: a revoked session must no longer verify.
+-}
+logoutTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+logoutTests database secureContext suffix =
+    await
+        "Register an account, log in, then log out"
+        (register database
+            secureContext
+            { username = "logout-" ++ suffix
+            , password = "example password"
+            }
+            |> Task.andThen
+                (\created ->
+                    Session.revoke database secureContext { token = created.token }
+                        |> Task.mapError StorageError
+                        |> Task.map (\_ -> created.token)
+                )
+        )
+        (\revokedToken ->
+            await
+                "Verify the revoked token"
+                (Session.verify database secureContext { token = revokedToken })
+                (\maybeSession ->
+                    test "a revoked session no longer verifies"
+                        (\_ -> Expect.equal Nothing maybeSession)
+                )
+        )
+
+
+{-| Change a password by proving the current one, then assert the change took:
+existing sessions are revoked, the old password is rejected, and the new one
+logs in.
+-}
+passwordChangeTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+passwordChangeTests database secureContext suffix =
+    let
+        username : String
+        username =
+            "change-" ++ suffix
+    in
+    await
+        "Register an account and change its password"
+        (register database secureContext { username = username, password = "old password" }
+            |> Task.andThen
+                (\created ->
+                    changePassword database
+                        secureContext
+                        { username = username
+                        , current = "old password"
+                        , new = "new password"
+                        }
+                        |> Task.map (\_ -> created)
+                )
+        )
+        (\created ->
+            concat
+                [ await
+                    "Verify the pre-change session"
+                    (Session.verify database secureContext { token = created.token })
+                    (\maybeSession ->
+                        test "a password change revokes existing sessions"
+                            (\_ -> Expect.equal Nothing maybeSession)
+                    )
+                , awaitError
+                    "Log in with the old password"
+                    (login database secureContext { username = username, password = "old password" })
+                    (\error ->
+                        test "the old password is rejected after a change"
+                            (\_ -> Expect.equal NotVerified error)
+                    )
+                , await
+                    "Log in with the new password"
+                    (login database secureContext { username = username, password = "new password" })
+                    (\loggedIn ->
+                        test "the new password logs in as the same user"
+                            (\_ -> Expect.equal (User.id created.user) loggedIn.session.userId)
+                    )
+                ]
+        )
+
+
+{-| The forgotten-password flow end to end: request a reset token, redeem it
+for a fresh session (auto-login), and assert the side effects — sessions
+revoked, old password dead, token single-use, unknown usernames mint nothing.
+-}
+passwordResetTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+passwordResetTests database secureContext suffix =
+    let
+        username : String
+        username =
+            "reset-" ++ suffix
+    in
+    concat
+        [ await
+            "Request a reset for a username nobody owns"
+            (requestResetFor database secureContext { username = "ghost-" ++ suffix })
+            (\maybeToken ->
+                test "an unknown username mints no reset token"
+                    (\_ -> Expect.equal Nothing (Maybe.map .token maybeToken))
+            )
+        , await
+            "Register an account and request a password reset"
+            (register database secureContext { username = username, password = "old password" }
+                |> Task.andThen
+                    (\created ->
+                        requestResetFor database secureContext { username = username }
+                            |> Task.map (\maybeToken -> { created = created, maybeToken = maybeToken })
+                    )
+            )
+            (\{ created, maybeToken } ->
+                when maybeToken is
+                    Nothing ->
+                        test "requesting a reset for a known username mints a token"
+                            (\_ -> Expect.fail "no reset token was minted")
+
+                    Just resetToken ->
+                        await
+                            "Redeem the reset token"
+                            (redeemReset database secureContext { token = resetToken.token, new = "reset password" })
+                            (\loggedIn ->
+                                concat
+                                    [ test "redeeming the reset logs the user straight in"
+                                        (\_ -> Expect.equal (User.id created.user) loggedIn.session.userId)
+                                    , await
+                                        "Verify the pre-reset session"
+                                        (Session.verify database secureContext { token = created.token })
+                                        (\maybeSession ->
+                                            test "a reset revokes existing sessions"
+                                                (\_ -> Expect.equal Nothing maybeSession)
+                                        )
+                                    , awaitError
+                                        "Log in with the pre-reset password"
+                                        (login database secureContext { username = username, password = "old password" })
+                                        (\error ->
+                                            test "the old password is rejected after a reset"
+                                                (\_ -> Expect.equal NotVerified error)
+                                        )
+                                    , await
+                                        "Log in with the reset password"
+                                        (login database secureContext { username = username, password = "reset password" })
+                                        (\reLoggedIn ->
+                                            test "the reset password logs in as the same user"
+                                                (\_ -> Expect.equal (User.id created.user) reLoggedIn.session.userId)
+                                        )
+                                    , awaitError
+                                        "Redeem the same token again"
+                                        (redeemReset database secureContext { token = resetToken.token, new = "another password" })
+                                        (\error ->
+                                            test "a reset token is single-use"
+                                                (\_ -> Expect.equal (ResetFailed Password.InvalidResetToken) error)
+                                        )
+                                    ]
+                            )
+            )
+        ]
+
+
+{-| Rename a username by proving the password, then assert the old name no
+longer resolves and the new one resolves to the same user.
+-}
+usernameChangeTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+usernameChangeTests database secureContext suffix =
+    let
+        oldName : String
+        oldName =
+            "rename-" ++ suffix
+
+        newName : String
+        newName =
+            "renamed-" ++ suffix
+    in
+    await
+        "Register an account and rename its username"
+        (register database secureContext { username = oldName, password = "example password" }
+            |> Task.andThen
+                (\created ->
+                    renameUsername database
+                        secureContext
+                        { from = oldName
+                        , to = newName
+                        , password = "example password"
+                        }
+                        |> Task.map (\_ -> created)
+                )
+        )
+        (\created ->
+            concat
+                [ await
+                    "Resolve the old username"
+                    (Username.user database { username = normalized oldName })
+                    (\maybeUser ->
+                        test "the old username no longer resolves"
+                            (\_ -> Expect.equal Nothing (Maybe.map User.id maybeUser))
+                    )
+                , await
+                    "Resolve the new username"
+                    (Username.user database { username = normalized newName })
+                    (\maybeUser ->
+                        test "the new username resolves to the same user"
+                            (\_ -> Expect.equal (Just (User.id created.user)) (Maybe.map User.id maybeUser))
+                    )
+                , await
+                    "Log in with the new username"
+                    (login database secureContext { username = newName, password = "example password" })
+                    (\loggedIn ->
+                        test "the renamed account logs in with its existing password"
+                            (\_ -> Expect.equal (User.id created.user) loggedIn.session.userId)
+                    )
+                ]
+        )

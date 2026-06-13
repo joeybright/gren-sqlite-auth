@@ -13,7 +13,11 @@
         "Auth.Simple.Token.Session",
         "Auth.Simple.Identifier.Username",
         "Auth.Simple.Credential.Password",
-        "Auth.Simple.Credential.Code"
+        "Auth.Simple.Credential.Code",
+        "Sqlite.Auth.User",
+        "Sqlite.Auth.Username",
+        "Sqlite.Auth.Password",
+        "Sqlite.Auth.Session"
     ],
     "gren-version": "0.6.0 <= v < 0.7.0",
     "dependencies": {

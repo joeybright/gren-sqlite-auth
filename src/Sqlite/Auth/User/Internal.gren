@@ -1,7 +1,0 @@
-module User.Internal exposing ( User(..) )
-
-{-|-}
-
-{-|-}
-type User
-    = User { userId : String }

@@ -12,6 +12,7 @@ import Tests.Register
 import Tests.CredentialLogin
 import Tests.PasswordChange
 import Tests.CodeLogin
+import Tests.SqliteAuth
 
 
 {-|-}
@@ -29,6 +30,7 @@ main =
                                 , Tests.CredentialLogin.tests fsPermission secureContext
                                 , Tests.PasswordChange.tests fsPermission secureContext
                                 , Tests.CodeLogin.tests fsPermission secureContext
+                                , Tests.SqliteAuth.tests fsPermission secureContext
                                 ]
                         )
                         |> Test.Runner.Effectful.run env

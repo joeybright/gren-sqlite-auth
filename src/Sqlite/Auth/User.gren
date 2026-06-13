@@ -1,27 +1,87 @@
-module Sqlite.Auth.User exposing ( User(..), id )
+module Sqlite.Auth.User exposing
+    ( migrationV1
+    , new
+    , id
+    )
 
-{-|
+{-| Users: the `users` table this package hangs everything else off, and the
+[`User`](#User) witness that proves a row exists.
 
-@docs User, id
+Every other table in the `Sqlite.Auth` namespace foreign-keys into `users.id`,
+and every pipeable step takes and returns a [`User`](#User) — so holding one
+means the user it names is real.
+
+@docs migrationV1
+@docs User
+@docs new
+@docs id
 
 -}
 
-import User.Internal
+import Crypto
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.Utilities as Utilities
+import Sqlite.Encode
+import Task exposing ( Task )
+
+
+{-| Create the `users` table: the minimal user record this package depends on
+(`id`, `created_at`, `updated_at`). Run before any other `Sqlite.Auth`
+migration — they all reference `users(id)`.
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Sqlite.Auth.User.migrationV1` - Add users table"
+    , statements =
+        [ addUsersTableMigrationSQL
+        ]
+    }
 
 
 {-|-}
-type User
-    = User User.Internal.User
+addUsersTableMigrationSQL : String
+addUsersTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    """
 
 
-{-| Get the id of the given `User` as a `String`
+{-| Create a new user — generating a UUIDv4 id and stamping
+`created_at`/`updated_at` to now — and return the [`User`](#User) witness for
+the row, ready to pipe into the steps that attach a username, a password, and
+so on.
 -}
-id : User -> String
-id (User (User.Internal.User { userId })) =
+new : Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Internal.User
+new database secureContext =
+    Task.map2
+        (\now userId -> { now = now, userId = userId })
+        Utilities.nowMillis
+        (Crypto.randomUuidV4 secureContext)
+        |> Task.andThen
+            (\{ now, userId } ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        INSERT INTO users (id, created_at, updated_at)
+                        VALUES (:id, :created_at, :updated_at)
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.string "id" userId
+                        , Sqlite.Encode.int "created_at" now
+                        , Sqlite.Encode.int "updated_at" now
+                        ]
+                    }
+                    |> Task.map (\_ -> Internal.User { userId = userId })
+            )
+
+
+{-| Get the id of the given [`User`](#User) as a `String`.
+-}
+id : Internal.User -> String
+id (Internal.User { userId }) =
     userId
-
-
-{-|-}
-get : Sqlite.Database -> Crypto.SecureContext -> { userId : String } -> Task x User 
-get database secureContext userId =
-    Debug.todo ""

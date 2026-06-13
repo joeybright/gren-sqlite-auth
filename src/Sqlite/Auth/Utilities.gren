@@ -1,0 +1,48 @@
+module Sqlite.Auth.Utilities exposing
+    ( base64
+    , sha256Base64
+    , nowMillis
+    )
+
+{-| Helpers shared across the `Sqlite.Auth` modules. Not exposed by the
+package.
+
+@docs base64
+@docs sha256Base64
+@docs nowMillis
+
+-}
+
+import Base64.Encode
+import Bytes exposing ( Bytes )
+import Crypto
+import Task exposing ( Task )
+import Time
+
+
+{-| Encode bytes as a standard base64 string.
+-}
+base64 : Bytes -> String
+base64 bytes =
+    Base64.Encode.bytes bytes
+        |> Base64.Encode.encode
+
+
+{-| Hash bytes into the base64-encoded SHA-256 stored in token columns.
+Tokens are full-entropy random values, so a single hash (no salt, no
+stretching) makes the stored value useless to an attacker while staying
+reproducible for lookups.
+-}
+sha256Base64 : Crypto.SecureContext -> Bytes -> Task x String
+sha256Base64 secureContext bytes =
+    Crypto.digest secureContext Crypto.Sha256 bytes
+        |> Task.map base64
+
+
+{-| The current time in milliseconds since the epoch — the form every
+timestamp column stores.
+-}
+nowMillis : Task x Int
+nowMillis =
+    Time.now
+        |> Task.map Time.posixToMillis
