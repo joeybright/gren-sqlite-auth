@@ -1,18 +1,23 @@
 module Sqlite.Auth.User exposing
     ( migrationV1
     , new
+    , get
     , id
     )
 
-{-| Users: the `users` table this package hangs everything else off, and the
-[`User`](#User) witness that proves a row exists.
+{-| Add and get users from the database.
 
-Every other table in the `Sqlite.Auth` namespace foreign-keys into `users.id`,
-and every pipeable step takes and returns a [`User`](#User) — so holding one
-means the user it names is real.
+## Migrations
+
+You must run the following migrations, in version order, before running any 
+other functions in this module.
 
 @docs migrationV1
+
+## Working with users
+
 @docs new
+@docs get
 @docs id
 
 -}
@@ -20,14 +25,18 @@ means the user it names is real.
 import Crypto
 import Sqlite
 import Sqlite.Auth.Internal as Internal
+import Sqlite.Decode
 import Sqlite.Encode
 import Task exposing ( Task )
 import Utils.Time
 
 
-{-| Create the `users` table: the minimal user record this package depends on
-(`id`, `created_at`, `updated_at`). Run before any other `Sqlite.Auth`
-migration — they all reference `users(id)`.
+{-| Migrate the database to add a `users` table with the minimum required
+schema for this package to operate.
+
+This migration is meant to be plug-and-play with the `gren-sqlite-migrate` 
+package. If you are using a different method of migration, the individual 
+SQL statements can be extracted from the records `statements` field.
 -}
 migrationV1 : { name : String, statements : Array String }
 migrationV1 =
@@ -38,7 +47,8 @@ migrationV1 =
     }
 
 
-{-|-}
+{-| SQL to add the `users` table to the database.
+-}
 addUsersTableMigrationSQL : String
 addUsersTableMigrationSQL =
     """
@@ -50,23 +60,18 @@ addUsersTableMigrationSQL =
     """
 
 
-{-| Create a new user — generating a UUIDv4 id and stamping
-`created_at`/`updated_at` to now — and return the [`User`](#User) witness for
-the row, ready to pipe into the steps that attach a username, a password, and
-so on.
+{-| Create a new user with a randomly genered UUID v4 identifier.
 
-Wrap a registration pipeline in `Sqlite.inTransaction`, so a failure partway
-— most likely a username that is already taken — rolls back this insert
-instead of stranding a user row with no credentials:
+This function returns a `User` type which is required for many other 
+functions in this package to operate. 
 
-    Sqlite.inTransaction database
-        (User.new database secureContext
-            |> Task.andThen (Username.new database { username = username })
-            |> Task.andThen (Password.add database hashedPassword)
-        )
-
-SQLite has no nested transactions, so keep later steps (validating, issuing a
-session) outside the wrap.
+It's _highly_ recommended that you immediately create a 
+[username](Sqlite.Auth.Username) for the new user in the same SQLite
+transaction. After a user is created, the only method of retrieving
+it from the database is by it's id (via the [get](#get) function) or by
+the users username. If you plan on using this package for user-facing 
+authentication, user ids are not the most friendly way to remember how
+to log into an account!
 -}
 new : Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Internal.User
 new database secureContext =
@@ -91,6 +96,27 @@ new database secureContext =
                                 |> Task.map (\_ -> Internal.User { userId = userId })
                         )
             )
+
+
+{-| Look up a user by id, returning the [`User`](#User) for the row. The 
+task fails when there's no user with the given id.
+-}
+get : Sqlite.Database -> { id : String } -> Task Sqlite.Error Internal.User
+get database input =
+    Sqlite.getOne database
+        { query =
+            """
+            SELECT id
+            FROM users
+            WHERE id = :id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "id" input.id
+            ]
+        , rowDecoder =
+            Sqlite.Decode.string "id"
+                (\userId -> Sqlite.Decode.succeed (Internal.User { userId = userId }))
+        }
 
 
 {-| Get the id of the given [`User`](#User) as a `String`.

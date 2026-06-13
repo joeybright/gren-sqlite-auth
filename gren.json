@@ -1,7 +1,7 @@
 {
     "type": "package",
     "platform": "node",
-    "name": "example/package",
+    "name": "joeybright/gren-sqlite-auth",
     "summary": "",
     "license": "BSD-3-Clause",
     "version": "1.0.0",
