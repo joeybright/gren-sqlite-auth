@@ -123,29 +123,35 @@ issue database secureContext options (Internal.Verified { userId }) =
     sweep database options
         |> Task.andThen
             (\_ ->
-                Task.map2
-                    (\tokenBytes now -> { token = Utils.Base64.encodeBytesUrlSafe tokenBytes, now = now })
-                    (Crypto.getRandomUInt8Values 32)
-                    Utils.Time.nowMillis
-            )
-        |> Task.andThen
-            (\{ token, now } ->
-                Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
+                Crypto.getRandomUInt8Values 32
                     |> Task.andThen
-                        (\hashedToken ->
-                            let
-                                session : Session
-                                session =
-                                    { sessionToken = hashedToken
-                                    , userId = userId
-                                    , createdAt = now
-                                    , expiresAt = now + options.lifetimeMillis
-                                    , lastUsedAt = now
-                                    , revokedAt = Nothing
-                                    }
-                            in
-                            insert database session
-                                |> Task.map (\_ -> { session = session, token = token })
+                        (\tokenBytes ->
+                            Utils.Time.nowMillis
+                                |> Task.andThen
+                                    (\now ->
+                                        let
+                                            token : String
+                                            token =
+                                                Utils.Base64.encodeBytesUrlSafe tokenBytes
+                                        in
+                                        Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
+                                            |> Task.andThen
+                                                (\hashedToken ->
+                                                    let
+                                                        session : Session
+                                                        session =
+                                                            { sessionToken = hashedToken
+                                                            , userId = userId
+                                                            , createdAt = now
+                                                            , expiresAt = now + options.lifetimeMillis
+                                                            , lastUsedAt = now
+                                                            , revokedAt = Nothing
+                                                            }
+                                                    in
+                                                    insert database session
+                                                        |> Task.map (\_ -> { session = session, token = token })
+                                                )
+                                    )
                         )
             )
 
@@ -158,28 +164,29 @@ bumped to now, and the returned [`Session`](#Session) reflects it.
 -}
 verify : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task Sqlite.Error (Maybe Session)
 verify database secureContext options input =
-    Task.map2
-        (\maybeSession now -> { maybeSession = maybeSession, now = now })
-        (getByToken database secureContext input)
-        Utils.Time.nowMillis
+    getByToken database secureContext input
         |> Task.andThen
-            (\{ maybeSession, now } ->
-                when maybeSession is
-                    Nothing ->
-                        Task.succeed Nothing
-
-                    Just session ->
-                        when session.revokedAt is
-                            Just _ ->
-                                Task.succeed Nothing
-
-                            Nothing ->
-                                if session.expiresAt > now && session.lastUsedAt + options.idleTimeoutMillis > now then
-                                    touch database { sessionToken = session.sessionToken, lastUsedAt = now }
-                                        |> Task.map (\_ -> Just { session | lastUsedAt = now })
-
-                                else
+            (\maybeSession ->
+                Utils.Time.nowMillis
+                    |> Task.andThen
+                        (\now ->
+                            when maybeSession is
+                                Nothing ->
                                     Task.succeed Nothing
+
+                                Just session ->
+                                    when session.revokedAt is
+                                        Just _ ->
+                                            Task.succeed Nothing
+
+                                        Nothing ->
+                                            if session.expiresAt > now && session.lastUsedAt + options.idleTimeoutMillis > now then
+                                                touch database { sessionToken = session.sessionToken, lastUsedAt = now }
+                                                    |> Task.map (\_ -> Just { session | lastUsedAt = now })
+
+                                            else
+                                                Task.succeed Nothing
+                        )
             )
 
 
@@ -220,24 +227,25 @@ table. Idempotent: a token matching no row simply updates nothing.
 -}
 revoke : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task Sqlite.Error {}
 revoke database secureContext options { token } =
-    Task.map2
-        (\hashedToken now -> { hashedToken = hashedToken, now = now })
-        (Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token))
-        Utils.Time.nowMillis
+    Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
         |> Task.andThen
-            (\{ hashedToken, now } ->
-                Sqlite.execute database
-                    { statement =
-                        """
-                        UPDATE auth_sessions
-                        SET revoked_at = :revoked_at
-                        WHERE session_token = :session_token
-                        """
-                    , parameters =
-                        [ Sqlite.Encode.int "revoked_at" now
-                        , Sqlite.Encode.string "session_token" hashedToken
-                        ]
-                    }
+            (\hashedToken ->
+                Utils.Time.nowMillis
+                    |> Task.andThen
+                        (\now ->
+                            Sqlite.execute database
+                                { statement =
+                                    """
+                                    UPDATE auth_sessions
+                                    SET revoked_at = :revoked_at
+                                    WHERE session_token = :session_token
+                                    """
+                                , parameters =
+                                    [ Sqlite.Encode.int "revoked_at" now
+                                    , Sqlite.Encode.string "session_token" hashedToken
+                                    ]
+                                }
+                        )
             )
         |> Task.andThen (\_ -> sweep database options)
 

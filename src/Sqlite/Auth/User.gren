@@ -12,7 +12,6 @@ and every pipeable step takes and returns a [`User`](#User) — so holding one
 means the user it names is real.
 
 @docs migrationV1
-@docs User
 @docs new
 @docs id
 
@@ -71,25 +70,26 @@ session) outside the wrap.
 -}
 new : Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Internal.User
 new database secureContext =
-    Task.map2
-        (\now userId -> { now = now, userId = userId })
-        Utils.Time.nowMillis
-        (Crypto.randomUuidV4 secureContext)
+    Utils.Time.nowMillis
         |> Task.andThen
-            (\{ now, userId } ->
-                Sqlite.execute database
-                    { statement =
-                        """
-                        INSERT INTO users (id, created_at, updated_at)
-                        VALUES (:id, :created_at, :updated_at)
-                        """
-                    , parameters =
-                        [ Sqlite.Encode.string "id" userId
-                        , Sqlite.Encode.int "created_at" now
-                        , Sqlite.Encode.int "updated_at" now
-                        ]
-                    }
-                    |> Task.map (\_ -> Internal.User { userId = userId })
+            (\now ->
+                Crypto.randomUuidV4 secureContext
+                    |> Task.andThen
+                        (\userId ->
+                            Sqlite.execute database
+                                { statement =
+                                    """
+                                    INSERT INTO users (id, created_at, updated_at)
+                                    VALUES (:id, :created_at, :updated_at)
+                                    """
+                                , parameters =
+                                    [ Sqlite.Encode.string "id" userId
+                                    , Sqlite.Encode.int "created_at" now
+                                    , Sqlite.Encode.int "updated_at" now
+                                    ]
+                                }
+                                |> Task.map (\_ -> Internal.User { userId = userId })
+                        )
             )
 
 
