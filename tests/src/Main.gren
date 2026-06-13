@@ -8,10 +8,6 @@ import Init
 import Node
 import Test.Runner.Effectful exposing ( await, concat )
 import Tests.PhcString
-import Tests.Register
-import Tests.CredentialLogin
-import Tests.PasswordChange
-import Tests.CodeLogin
 import Tests.SqliteAuth
 
 
@@ -26,10 +22,6 @@ main =
                         (\secureContext ->
                             concat
                                 [ Test.Runner.Effectful.wrap Tests.PhcString.tests
-                                , Tests.Register.tests fsPermission secureContext
-                                , Tests.CredentialLogin.tests fsPermission secureContext
-                                , Tests.PasswordChange.tests fsPermission secureContext
-                                , Tests.CodeLogin.tests fsPermission secureContext
                                 , Tests.SqliteAuth.tests fsPermission secureContext
                                 ]
                         )

@@ -21,10 +21,8 @@ logout (`Session.revoke`), password change (`Password.change`, gated by the
 (`Password.requestReset` / `Password.reset`, single-use token, auto-login),
 and username rename (`Username.change`, also witness-gated).
 
-The new namespace gets its own database file — `Sqlite.Migrate` tracks one
-linear migration history per database, and `test.sqlite` already carries the
-`Auth.Simple` history. The database persists across runs, so each run derives
-a unique username from a fresh UUID.
+The suite runs against its own on-disk database file, which persists across
+runs, so each run derives a unique username from a fresh UUID.
 
 @docs tests
 
