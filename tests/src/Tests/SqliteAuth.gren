@@ -22,7 +22,8 @@ logout (`Session.revoke`), password change (`Password.change`, gated by the
 and username rename (`Username.change`, also witness-gated).
 
 The suite runs against its own on-disk database file, which persists across
-runs, so each run derives a unique username from a fresh UUID.
+runs, so each run derives a unique username from a fresh UUID. Session idle
+expiry is not covered — it is unobservable without injecting a clock.
 
 @docs tests
 
@@ -38,15 +39,17 @@ import Sqlite.Auth.Password as Password
 import Sqlite.Auth.Session as Session
 import Sqlite.Auth.User as User
 import Sqlite.Auth.Username as Username
+import Sqlite.Decode
 import Sqlite.Migrate
 import Task exposing ( Task )
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
 
 
 {-| The ways the combined pipelines can fail: hashing the new password, a
-database fault on any write, a real fault while validating, or a validation
-that didn't verify. `NotVerified` covers unknown username and wrong password
-alike — `Password.validate` deliberately answers `Rejected` to both.
+database fault on any write, a real fault while validating, a validation
+that didn't verify, or a username that normalizes to nothing. `NotVerified`
+covers unknown username and wrong password alike — `Password.validate`
+deliberately answers `Rejected` to both.
 -}
 type Error
     = HashError Password.HashError
@@ -54,18 +57,56 @@ type Error
     | ValidateError Password.ValidateError
     | NotVerified
     | ResetFailed Password.ResetError
+    | InvalidUsername
 
 
 {-| Normalize a raw username string — the shape every `Sqlite.Auth.Username`
-entry point demands.
+entry point demands — failing the pipeline on a name that normalizes to
+nothing.
 -}
-normalized : String -> Username.Username Username.Normalized
-normalized =
-    Username.fromString >> Username.normalize
+normalized : String -> Task Error (Username.Username Username.Normalized)
+normalized string =
+    when Username.normalize (Username.fromString string) is
+        Just username ->
+            Task.succeed username
+
+        Nothing ->
+            Task.fail InvalidUsername
 
 
-{-| The README sketch's pipeline, verbatim: hash the password, create the
-user, attach the username and password, validate the candidate, and issue a
+{-| Resolve who owns a raw username string: normalize it and look it up with
+`Username.user`.
+-}
+resolve : Sqlite.Database -> String -> Task Error (Maybe Internal.User)
+resolve database string =
+    normalized string
+        |> Task.andThen
+            (\username ->
+                Username.user database { username = username }
+                    |> Task.mapError StorageError
+            )
+
+
+{-| Count the rows in `users` — used to prove a failed registration rolls its
+user insert back.
+-}
+countUsers : Sqlite.Database -> Task Sqlite.Error Int
+countUsers database =
+    Sqlite.getOne database
+        { query =
+            """
+            SELECT COUNT(*) AS user_count FROM users
+            """
+        , parameters = []
+        , rowDecoder =
+            Sqlite.Decode.int "user_count"
+                (\count -> Sqlite.Decode.succeed count)
+        }
+
+
+{-| The README sketch's pipeline: hash the password, create the user and
+attach the username and password inside one transaction (a taken username
+must roll back the user insert), then validate the candidate and issue a
 session for the minted witness.
 -}
 register :
@@ -74,13 +115,19 @@ register :
     -> { username : String, password : String }
     -> Task Error { user : Internal.User, session : Session.Session, token : String }
 register database secureContext { username, password } =
-    Password.hash secureContext (Password.fromString password)
-        |> Task.mapError HashError
+    Task.map2
+        (\hashedPassword username_ -> { hashedPassword = hashedPassword, username = username_ })
+        (Password.hash secureContext Password.defaultOptions (Password.fromString password)
+            |> Task.mapError HashError
+        )
+        (normalized username)
         |> Task.andThen
-            (\hashedPassword ->
-                User.new database secureContext
-                    |> Task.andThen (Username.new database { username = normalized username })
-                    |> Task.andThen (Password.add database hashedPassword)
+            (\new ->
+                Sqlite.inTransaction database
+                    (User.new database secureContext
+                        |> Task.andThen (Username.new database { username = new.username })
+                        |> Task.andThen (Password.add database new.hashedPassword)
+                    )
                     |> Task.mapError StorageError
             )
         |> Task.andThen
@@ -107,8 +154,7 @@ login :
     -> { username : String, password : String }
     -> Task Error { session : Session.Session, token : String }
 login database secureContext { username, password } =
-    Username.user database { username = normalized username }
-        |> Task.mapError StorageError
+    resolve database username
         |> Task.andThen (validateAndIssue database secureContext { password = password })
 
 
@@ -124,15 +170,13 @@ changePassword :
 changePassword database secureContext { username, current, new } =
     Task.map2
         (\hashedNew maybeUser -> { hashedNew = hashedNew, maybeUser = maybeUser })
-        (Password.hash secureContext (Password.fromString new)
+        (Password.hash secureContext Password.defaultOptions (Password.fromString new)
             |> Task.mapError HashError
         )
-        (Username.user database { username = normalized username }
-            |> Task.mapError StorageError
-        )
+        (resolve database username)
         |> Task.andThen
             (\{ hashedNew, maybeUser } ->
-                Password.validate database secureContext (Password.fromString current) maybeUser
+                Password.validate database secureContext Password.defaultOptions (Password.fromString current) maybeUser
                     |> Task.mapError ValidateError
                     |> Task.andThen
                         (\outcome ->
@@ -160,28 +204,34 @@ renameUsername :
     -> { from : String, to : String, password : String }
     -> Task Error {}
 renameUsername database secureContext { from, to, password } =
-    Username.user database { username = normalized from }
-        |> Task.mapError StorageError
+    Task.map2
+        (\fromName toName -> { fromName = fromName, toName = toName })
+        (normalized from)
+        (normalized to)
         |> Task.andThen
-            (\maybeUser ->
-                Password.validate database secureContext (Password.fromString password) maybeUser
-                    |> Task.mapError ValidateError
-            )
-        |> Task.andThen
-            (\outcome ->
-                when outcome is
-                    Password.Verified proof ->
-                        Username.change database
-                            { from = normalized from, to = normalized to }
-                            proof
-                            |> Task.mapError StorageError
-                            |> Task.map (\_ -> {})
+            (\names ->
+                resolve database from
+                    |> Task.andThen
+                        (\maybeUser ->
+                            Password.validate database secureContext Password.defaultOptions (Password.fromString password) maybeUser
+                                |> Task.mapError ValidateError
+                        )
+                    |> Task.andThen
+                        (\outcome ->
+                            when outcome is
+                                Password.Verified proof ->
+                                    Username.change database
+                                        { from = names.fromName, to = names.toName }
+                                        proof
+                                        |> Task.mapError StorageError
+                                        |> Task.map (\_ -> {})
 
-                    Password.Rejected ->
-                        Task.fail NotVerified
+                                Password.Rejected ->
+                                    Task.fail NotVerified
 
-                    Password.Locked ->
-                        Task.fail NotVerified
+                                Password.Locked ->
+                                    Task.fail NotVerified
+                        )
             )
 
 
@@ -195,8 +245,7 @@ requestResetFor :
     -> { username : String }
     -> Task Error (Maybe { token : String })
 requestResetFor database secureContext { username } =
-    Username.user database { username = normalized username }
-        |> Task.mapError StorageError
+    resolve database username
         |> Task.andThen
             (\maybeUser ->
                 when maybeUser is
@@ -204,7 +253,7 @@ requestResetFor database secureContext { username } =
                         Task.succeed Nothing
 
                     Just user ->
-                        Password.requestReset database secureContext user
+                        Password.requestReset database secureContext Password.defaultOptions user
                             |> Task.mapError StorageError
                             |> Task.map Just
             )
@@ -220,7 +269,7 @@ redeemReset :
     -> { token : String, new : String }
     -> Task Error { session : Session.Session, token : String }
 redeemReset database secureContext input =
-    Password.hash secureContext (Password.fromString input.new)
+    Password.hash secureContext Password.defaultOptions (Password.fromString input.new)
         |> Task.mapError HashError
         |> Task.andThen
             (\hashedNew ->
@@ -228,7 +277,7 @@ redeemReset database secureContext input =
                     |> Task.mapError ResetFailed
             )
         |> Task.andThen
-            (Session.issue database secureContext
+            (Session.issue database secureContext Session.defaultOptions
                 >> Task.mapError StorageError
             )
 
@@ -244,13 +293,13 @@ validateAndIssue :
     -> Maybe Internal.User
     -> Task Error { session : Session.Session, token : String }
 validateAndIssue database secureContext { password } maybeUser =
-    Password.validate database secureContext (Password.fromString password) maybeUser
+    Password.validate database secureContext Password.defaultOptions (Password.fromString password) maybeUser
         |> Task.mapError ValidateError
         |> Task.andThen
             (\outcome ->
                 when outcome is
                     Password.Verified proof ->
-                        Session.issue database secureContext proof
+                        Session.issue database secureContext Session.defaultOptions proof
                             |> Task.mapError StorageError
 
                     Password.Rejected ->
@@ -290,6 +339,7 @@ tests fsPermission secureContext =
                         (\suffix ->
                             concat
                                 [ registrationAndLoginTests database secureContext suffix
+                                , duplicateRegistrationTests database secureContext suffix
                                 , logoutTests database secureContext suffix
                                 , passwordChangeTests database secureContext suffix
                                 , passwordResetTests database secureContext suffix
@@ -316,9 +366,15 @@ registrationAndLoginTests database secureContext suffix =
         )
         (\result ->
             concat
-                [ await
+                [ test "a whitespace-only username does not normalize"
+                    (\_ ->
+                        Expect.equal
+                            Nothing
+                            (Maybe.map Username.toString (Username.normalize (Username.fromString "   ")))
+                    )
+                , await
                     "Verify the session by its raw token"
-                    (Session.verify database secureContext { token = result.token })
+                    (Session.verify database secureContext Session.defaultOptions { token = result.token })
                     (\maybeSession ->
                         concat
                             [ test "the issued session belongs to the user the pipeline created"
@@ -345,7 +401,7 @@ registrationAndLoginTests database secureContext suffix =
                     )
                 , await
                     "Resolve a username nobody owns"
-                    (Username.user database { username = normalized ("nobody-" ++ suffix) })
+                    (resolve database ("nobody-" ++ suffix))
                     (\maybeUser ->
                         test "an unknown username resolves to Nothing"
                             (\_ -> Expect.equal Nothing (Maybe.map User.id maybeUser))
@@ -366,6 +422,50 @@ registrationAndLoginTests database secureContext suffix =
         )
 
 
+{-| Registering a taken username must fail without side effects: the
+registration runs in one transaction, so the duplicate attempt's user insert
+rolls back and the username keeps its original owner.
+-}
+duplicateRegistrationTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+duplicateRegistrationTests database secureContext suffix =
+    let
+        username : String
+        username =
+            "dupe-" ++ suffix
+    in
+    await
+        "Register an account"
+        (register database secureContext { username = username, password = "example password" })
+        (\created ->
+            await
+                "Count users before the duplicate attempt"
+                (countUsers database)
+                (\countBefore ->
+                    awaitError
+                        "Register the same username again"
+                        (register database secureContext { username = username, password = "other password" })
+                        (\_ ->
+                            concat
+                                [ await
+                                    "Count users after the failed attempt"
+                                    (countUsers database)
+                                    (\countAfter ->
+                                        test "a failed registration leaves no orphaned user row"
+                                            (\_ -> Expect.equal countBefore countAfter)
+                                    )
+                                , await
+                                    "Resolve the contested username"
+                                    (resolve database username)
+                                    (\maybeUser ->
+                                        test "the username still belongs to its original owner"
+                                            (\_ -> Expect.equal (Just (User.id created.user)) (Maybe.map User.id maybeUser))
+                                    )
+                                ]
+                        )
+                )
+        )
+
+
 {-| Log in, then log out: a revoked session must no longer verify.
 -}
 logoutTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
@@ -379,7 +479,7 @@ logoutTests database secureContext suffix =
             }
             |> Task.andThen
                 (\created ->
-                    Session.revoke database secureContext { token = created.token }
+                    Session.revoke database secureContext Session.defaultOptions { token = created.token }
                         |> Task.mapError StorageError
                         |> Task.map (\_ -> created.token)
                 )
@@ -387,7 +487,7 @@ logoutTests database secureContext suffix =
         (\revokedToken ->
             await
                 "Verify the revoked token"
-                (Session.verify database secureContext { token = revokedToken })
+                (Session.verify database secureContext Session.defaultOptions { token = revokedToken })
                 (\maybeSession ->
                     test "a revoked session no longer verifies"
                         (\_ -> Expect.equal Nothing maybeSession)
@@ -424,7 +524,7 @@ passwordChangeTests database secureContext suffix =
             concat
                 [ await
                     "Verify the pre-change session"
-                    (Session.verify database secureContext { token = created.token })
+                    (Session.verify database secureContext Session.defaultOptions { token = created.token })
                     (\maybeSession ->
                         test "a password change revokes existing sessions"
                             (\_ -> Expect.equal Nothing maybeSession)
@@ -491,7 +591,7 @@ passwordResetTests database secureContext suffix =
                                         (\_ -> Expect.equal (User.id created.user) loggedIn.session.userId)
                                     , await
                                         "Verify the pre-reset session"
-                                        (Session.verify database secureContext { token = created.token })
+                                        (Session.verify database secureContext Session.defaultOptions { token = created.token })
                                         (\maybeSession ->
                                             test "a reset revokes existing sessions"
                                                 (\_ -> Expect.equal Nothing maybeSession)
@@ -555,14 +655,14 @@ usernameChangeTests database secureContext suffix =
             concat
                 [ await
                     "Resolve the old username"
-                    (Username.user database { username = normalized oldName })
+                    (resolve database oldName)
                     (\maybeUser ->
                         test "the old username no longer resolves"
                             (\_ -> Expect.equal Nothing (Maybe.map User.id maybeUser))
                     )
                 , await
                     "Resolve the new username"
-                    (Username.user database { username = normalized newName })
+                    (resolve database newName)
                     (\maybeUser ->
                         test "the new username resolves to the same user"
                             (\_ -> Expect.equal (Just (User.id created.user)) (Maybe.map User.id maybeUser))

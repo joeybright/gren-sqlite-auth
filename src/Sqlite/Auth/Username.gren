@@ -112,12 +112,26 @@ fromString =
 
 {-| Normalize a username for both storage and lookup: trim surrounding
 whitespace and lowercase it, so `"Alice"`, `" alice "`, and `"ALICE"` all
-resolve to one account. This is the only way to produce the
+resolve to one account. A name that is empty (or whitespace-only) normalizes
+to `Nothing` — an expected negative, not an error — so an empty username can
+never reach the database. This is the only way to produce the
 `Username Normalized` that [`new`](#new) demands.
+
+No Unicode normalization is applied: visually identical names with different
+code points are distinct usernames.
 -}
-normalize : Username Raw -> Username Normalized
+normalize : Username Raw -> Maybe (Username Normalized)
 normalize (Username string) =
-    Username (String.toLower (String.trim string))
+    let
+        trimmed : String
+        trimmed =
+            String.toLower (String.trim string)
+    in
+    if String.isEmpty trimmed then
+        Nothing
+
+    else
+        Just (Username trimmed)
 
 
 {-| Get the underlying `String` of a [`Username`](#Username) in either state.
@@ -134,11 +148,11 @@ toString (Username string) =
 {-| Add a username to the given user, returning the
 [`User`](Sqlite.Auth.User#User) witness for further pipeline steps:
 
-    User.new database secureContext
-        |> Task.andThen
-            (Username.new database
-                { username = Username.normalize (Username.fromString "Alice") }
-            )
+    when Username.normalize (Username.fromString typed) is
+        Just username ->
+            User.new database secureContext
+                |> Task.andThen (Username.new database { username = username })
+        ...
 
 The phantom type guards this entry point — only a
 [`Username Normalized`](#Username) from [`normalize`](#normalize) can be
@@ -171,7 +185,7 @@ must be proven (e.g. via
 [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate)) before an
 identifier can be changed:
 
-    Password.validate database secureContext current (Just user)
+    Password.validate database secureContext options current (Just user)
         |> Task.andThen
             (\outcome ->
                 when outcome is
@@ -217,9 +231,8 @@ change database { from, to } ((Internal.Verified { userId }) as verified) =
 {-| Get the user who owns the given username — the first step of logging in
 an existing user. Pass the whole `Maybe` to a credential check:
 
-    Username.user database
-        { username = Username.normalize (Username.fromString typedUsername) }
-        |> Task.andThen (Password.validate database secureContext candidate)
+    Username.user database { username = username }
+        |> Task.andThen (Password.validate database secureContext options candidate)
 
 Succeeds with `Nothing` when no user owns the username — an expected negative
 is a value, not an error.

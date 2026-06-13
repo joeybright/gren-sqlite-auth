@@ -1,6 +1,8 @@
 module Sqlite.Auth.Session exposing
     ( migrationV1
     , Session
+    , Options
+    , defaultOptions
     , issue
     , verify
     , validate
@@ -19,6 +21,7 @@ deleting it; dead rows (revoked or expired) are swept as part of every
 
 @docs migrationV1
 @docs Session
+@docs Options, defaultOptions
 @docs issue
 @docs verify
 @docs validate
@@ -27,7 +30,6 @@ deleting it; dead rows (revoked or expired) are swept as part of every
 
 -}
 
-import Base64.Decode
 import Crypto
 import Sqlite
 import Sqlite.Auth.Internal as Internal
@@ -80,11 +82,27 @@ type alias Session =
     }
 
 
-{-| How long an issued session stays valid: 30 days.
+{-| The tunables every session function takes. `lifetimeMillis` caps a
+session's absolute age; `idleTimeoutMillis` caps how long it survives without
+being used — a stolen token on an abandoned session should not stay live for
+the rest of the absolute lifetime.
 -}
-sessionLifetimeMillis : Int
-sessionLifetimeMillis =
-    30 * 24 * 60 * 60 * 1000
+type alias Options =
+    { lifetimeMillis : Int
+    , idleTimeoutMillis : Int
+    }
+
+
+{-| The defaults: 30-day lifetime, 7-day idle timeout. Pass as-is or override
+fields:
+
+    { Session.defaultOptions | lifetimeMillis = 60 * 60 * 1000 }
+-}
+defaultOptions : Options
+defaultOptions =
+    { lifetimeMillis = 30 * 24 * 60 * 60 * 1000
+    , idleTimeoutMillis = 7 * 24 * 60 * 60 * 1000
+    }
 
 
 {-| Issue a session for a verified user — the final step of a login pipeline.
@@ -92,23 +110,24 @@ Demands the `Verified` witness only a credential check (e.g.
 [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate)) can mint, so
 a session can never be issued for a user who merely exists.
 
-Returns `{ session, token }` — hand `token` to the client, keep nothing else;
-only its hash is stored. Sweeps dead rows first, so every login doubles as a
-cleanup pass.
+Returns `{ session, token }` — hand `token` to the client (URL-safe base64,
+so it travels in cookies and links unescaped), keep nothing else; only its
+hash is stored. Sweeps dead rows first, so every login doubles as a cleanup
+pass.
 -}
-issue : Sqlite.Database -> Crypto.SecureContext -> Internal.Verified -> Task Sqlite.Error { session : Session, token : String }
-issue database secureContext (Internal.Verified { userId }) =
-    sweep database
+issue : Sqlite.Database -> Crypto.SecureContext -> Options -> Internal.Verified -> Task Sqlite.Error { session : Session, token : String }
+issue database secureContext options (Internal.Verified { userId }) =
+    sweep database options
         |> Task.andThen
             (\_ ->
                 Task.map2
-                    (\tokenBytes now -> { tokenBytes = tokenBytes, now = now })
+                    (\tokenBytes now -> { token = Utilities.base64UrlSafe tokenBytes, now = now })
                     (Crypto.getRandomUInt8Values 32)
                     Utilities.nowMillis
             )
         |> Task.andThen
-            (\{ tokenBytes, now } ->
-                Utilities.sha256Base64 secureContext tokenBytes
+            (\{ token, now } ->
+                Utilities.hashTokenString secureContext token
                     |> Task.andThen
                         (\hashedToken ->
                             let
@@ -117,25 +136,25 @@ issue database secureContext (Internal.Verified { userId }) =
                                     { sessionToken = hashedToken
                                     , userId = userId
                                     , createdAt = now
-                                    , expiresAt = now + sessionLifetimeMillis
+                                    , expiresAt = now + options.lifetimeMillis
                                     , lastUsedAt = now
                                     , revokedAt = Nothing
                                     }
                             in
                             insert database session
-                                |> Task.map (\_ -> { session = session, token = Utilities.base64 tokenBytes })
+                                |> Task.map (\_ -> { session = session, token = token })
                         )
             )
 
 
 {-| Verify a presented raw token: resolve it to its stored row, treating a
-revoked (`revoked_at` set) or expired (`expires_at` in the past) row — or no
-row at all — as no session. A successful verification touches the session:
-`last_used_at` is bumped to now, and the returned [`Session`](#Session)
-reflects it.
+revoked (`revoked_at` set), expired (`expires_at` in the past), or idle
+(unused for longer than `idleTimeoutMillis`) row — or no row at all — as no
+session. A successful verification touches the session: `last_used_at` is
+bumped to now, and the returned [`Session`](#Session) reflects it.
 -}
-verify : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task Sqlite.Error (Maybe Session)
-verify database secureContext input =
+verify : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task Sqlite.Error (Maybe Session)
+verify database secureContext options input =
     Task.map2
         (\maybeSession now -> { maybeSession = maybeSession, now = now })
         (getByToken database secureContext input)
@@ -152,7 +171,7 @@ verify database secureContext input =
                                 Task.succeed Nothing
 
                             Nothing ->
-                                if session.expiresAt > now then
+                                if session.expiresAt > now && session.lastUsedAt + options.idleTimeoutMillis > now then
                                     touch database { sessionToken = session.sessionToken, lastUsedAt = now }
                                         |> Task.map (\_ -> Just { session | lastUsedAt = now })
 
@@ -165,7 +184,7 @@ verify database secureContext input =
 `Verified` witness — so holding a valid session can authorize the
 witness-gated steps without re-proving a credential:
 
-    Session.validate database secureContext { token = token }
+    Session.validate database secureContext options { token = token }
         |> Task.andThen
             (\maybeProof ->
                 when maybeProof is
@@ -185,9 +204,9 @@ Built on [`verify`](#verify), so the same rules apply: a revoked, expired, or
 unknown token yields `Nothing`, and a successful validation touches the
 session.
 -}
-validate : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task Sqlite.Error (Maybe Internal.Verified)
-validate database secureContext input =
-    verify database secureContext input
+validate : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task Sqlite.Error (Maybe Internal.Verified)
+validate database secureContext options input =
+    verify database secureContext options input
         |> Task.map
             (Maybe.map (\session -> Internal.Verified { userId = session.userId }))
 
@@ -196,11 +215,11 @@ validate database secureContext input =
 with the current time, then sweeps dead rows, so logging out also cleans the
 table. Idempotent: a token matching no row simply updates nothing.
 -}
-revoke : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task Sqlite.Error {}
-revoke database secureContext { token } =
+revoke : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task Sqlite.Error {}
+revoke database secureContext options { token } =
     Task.map2
         (\hashedToken now -> { hashedToken = hashedToken, now = now })
-        (hashTokenString secureContext token)
+        (Utilities.hashTokenString secureContext token)
         Utilities.nowMillis
         |> Task.andThen
             (\{ hashedToken, now } ->
@@ -217,7 +236,7 @@ revoke database secureContext { token } =
                         ]
                     }
             )
-        |> Task.andThen (\_ -> sweep database)
+        |> Task.andThen (\_ -> sweep database options)
 
 
 {-| Revoke every live session a user holds — "log out everywhere", and the
@@ -245,25 +264,6 @@ revokeAll database { userId } =
                     }
             )
         |> Task.map (\_ -> {})
-
-
-
--- tokens
-
-
-{-| Map a presented token string to the value stored in
-`auth_sessions.session_token`: decode the base64 back to the raw token bytes,
-then hash them the way [`issue`](#issue) did when storing the row. An
-undecodable token is passed through verbatim and simply matches no row.
--}
-hashTokenString : Crypto.SecureContext -> String -> Task x String
-hashTokenString secureContext rawToken =
-    when Base64.Decode.bytes rawToken is
-        Ok tokenBytes ->
-            Utilities.sha256Base64 secureContext tokenBytes
-
-        Err _ ->
-            Task.succeed rawToken
 
 
 
@@ -324,12 +324,12 @@ insert database { sessionToken, userId, createdAt, expiresAt, lastUsedAt, revoke
 
 
 {-| Read a single session by its presented raw token, returning `Nothing` when
-no row matches. The token is mapped to the stored hash via
-[`hashTokenString`](#hashTokenString) before matching.
+no row matches. The token string is hashed to the stored value before
+matching.
 -}
 getByToken : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task Sqlite.Error (Maybe Session)
 getByToken database secureContext { token } =
-    hashTokenString secureContext token
+    Utilities.hashTokenString secureContext token
         |> Task.andThen
             (\hashedToken ->
                 Sqlite.getMaybeOne database
@@ -366,11 +366,12 @@ touch database { sessionToken, lastUsedAt } =
         }
 
 
-{-| Delete every dead session row: revoked, or expired as of now. Run by
-[`issue`](#issue), so the table tends itself during normal logins.
+{-| Delete every dead session row: revoked, expired, or idle past
+`idleTimeoutMillis` as of now. Run by [`issue`](#issue) and
+[`revoke`](#revoke), so the table tends itself during normal use.
 -}
-sweep : Sqlite.Database -> Task Sqlite.Error {}
-sweep database =
+sweep : Sqlite.Database -> Options -> Task Sqlite.Error {}
+sweep database options =
     Utilities.nowMillis
         |> Task.andThen
             (\now ->
@@ -378,10 +379,11 @@ sweep database =
                     { statement =
                         """
                         DELETE FROM auth_sessions
-                        WHERE revoked_at IS NOT NULL OR expires_at <= :now
+                        WHERE revoked_at IS NOT NULL OR expires_at <= :now OR last_used_at <= :idle_cutoff
                         """
                     , parameters =
                         [ Sqlite.Encode.int "now" now
+                        , Sqlite.Encode.int "idle_cutoff" (now - options.idleTimeoutMillis)
                         ]
                     }
             )

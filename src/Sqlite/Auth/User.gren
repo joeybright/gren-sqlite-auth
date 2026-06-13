@@ -55,6 +55,19 @@ addUsersTableMigrationSQL =
 `created_at`/`updated_at` to now — and return the [`User`](#User) witness for
 the row, ready to pipe into the steps that attach a username, a password, and
 so on.
+
+Wrap a registration pipeline in `Sqlite.inTransaction`, so a failure partway
+— most likely a username that is already taken — rolls back this insert
+instead of stranding a user row with no credentials:
+
+    Sqlite.inTransaction database
+        (User.new database secureContext
+            |> Task.andThen (Username.new database { username = username })
+            |> Task.andThen (Password.add database hashedPassword)
+        )
+
+SQLite has no nested transactions, so keep later steps (validating, issuing a
+session) outside the wrap.
 -}
 new : Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Internal.User
 new database secureContext =
