@@ -43,10 +43,10 @@ can never disagree about case or whitespace.
 
 import Sqlite
 import Sqlite.Auth.Internal as Internal
-import Sqlite.Auth.Utilities as Utilities
 import Sqlite.Decode
 import Sqlite.Encode
 import Task exposing ( Task )
+import Utils.Time
 
 
 {-| Create the `auth_usernames` table. Run after
@@ -160,7 +160,7 @@ persisted. A username that is already taken fails on the table's primary key.
 -}
 new : Sqlite.Database -> { username : Username Normalized } -> Internal.User -> Task Sqlite.Error Internal.User
 new database { username } ((Internal.User { userId }) as userWitness) =
-    Utilities.nowMillis
+    Utils.Time.nowMillis
         |> Task.andThen
             (\now ->
                 Sqlite.execute database
@@ -203,7 +203,7 @@ the table's primary key. Returns the witness back for further steps.
 -}
 change : Sqlite.Database -> { from : Username Normalized, to : Username Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
 change database { from, to } ((Internal.Verified { userId }) as verified) =
-    Utilities.nowMillis
+    Utils.Time.nowMillis
         |> Task.andThen
             (\now ->
                 Sqlite.execute database

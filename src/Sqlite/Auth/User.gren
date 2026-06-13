@@ -21,9 +21,9 @@ means the user it names is real.
 import Crypto
 import Sqlite
 import Sqlite.Auth.Internal as Internal
-import Sqlite.Auth.Utilities as Utilities
 import Sqlite.Encode
 import Task exposing ( Task )
+import Utils.Time
 
 
 {-| Create the `users` table: the minimal user record this package depends on
@@ -73,7 +73,7 @@ new : Sqlite.Database -> Crypto.SecureContext -> Task Sqlite.Error Internal.User
 new database secureContext =
     Task.map2
         (\now userId -> { now = now, userId = userId })
-        Utilities.nowMillis
+        Utils.Time.nowMillis
         (Crypto.randomUuidV4 secureContext)
         |> Task.andThen
             (\{ now, userId } ->

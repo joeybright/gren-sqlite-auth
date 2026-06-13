@@ -1,0 +1,23 @@
+module Utils.Crypto exposing ( digestAsBase64 )
+
+{-| Cryptographic digest helpers.
+
+@docs digestAsBase64
+
+-}
+
+import Bytes exposing ( Bytes )
+import Crypto
+import Task exposing ( Task )
+import Utils.Base64
+
+
+{-| Hash bytes with the given algorithm and base64-encode the digest. Suitable
+for storing full-entropy random values (tokens) at rest: a single hash (no
+salt, no stretching) makes the stored value useless to an attacker while
+staying reproducible for lookups.
+-}
+digestAsBase64 : Crypto.SecureContext -> Crypto.DigestAlgorithm -> Bytes -> Task x String
+digestAsBase64 secureContext algorithm bytes =
+    Crypto.digest secureContext algorithm bytes
+        |> Task.map Utils.Base64.encodeBytes

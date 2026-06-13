@@ -30,13 +30,16 @@ deleting it; dead rows (revoked or expired) are swept as part of every
 
 -}
 
+import Bytes
 import Crypto
 import Sqlite
 import Sqlite.Auth.Internal as Internal
-import Sqlite.Auth.Utilities as Utilities
 import Sqlite.Decode
 import Sqlite.Encode
 import Task exposing ( Task )
+import Utils.Base64
+import Utils.Crypto
+import Utils.Time
 
 
 {-| Create the `auth_sessions` table. Run after
@@ -121,13 +124,13 @@ issue database secureContext options (Internal.Verified { userId }) =
         |> Task.andThen
             (\_ ->
                 Task.map2
-                    (\tokenBytes now -> { token = Utilities.base64UrlSafe tokenBytes, now = now })
+                    (\tokenBytes now -> { token = Utils.Base64.encodeBytesUrlSafe tokenBytes, now = now })
                     (Crypto.getRandomUInt8Values 32)
-                    Utilities.nowMillis
+                    Utils.Time.nowMillis
             )
         |> Task.andThen
             (\{ token, now } ->
-                Utilities.hashTokenString secureContext token
+                Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
                     |> Task.andThen
                         (\hashedToken ->
                             let
@@ -158,7 +161,7 @@ verify database secureContext options input =
     Task.map2
         (\maybeSession now -> { maybeSession = maybeSession, now = now })
         (getByToken database secureContext input)
-        Utilities.nowMillis
+        Utils.Time.nowMillis
         |> Task.andThen
             (\{ maybeSession, now } ->
                 when maybeSession is
@@ -219,8 +222,8 @@ revoke : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String 
 revoke database secureContext options { token } =
     Task.map2
         (\hashedToken now -> { hashedToken = hashedToken, now = now })
-        (Utilities.hashTokenString secureContext token)
-        Utilities.nowMillis
+        (Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token))
+        Utils.Time.nowMillis
         |> Task.andThen
             (\{ hashedToken, now } ->
                 Sqlite.execute database
@@ -247,7 +250,7 @@ until the next sweep.
 -}
 revokeAll : Sqlite.Database -> { userId : String } -> Task Sqlite.Error {}
 revokeAll database { userId } =
-    Utilities.nowMillis
+    Utils.Time.nowMillis
         |> Task.andThen
             (\now ->
                 Sqlite.execute database
@@ -329,7 +332,7 @@ matching.
 -}
 getByToken : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task Sqlite.Error (Maybe Session)
 getByToken database secureContext { token } =
-    Utilities.hashTokenString secureContext token
+    Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
         |> Task.andThen
             (\hashedToken ->
                 Sqlite.getMaybeOne database
@@ -372,7 +375,7 @@ touch database { sessionToken, lastUsedAt } =
 -}
 sweep : Sqlite.Database -> Options -> Task Sqlite.Error {}
 sweep database options =
-    Utilities.nowMillis
+    Utils.Time.nowMillis
         |> Task.andThen
             (\now ->
                 Sqlite.execute database
