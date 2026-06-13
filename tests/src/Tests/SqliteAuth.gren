@@ -366,13 +366,7 @@ registrationAndLoginTests database secureContext suffix =
         )
         (\result ->
             concat
-                [ test "a whitespace-only username does not normalize"
-                    (\_ ->
-                        Expect.equal
-                            Nothing
-                            (Maybe.map Username.toString (Username.normalize (Username.fromString "   ")))
-                    )
-                , await
+                [ await
                     "Verify the session by its raw token"
                     (Session.verify database secureContext Session.defaultOptions { token = result.token })
                     (\maybeSession ->
