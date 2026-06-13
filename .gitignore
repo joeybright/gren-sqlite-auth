@@ -1,5 +1,6 @@
 .DS_Store
 tests/app
 tests/test.sqlite
+tests/test-sqlite-auth.sqlite
 .gren
 app.js
