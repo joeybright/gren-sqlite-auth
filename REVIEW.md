@@ -2,6 +2,7 @@
 
 - [x] `Sqlite.Auth.User`
 - [ ] `Sqlite.Auth.Username`
+    - [ ] Rename created table from `auth_usernames` to just `usernames`
 - [ ] `Sqlite.Auth.Password`
 - [ ] `Sqlite.Auth.Password.PhcString`
 - [ ] `Sqlite.Auth.Session`
