@@ -7,10 +7,24 @@ module Sqlite.Auth.User exposing
 
 {-| Add and get users from the database.
 
-## Migrations
+## Expected database schema
 
-You must run the following migrations, in version order, before running any 
-other functions in this module.
+The minimum required table schema for this module to work is below:
+
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+
+`id` is expected to be a unique identifier. Functions in this module generate UUID 
+v4 id strings. Both `created_at` and `updated_at` are posix timestamp values.
+
+The `users` table is used as a foreign key reference for _all_ other modules in this 
+package. As such, it is required for most, if not all, of the functions in this package
+to operate successfully.
+
+## Migrations
 
 @docs migrationV1
 
@@ -63,13 +77,13 @@ addUsersTableMigrationSQL =
 {-| Create a new user with a randomly genered UUID v4 identifier.
 
 This function returns a `User` type which is required for many other 
-functions in this package to operate. 
+functions in this package to operate.
 
 It's _highly_ recommended that you immediately create a 
 [username](Sqlite.Auth.Username) for the new user in the same SQLite
 transaction. After a user is created, the only method of retrieving
 it from the database is by it's id (via the [get](#get) function) or by
-the users username. If you plan on using this package for user-facing 
+the users created username. If you plan on using this package for user-facing 
 authentication, user ids are not the most friendly way to remember how
 to log into an account!
 -}
