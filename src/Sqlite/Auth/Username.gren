@@ -15,30 +15,45 @@ module Sqlite.Auth.Username exposing
 
 ## Expected database schema
 
-The username identifier: the `auth_usernames` table linking a username to
-its owning user.
+The minimum required table schema for this module to work is below:
 
-The username itself is the primary key, so uniqueness is enforced by the
-schema. A username enters as a [`Username Raw`](#Username) via
-[`fromString`](#fromString) and must pass through [`normalize`](#normalize)
-to become a `Username Normalized` — the only form [`new`](#new) accepts, so
-an un-normalized username can never reach the database and writes and lookups
-can never disagree about case or whitespace.
+    CREATE TABLE IF NOT EXISTS usernames (
+        username TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+
+`username` is, of course, the username of the user as a `String`. `user_id` 
+references the users (in [Sqlite.Auth.User module](Sqlite.Auth.User)). Both 
+`created_at` and `updated_at` are posix timestamp values.
 
 ## Migrations
 
-You must run the migrations in the [Sqlite.Auth.User](Sqlite.Auth.User) module
-_and_ the migrations in this module, in version order, for function in this
-module to work properly.
-
 @docs migrationV1
 
-# Using usernames
+# Creating a username
+
+You must create a `Username` before being able to save it for a user or
+find a user by that username. These functions ensure usernames are properly
+formatted before being saved to or searched within the database.
+
+If you want to manipulate a username in any way, you must do so to the raw
+`String` before calling `fromString`.
 
 @docs Username, Raw, Normalized
 @docs fromString
 @docs normalize
 @docs toString
+
+# Working with usernames
+
+Adding & changing usernames are supported, as is finding users by a given
+username.
+
 @docs new
 @docs change
 @docs user
@@ -85,25 +100,19 @@ addUsernamesTableMigrationSQL =
     """
 
 
-
--- usernames
-
-
-{-| A username exactly as the user typed it.
+{-| A raw, non-normalized, username.
 -}
 type Raw
     = Raw
 
 
-{-| A username that has been [`normalize`](#normalize)d and is safe to match
-or persist.
+{-| A normalized username that is ready to be saved to the database.
 -}
 type Normalized
     = Normalized
 
 
-{-| A username, tagged with whether it is still [`Raw`](#Raw) or already
-[`Normalized`](#Normalized). Only the normalized form can reach the database.
+{-| A username, with a phantom type state of either `Raw` or `Normalized`.
 -}
 type Username state
     = Username String
@@ -117,15 +126,8 @@ fromString =
     Username
 
 
-{-| Normalize a username for both storage and lookup: trim surrounding
-whitespace and lowercase it, so `"Alice"`, `" alice "`, and `"ALICE"` all
-resolve to one account. A name that is empty (or whitespace-only) normalizes
-to `Nothing` — an expected negative, not an error — so an empty username can
-never reach the database. This is the only way to produce the
-`Username Normalized` that [`new`](#new) demands.
-
-No Unicode normalization is applied: visually identical names with different
-code points are distinct usernames.
+{-| Ensures the users has has been trimmed, is not empty, and all characters 
+are lowercase. This function does not remove empty spaces.
 -}
 normalize : Username Raw -> Maybe (Username Normalized)
 normalize (Username string) =
@@ -141,29 +143,16 @@ normalize (Username string) =
         Just (Username trimmed)
 
 
-{-| Get the underlying `String` of a [`Username`](#Username) in either state.
+{-| Get the underlying username `String`.
 -}
 toString : Username state -> String
 toString (Username string) =
     string
 
 
-
--- pipeline steps
-
-
-{-| Add a username to the given user, returning the
-[`User`](Sqlite.Auth.User#User) witness for further pipeline steps:
-
-    when Username.normalize (Username.fromString typed) is
-        Just username ->
-            User.new database secureContext
-                |> Task.andThen (Username.new database { username = username })
-        ...
-
-The phantom type guards this entry point — only a
-[`Username Normalized`](#Username) from [`normalize`](#normalize) can be
-persisted. A username that is already taken fails on the table's primary key.
+{-| Add a username to the given user, returning the user for further pipeline 
+steps. The passed username must be normalized using the 
+[`normalize`](#normalize) function.
 -}
 new : Sqlite.Database -> { username : Username Normalized } -> Internal.User -> Task Sqlite.Error Internal.User
 new database { username } ((Internal.User { userId }) as userWitness) =
@@ -187,29 +176,19 @@ new database { username } ((Internal.User { userId }) as userWitness) =
             )
 
 
-{-| Rename a username — gated by the `Verified` witness, so the credential
-must be proven (e.g. via
-[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate)) before an
-identifier can be changed:
+{-| Change a users username. The user whos username will be changed depends
+on the given `Verified` type.
 
-    Password.validate database secureContext options current (Just user)
-        |> Task.andThen
-            (\outcome ->
-                when outcome is
-                    Password.Verified proof ->
-                        Username.change database
-                            { from = currentUsername, to = newUsername }
-                            proof
-                    ...
-            )
+You can obtain the `Verified` type by using any functions in this package that 
+verify credentials. This restriction forces callers of this function to go
+through the process of properly verifying who a user is before being able to
+complete actions on their behalf.
 
-The write is scoped to the witness's user, so a held proof can only rename a
-username its own user owns — a `from` owned by someone else (or nobody)
-matches zero rows and changes nothing. A `to` that is already taken fails on
-the table's primary key. Returns the witness back for further steps.
+At the time of writing, the only function that can produce the `Verified` type
+is the [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) function.
 -}
-change : Sqlite.Database -> { from : Username Normalized, to : Username Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
-change database { from, to } ((Internal.Verified { userId }) as verified) =
+change : Sqlite.Database -> { newUsername : Username Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
+change database { newUsername } ((Internal.Verified { userId }) as verified) =
     Utils.Time.nowMillis
         |> Task.andThen
             (\now ->
@@ -218,12 +197,11 @@ change database { from, to } ((Internal.Verified { userId }) as verified) =
                         """
                         UPDATE auth_usernames
                         SET username = :to, updated_at = :updated_at
-                        WHERE username = :from AND user_id = :user_id
+                        WHERE user_id = :user_id
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "to" (toString to)
+                        [ Sqlite.Encode.string "to" (toString newUsername)
                         , Sqlite.Encode.int "updated_at" now
-                        , Sqlite.Encode.string "from" (toString from)
                         , Sqlite.Encode.string "user_id" userId
                         ]
                     }
@@ -231,21 +209,8 @@ change database { from, to } ((Internal.Verified { userId }) as verified) =
             )
 
 
-
--- getting users
-
-
-{-| Get the user who owns the given username — the first step of logging in
-an existing user. Pass the whole `Maybe` to a credential check:
-
-    Username.user database { username = username }
-        |> Task.andThen (Password.validate database secureContext options candidate)
-
-Succeeds with `Nothing` when no user owns the username — an expected negative
-is a value, not an error.
-[`Password.validate`](Sqlite.Auth.Password#validate) burns a full hashing
-round on `Nothing`, so an unknown username costs (and answers) the same as a
-wrong password.
+{-| Get the user who owns the given username. Returns `Nothing` is the given
+username is not associated with any user.
 -}
 user : Sqlite.Database -> { username : Username Normalized } -> Task Sqlite.Error (Maybe Internal.User)
 user database { username } =

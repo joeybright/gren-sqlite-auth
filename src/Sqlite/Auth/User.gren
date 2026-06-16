@@ -74,7 +74,7 @@ addUsersTableMigrationSQL =
     """
 
 
-{-| Create a new user with a randomly genered UUID v4 identifier.
+{-| Create a new user with a randomly generated UUID v4 identifier.
 
 This function returns a `User` type which is required for many other 
 functions in this package to operate.
