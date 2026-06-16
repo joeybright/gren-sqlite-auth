@@ -1,20 +1,23 @@
 # gren-sqlite-auth
 
-- Each module has a SQLite migration that is required to use its functionality, else interacting with the database will fail. You _must_ run the migration in the [User](Sqlite.Auth.User) module.
-- All data is available for you to read, update, and manipulate outside of the confines of this package, given it lives in a SQLite database. This package primarily helps by ensuring authentication information is properly and safely saved and retrieved from the database and validated in situations when validation is necessary. Given all of the data this package operates on is available in an external SQLite database, it cannot prevent that data from being manipulated in ways that break the functionality of this package. In other words: use extreme caution when manipulating data this package depends on, otherwise it may break your authentication system!
+`gren-sqlite-auth` is a simple way to add authentication primitives to your Gren application without getting caught with your pants down when handling credentials.
 
-## Why this package exists
-
-The primary purpose of this package is to have a drop-in method for adding simple authentication primitives to your Gren application.
+The ideal use for this package is to setup simple applications, prototypes, or small guarded areas of a website where authentication is useful and/or necessary, but doesn't need to be enterprise-grade. 
 
 ## What this package does
 
-This package helps 
+This package gives you username and password authentication out-of-the-box without much work. This is usually all you need for simple applications. Other identifiers (email) and/or credentials (one-time codes, etc.) may be added in the future.
+
+More importantly, this package, when used properly (see _What this package does not do_ below) prevents you from mishandling credentials at the type-level. In other words: If you use functions in this package to handle credential information, it is difficult, if not impossible in some cases, to comprimise the security of your application. This includes ensuring you handle credentials properly within your Gren program _and_ ensuring that any data saved to the database is done so as safely as possible.
 
 ## What this package does _not_ do
 
-This package is not meant to provide production-grade authencation. While care has gone into ensuring sensitive information is saved to the database properly to prevent against most attacks, it's highly recommended to review and deeply interrogate the implementations of such functionality before using it for critical systems.
+This package is not meant to provide production-grade authencation. While great care has gone into ensuring information is saved to the database properly, I (the author) am not a security engineer, nor has this codebase been reviewed by security professionals. As such, it's highly recommended to review and deeply interrogate the implemention of all functionality in this package before using it in any critical systems.
 
-## Quickstart
+This package does not help in setting up proper endpoints for authentication or handling sessions with proper HTTP cookies and such. Modules to help with this - particularly in handling session tokens via HTTP cookies - may be added in the future.
 
-1. 
+Finally, this package does not prevent you from manipulating data saved to the database in a way that breaks the functionality provided by this package. In other words: Be very careful when writing your own SQL that interacts with the tables this package relies on. You have been warned!
+
+## Getting started
+
+Coming soon...
