@@ -5,6 +5,7 @@ module Sqlite.Auth.Session exposing
     , defaultOptions
     , issue
     , verify
+    , VerifyError(..)
     , revoke
     , revokeAll
     )
@@ -206,22 +207,37 @@ issue database secureContext options (Internal.Verified { userId }) =
             )
 
 
-{-| Verify a presented raw token, returning the [`Session`](#Session) it names
-together with the `Verified` witness for its user. A revoked, expired, or idle
-session (unused for longer than `idleTimeoutMillis`), or a token matching no
-session at all, all return `Nothing`. A successful verification bumps the
-session's `last_used_at` to now, and the returned session reflects it.
+{-| Why a presented token failed to verify. `StorageError` is a real database
+fault; the rest are expected rejections — the token names no live session.
+
+  - `TokenNotFound` — the token matches no session row at all.
+  - `Revoked` — the session was revoked.
+  - `Expired` — the session is past its absolute lifetime.
+  - `IdleTimeout` — the session went unused for longer than `idleTimeoutMillis`.
+
+-}
+type VerifyError
+    = StorageError Sqlite.Error
+    | TokenNotFound
+    | Revoked
+    | Expired
+    | IdleTimeout
+
+
+{-| Verify a presented raw token, succeeding with the [`Session`](#Session) it
+names together with the `Verified` witness for its user. A successful
+verification bumps the session's `last_used_at` to now, and the returned session
+reflects it. Anything that makes the token unusable — a revoked, expired, or
+idle session, or a token matching no session at all — fails the task with the
+matching [`VerifyError`](#VerifyError).
 
 The `verified` field lets a live session authorize actions that require
 `Verified` without re-checking a credential:
 
     Session.verify database secureContext options { token = token }
         |> Task.andThen
-            (\maybeOutcome ->
-                when maybeOutcome is
-                    Just { verified } ->
-                        Username.change database { newUsername = new } verified
-                    ...
+            (\{ verified } ->
+                Username.change database { newUsername = new } verified
             )
 
 This trades "credential proven just now" for "holds a live session": a stolen
@@ -231,9 +247,10 @@ stricter proof from
 [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) where that is
 not acceptable.
 -}
-verify : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task Sqlite.Error (Maybe { session : Session, verified : Internal.Verified })
+verify : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task VerifyError { session : Session, verified : Internal.Verified }
 verify database secureContext options input =
     getByToken database secureContext input
+        |> Task.mapError StorageError
         |> Task.andThen
             (\maybeSession ->
                 Utils.Time.nowMillis
@@ -241,16 +258,23 @@ verify database secureContext options input =
                         (\now ->
                             when maybeSession is
                                 Nothing ->
-                                    Task.succeed Nothing
+                                    Task.fail TokenNotFound
 
                                 Just session ->
                                     when session.revokedAt is
                                         Just _ ->
-                                            Task.succeed Nothing
+                                            Task.fail Revoked
 
                                         Nothing ->
-                                            if session.expiresAt > now && session.lastUsedAt + options.idleTimeoutMillis > now then
+                                            if session.expiresAt <= now then
+                                                Task.fail Expired
+
+                                            else if session.lastUsedAt + options.idleTimeoutMillis <= now then
+                                                Task.fail IdleTimeout
+
+                                            else
                                                 touch database { sessionToken = session.sessionToken, lastUsedAt = now }
+                                                    |> Task.mapError StorageError
                                                     |> Task.map
                                                         (\_ ->
                                                             let
@@ -258,14 +282,10 @@ verify database secureContext options input =
                                                                 updated =
                                                                     { session | lastUsedAt = now }
                                                             in
-                                                            Just
-                                                                { session = updated
-                                                                , verified = Internal.Verified { userId = updated.userId }
-                                                                }
+                                                            { session = updated
+                                                            , verified = Internal.Verified { userId = updated.userId }
+                                                            }
                                                         )
-
-                                            else
-                                                Task.succeed Nothing
                         )
             )
 

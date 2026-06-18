@@ -466,12 +466,12 @@ passwordChangeTests database secureContext suffix =
         )
         (\created ->
             concat
-                [ await
+                [ awaitError
                     "Verify the pre-change session"
                     (Session.verify database secureContext Session.defaultOptions { token = created.token })
-                    (\maybeSession ->
+                    (\error ->
                         test "a password change revokes existing sessions"
-                            (\_ -> Expect.equal Nothing maybeSession)
+                            (\_ -> Expect.equal Session.Revoked error)
                     )
                 , await
                     "Log in with the new password"
@@ -526,12 +526,12 @@ passwordResetTests database secureContext suffix =
                                 concat
                                     [ test "redeeming the reset logs the user straight in"
                                         (\_ -> Expect.equal (User.id created.user) loggedIn.session.userId)
-                                    , await
+                                    , awaitError
                                         "Verify the pre-reset session"
                                         (Session.verify database secureContext Session.defaultOptions { token = created.token })
-                                        (\maybeSession ->
+                                        (\error ->
                                             test "a reset revokes existing sessions"
-                                                (\_ -> Expect.equal Nothing maybeSession)
+                                                (\_ -> Expect.equal Session.TokenNotFound error)
                                         )
                                     , awaitError
                                         "Redeem the same token again"
