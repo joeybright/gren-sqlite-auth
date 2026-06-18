@@ -5,7 +5,7 @@ module Tests.Sqlite.Auth.Session exposing ( tests )
 database.
 
 Behavior is observed through the module's own `verify`/`validate`, so no raw SQL
-is needed. Each group creates its own user (the `auth_sessions.user_id` foreign
+is needed. Each group creates its own user (the `sessions.user_id` foreign
 key) and mints the `Verified` witness `issue` demands directly from
 `Sqlite.Auth.Internal`. Expiry and idle timeout are forced deterministically by
 zeroing the relevant `Options` field rather than waiting on the clock.

@@ -20,7 +20,7 @@ stolen database cannot be replayed as live sessions.
 
 The minimum required table schema for this module to work is below:
 
-    CREATE TABLE IF NOT EXISTS auth_sessions (
+    CREATE TABLE IF NOT EXISTS sessions (
         session_token TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -75,7 +75,7 @@ import Utils.Crypto
 import Utils.Time
 
 
-{-| Migrate the database to add an `auth_sessions` table with the minimum
+{-| Migrate the database to add a `sessions` table with the minimum
 required schema for this module to operate. It references users, so run this
 after [`Sqlite.Auth.User.migrationV1`](Sqlite.Auth.User#migrationV1).
 
@@ -85,7 +85,7 @@ statements can be extracted from the records `statements` field.
 -}
 migrationV1 : { name : String, statements : Array String }
 migrationV1 =
-    { name = "`Sqlite.Auth.Session.migrationV1` - Add auth_sessions table"
+    { name = "`Sqlite.Auth.Session.migrationV1` - Add sessions table"
     , statements =
         [ addSessionsTableMigrationSQL
         ]
@@ -96,7 +96,7 @@ migrationV1 =
 addSessionsTableMigrationSQL : String
 addSessionsTableMigrationSQL =
     """
-    CREATE TABLE IF NOT EXISTS auth_sessions (
+    CREATE TABLE IF NOT EXISTS sessions (
         session_token TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -108,7 +108,7 @@ addSessionsTableMigrationSQL =
     """
 
 
-{-| A row from the `auth_sessions` table. `sessionToken` is the SHA-256 hash of
+{-| A row from the `sessions` table. `sessionToken` is the SHA-256 hash of
 the raw token, never the raw token itself. `revokedAt` is `Nothing` for a live
 session and `Just` the revocation time once it has been explicitly revoked.
 -}
@@ -305,7 +305,7 @@ revoke database secureContext options { token } =
                             Sqlite.execute database
                                 { statement =
                                     """
-                                    UPDATE auth_sessions
+                                    UPDATE sessions
                                     SET revoked_at = :revoked_at
                                     WHERE session_token = :session_token
                                     """
@@ -332,7 +332,7 @@ revokeAll database { userId } =
                 Sqlite.execute database
                     { statement =
                         """
-                        UPDATE auth_sessions
+                        UPDATE sessions
                         SET revoked_at = :revoked_at
                         WHERE user_id = :user_id AND revoked_at IS NULL
                         """
@@ -345,7 +345,7 @@ revokeAll database { userId } =
         |> Task.map (\_ -> {})
 
 
-{-| Decode a single `auth_sessions` row into a [`Session`](#Session).
+{-| Decode a single `sessions` row into a [`Session`](#Session).
 -}
 decoder : Sqlite.Decode.Decoder Session
 decoder =
@@ -377,14 +377,14 @@ decoder =
         )
 
 
-{-| Insert a session row into the `auth_sessions` table.
+{-| Insert a session row into the `sessions` table.
 -}
 insert : Sqlite.Database -> Session -> Task Sqlite.Error Sqlite.ExecutionSummary
 insert database { sessionToken, userId, createdAt, expiresAt, lastUsedAt, revokedAt } =
     Sqlite.execute database
         { statement =
             """
-            INSERT INTO auth_sessions (session_token, user_id, created_at, expires_at, last_used_at, revoked_at)
+            INSERT INTO sessions (session_token, user_id, created_at, expires_at, last_used_at, revoked_at)
             VALUES (:session_token, :user_id, :created_at, :expires_at, :last_used_at, :revoked_at)
             """
         , parameters =
@@ -411,7 +411,7 @@ getByToken database secureContext { token } =
                     { query =
                         """
                         SELECT session_token, user_id, created_at, expires_at, last_used_at, revoked_at
-                        FROM auth_sessions
+                        FROM sessions
                         WHERE session_token = :session_token
                         """
                     , parameters =
@@ -430,7 +430,7 @@ touch database { sessionToken, lastUsedAt } =
     Sqlite.execute database
         { statement =
             """
-            UPDATE auth_sessions
+            UPDATE sessions
             SET last_used_at = :last_used_at
             WHERE session_token = :session_token
             """
@@ -453,7 +453,7 @@ sweep database options =
                 Sqlite.execute database
                     { statement =
                         """
-                        DELETE FROM auth_sessions
+                        DELETE FROM sessions
                         WHERE revoked_at IS NOT NULL OR expires_at <= :now OR last_used_at <= :idle_cutoff
                         """
                     , parameters =

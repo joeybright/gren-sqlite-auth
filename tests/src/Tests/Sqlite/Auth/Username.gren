@@ -8,7 +8,7 @@ Each database-backed group interleaves work and assertions: a task runs, its
 result is awaited, a test runs against it, and only then does the next task run.
 Witnesses are minted directly from `Sqlite.Auth.Internal` so the credential
 layer stays out of it; `Sqlite.Auth.User.new` is used only as a fixture to
-satisfy the `auth_usernames.user_id` foreign key. Database state is always read
+satisfy the `usernames.user_id` foreign key. Database state is always read
 back through `Username.user`, the module's own lookup.
 
 @docs tests
