@@ -54,7 +54,7 @@ to enforce the idle timeout.
 
 ### Verifying sessions
 
-@docs verify
+@docs verify, VerifyError
 
 ### Revoking sessions
 
