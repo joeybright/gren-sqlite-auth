@@ -206,12 +206,9 @@ renameUsername :
     -> { from : String, to : String, password : String }
     -> Task Error {}
 renameUsername database secureContext { from, to, password } =
-    Task.map2
-        (\fromName toName -> { fromName = fromName, toName = toName })
-        (normalized from)
-        (normalized to)
+    normalized to
         |> Task.andThen
-            (\names ->
+            (\toName ->
                 resolve database from
                     |> Task.andThen
                         (\maybeUser ->
@@ -223,7 +220,7 @@ renameUsername database secureContext { from, to, password } =
                             when outcome is
                                 Password.Verified proof ->
                                     Username.change database
-                                        { from = names.fromName, to = names.toName }
+                                        { newUsername = toName }
                                         proof
                                         |> Task.mapError StorageError
                                         |> Task.map (\_ -> {})

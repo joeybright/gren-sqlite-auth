@@ -18,7 +18,7 @@ type User
 
 {-| Proof that the caller authenticated as a user — by a credential check
 (`Sqlite.Auth.Password.validate`, `Sqlite.Auth.Password.reset`) or by holding
-a live session (`Sqlite.Auth.Session.validate`). Demanded by
+a live session (`Sqlite.Auth.Session.verify`). Demanded by
 `Sqlite.Auth.Session.issue` and the credential- and identifier-changing steps.
 -}
 type Verified

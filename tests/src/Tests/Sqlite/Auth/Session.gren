@@ -87,7 +87,7 @@ issueAndVerifyTests database secureContext =
                         (\maybeSession ->
                             concat
                                 [ test "verify resolves a live token to its session"
-                                    (\_ -> Expect.equal (Just (User.id user)) (Maybe.map .userId maybeSession))
+                                    (\_ -> Expect.equal (Just (User.id user)) (Maybe.map (\outcome -> outcome.session.userId) maybeSession))
                                 , test "the stored token is the hash, not the raw token"
                                     (\_ -> Expect.notEqual issued.token issued.session.sessionToken)
                                 ]
@@ -105,11 +105,11 @@ verifyUnknownTests database secureContext =
         (Session.verify database secureContext Session.defaultOptions { token = "not-a-real-token" })
         (\maybeSession ->
             test "an unknown token resolves to no session"
-                (\_ -> Expect.equal Nothing (Maybe.map .userId maybeSession))
+                (\_ -> Expect.equal Nothing (Maybe.map (\outcome -> outcome.session.userId) maybeSession))
         )
 
 
-{-| `validate` mints the `Verified` witness for a live token and `Nothing` for an
+{-| `verify` mints the `Verified` witness for a live token and `Nothing` for an
 unknown one.
 -}
 validateTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
@@ -123,18 +123,18 @@ validateTests database secureContext =
                 (Session.issue database secureContext Session.defaultOptions (verifiedFor user))
                 (\issued ->
                     await
-                        "Validate the issued token"
-                        (Session.validate database secureContext Session.defaultOptions { token = issued.token })
+                        "Verify the issued token"
+                        (Session.verify database secureContext Session.defaultOptions { token = issued.token })
                         (\maybeProof ->
                             concat
-                                [ test "validate mints the Verified witness for a live token"
-                                    (\_ -> Expect.equal (Just (verifiedFor user)) maybeProof)
+                                [ test "verify mints the Verified witness for a live token"
+                                    (\_ -> Expect.equal (Just (verifiedFor user)) (Maybe.map .verified maybeProof))
                                 , await
-                                    "Validate an unknown token"
-                                    (Session.validate database secureContext Session.defaultOptions { token = "bogus" })
+                                    "Verify an unknown token"
+                                    (Session.verify database secureContext Session.defaultOptions { token = "bogus" })
                                     (\maybeUnknownProof ->
-                                        test "validate yields no witness for an unknown token"
-                                            (\_ -> Expect.equal Nothing maybeUnknownProof)
+                                        test "verify yields no witness for an unknown token"
+                                            (\_ -> Expect.equal Nothing (Maybe.map .verified maybeUnknownProof))
                                     )
                                 ]
                         )
@@ -163,7 +163,7 @@ revokeTests database secureContext =
                                 (Session.verify database secureContext Session.defaultOptions { token = issued.token })
                                 (\maybeSession ->
                                     test "a revoked token no longer verifies"
-                                        (\_ -> Expect.equal Nothing (Maybe.map .userId maybeSession))
+                                        (\_ -> Expect.equal Nothing (Maybe.map (\outcome -> outcome.session.userId) maybeSession))
                                 )
                         )
                 )
@@ -213,11 +213,11 @@ revokeAllTests database secureContext =
                                                                         (\maybeB ->
                                                                             concat
                                                                                 [ test "revokeAll kills the target's first session"
-                                                                                    (\_ -> Expect.equal Nothing (Maybe.map .userId maybeA1))
+                                                                                    (\_ -> Expect.equal Nothing (Maybe.map (\outcome -> outcome.session.userId) maybeA1))
                                                                                 , test "revokeAll kills the target's second session"
-                                                                                    (\_ -> Expect.equal Nothing (Maybe.map .userId maybeA2))
+                                                                                    (\_ -> Expect.equal Nothing (Maybe.map (\outcome -> outcome.session.userId) maybeA2))
                                                                                 , test "revokeAll leaves a bystander's session live"
-                                                                                    (\_ -> Expect.equal (Just (User.id userB)) (Maybe.map .userId maybeB))
+                                                                                    (\_ -> Expect.equal (Just (User.id userB)) (Maybe.map (\outcome -> outcome.session.userId) maybeB))
                                                                                 ]
                                                                         )
                                                                 )
@@ -253,7 +253,7 @@ expiredSessionTests database secureContext =
                         (Session.verify database secureContext Session.defaultOptions { token = issued.token })
                         (\maybeSession ->
                             test "an expired session no longer verifies"
-                                (\_ -> Expect.equal Nothing (Maybe.map .userId maybeSession))
+                                (\_ -> Expect.equal Nothing (Maybe.map (\outcome -> outcome.session.userId) maybeSession))
                         )
                 )
         )
@@ -282,7 +282,7 @@ idleSessionTests database secureContext =
                         (Session.verify database secureContext idleOptions { token = issued.token })
                         (\maybeSession ->
                             test "an idle-timed-out session no longer verifies"
-                                (\_ -> Expect.equal Nothing (Maybe.map .userId maybeSession))
+                                (\_ -> Expect.equal Nothing (Maybe.map (\outcome -> outcome.session.userId) maybeSession))
                         )
                 )
         )

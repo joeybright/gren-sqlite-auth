@@ -207,7 +207,7 @@ changeRenameTests database secureContext suffix =
                                 (\_ ->
                                     await
                                         "Rename with the owner's proof"
-                                        (Username.change database { from = from, to = to } (Internal.Verified { userId = User.id user }))
+                                        (Username.change database { newUsername = to } (Internal.Verified { userId = User.id user }))
                                         (\_ ->
                                             await
                                                 "Look up the old username after renaming"
@@ -255,7 +255,7 @@ changeScopingTests database secureContext suffix =
                                         (\_ ->
                                             await
                                                 "Rename with a mismatched proof"
-                                                (Username.change database { from = from, to = to } (Internal.Verified { userId = User.id userB }))
+                                                (Username.change database { newUsername = to } (Internal.Verified { userId = User.id userB }))
                                                 (\_ ->
                                                     await
                                                         "Look up the original username after the mismatched rename"
@@ -303,7 +303,7 @@ changeTakenTests database secureContext suffix =
                                         (\_ ->
                                             awaitError
                                                 "Rename the second username to the first"
-                                                (Username.change database { from = two, to = one } (Internal.Verified { userId = User.id user }))
+                                                (Username.change database { newUsername = one } (Internal.Verified { userId = User.id user }))
                                                 (\_ ->
                                                     test "renaming to a taken username fails on the primary key"
                                                         (\_ -> Expect.pass)
