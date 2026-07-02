@@ -4,8 +4,10 @@ module Main exposing (main)
 
 import Crypto
 import FileSystem
+import FileSystem.Path
 import Init
 import Node
+import Task exposing ( Task )
 import Test.Runner.Effectful exposing ( await, concat )
 import Tests.PhcString
 import Tests.Sqlite.Auth.Password
@@ -24,15 +26,39 @@ main =
                 (\fsPermission ->
                     await "Get secure context for Crypto functions" Crypto.getSecureContext
                         (\secureContext ->
-                            concat
-                                [ Test.Runner.Effectful.wrap Tests.PhcString.tests
-                                , Tests.Sqlite.Auth.User.tests fsPermission secureContext
-                                , Tests.Sqlite.Auth.Password.tests fsPermission secureContext
-                                , Tests.Sqlite.Auth.Username.tests fsPermission secureContext
-                                , Tests.Sqlite.Auth.Session.tests fsPermission secureContext
-                                , Tests.SqliteAuth.tests fsPermission secureContext
-                                ]
+                            await "Remove test databases left by a previous run" (removeTestDatabases fsPermission)
+                                (\_ ->
+                                    concat
+                                        [ Test.Runner.Effectful.wrap Tests.PhcString.tests
+                                        , Tests.Sqlite.Auth.User.tests fsPermission secureContext
+                                        , Tests.Sqlite.Auth.Password.tests fsPermission secureContext
+                                        , Tests.Sqlite.Auth.Username.tests fsPermission secureContext
+                                        , Tests.Sqlite.Auth.Session.tests fsPermission secureContext
+                                        , Tests.SqliteAuth.tests fsPermission secureContext
+                                        ]
+                                )
                         )
                         |> Test.Runner.Effectful.run env
                 )
         )
+
+
+{-| Delete the on-disk databases every suite writes, tolerating files that do
+not exist, so each run starts from empty tables instead of accreting rows.
+-}
+removeTestDatabases : FileSystem.Permission -> Task x {}
+removeTestDatabases fsPermission =
+    [ "test-sqlite-auth.sqlite"
+    , "test-sqlite-auth-user.sqlite"
+    , "test-sqlite-auth-username.sqlite"
+    , "test-sqlite-auth-password.sqlite"
+    , "test-sqlite-auth-session.sqlite"
+    ]
+        |> Array.map
+            (\name ->
+                FileSystem.remove fsPermission { recursive = False } (FileSystem.Path.fromPosixString name)
+                    |> Task.map (\_ -> {})
+                    |> Task.onError (\_ -> Task.succeed {})
+            )
+        |> Task.sequence
+        |> Task.map (\_ -> {})

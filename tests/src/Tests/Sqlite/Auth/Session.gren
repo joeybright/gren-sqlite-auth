@@ -22,7 +22,10 @@ import Sqlite
 import Sqlite.Auth.Internal as Internal
 import Sqlite.Auth.Session as Session
 import Sqlite.Auth.User as User
+import Sqlite.Decode
+import Sqlite.Encode
 import Sqlite.Migrate
+import Task exposing ( Task )
 import Test
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
 
@@ -59,10 +62,14 @@ tests fsPermission secureContext =
                         [ issueAndVerifyTests database secureContext
                         , verifyUnknownTests database secureContext
                         , validateTests database secureContext
+                        , touchOnUseTests database secureContext
+                        , tokenUniquenessTests database secureContext
                         , revokeTests database secureContext
+                        , revokeUnknownTests database secureContext
                         , revokeAllTests database secureContext
                         , expiredSessionTests database secureContext
                         , idleSessionTests database secureContext
+                        , issueSweepTests database secureContext
                         ]
                 )
         )
@@ -142,6 +149,63 @@ validateTests database secureContext =
         )
 
 
+{-| Successful verification is what keeps a session alive: each `verify` bumps
+`lastUsedAt`, and the returned session reflects the bump.
+-}
+touchOnUseTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+touchOnUseTests database secureContext =
+    await
+        "Create a user (touch)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Issue a session (touch)"
+                (Session.issue database secureContext Session.defaultOptions (verifiedFor user))
+                (\issued ->
+                    await
+                        "Verify the token a first time (touch)"
+                        (Session.verify database secureContext Session.defaultOptions { token = issued.token })
+                        (\firstOutcome ->
+                            concat
+                                [ test "the first verify bumps lastUsedAt to at least the issue time"
+                                    (\_ -> Expect.atLeast issued.session.lastUsedAt firstOutcome.session.lastUsedAt)
+                                , await
+                                    "Verify the token a second time (touch)"
+                                    (Session.verify database secureContext Session.defaultOptions { token = issued.token })
+                                    (\secondOutcome ->
+                                        test "a second verify succeeds and reflects a bumped lastUsedAt"
+                                            (\_ -> Expect.atLeast firstOutcome.session.lastUsedAt secondOutcome.session.lastUsedAt)
+                                    )
+                                ]
+                        )
+                )
+        )
+
+
+{-| Two issued sessions carry distinct raw tokens — a canary for a broken or
+misused random source.
+-}
+tokenUniquenessTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tokenUniquenessTests database secureContext =
+    await
+        "Create a user (uniqueness)"
+        (User.new database secureContext)
+        (\user ->
+            await
+                "Issue a first session (uniqueness)"
+                (Session.issue database secureContext Session.defaultOptions (verifiedFor user))
+                (\first ->
+                    await
+                        "Issue a second session (uniqueness)"
+                        (Session.issue database secureContext Session.defaultOptions (verifiedFor user))
+                        (\second ->
+                            test "two issued sessions carry distinct raw tokens"
+                                (\_ -> Expect.notEqual first.token second.token)
+                        )
+                )
+        )
+
+
 {-| A revoked token no longer verifies. `revoke` sweeps the revoked row, so the
 token then fails with `TokenNotFound`.
 -}
@@ -168,6 +232,20 @@ revokeTests database secureContext =
                                 )
                         )
                 )
+        )
+
+
+{-| Revoking a token that names no session succeeds without touching anything —
+the documented contract, so a logout can never fail on an already-dead token.
+-}
+revokeUnknownTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+revokeUnknownTests database secureContext =
+    await
+        "Revoke a token that names no session"
+        (Session.revoke database secureContext Session.defaultOptions { token = "not-a-real-token" })
+        (\_ ->
+            test "revoking an unknown token succeeds"
+                (\_ -> Expect.pass)
         )
 
 
@@ -258,6 +336,66 @@ expiredSessionTests database secureContext =
                         )
                 )
         )
+
+
+{-| `issue` sweeps dead session rows: after any later issue, an expired session
+row is gone from the table, not just unverifiable.
+-}
+issueSweepTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+issueSweepTests database secureContext =
+    let
+        expiredOptions : Session.Options
+        expiredOptions =
+            { Session.defaultOptions | lifetimeMillis = 0 }
+    in
+    await
+        "Create a user whose session expires immediately (sweep)"
+        (User.new database secureContext)
+        (\expiredUser ->
+            await
+                "Issue a session that expires immediately (sweep)"
+                (Session.issue database secureContext expiredOptions (verifiedFor expiredUser))
+                (\_ ->
+                    await
+                        "Create a second user (sweep)"
+                        (User.new database secureContext)
+                        (\otherUser ->
+                            await
+                                "Issue a session for the second user (sweep)"
+                                (Session.issue database secureContext Session.defaultOptions (verifiedFor otherUser))
+                                (\_ ->
+                                    await
+                                        "Count the first user's session rows"
+                                        (countSessionRows database { userId = User.id expiredUser })
+                                        (\count ->
+                                            test "the expired session row was swept"
+                                                (\_ -> Expect.equal 0 count)
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| Count a user's rows in `sessions` directly — the one place a raw query is
+needed, because sweeping is about the row being gone, not about any observable
+`verify` outcome.
+-}
+countSessionRows : Sqlite.Database -> { userId : String } -> Task Sqlite.Error Int
+countSessionRows database { userId } =
+    Sqlite.getOne database
+        { query =
+            """
+            SELECT COUNT(*) AS row_count
+            FROM sessions
+            WHERE user_id = :user_id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "user_id" userId
+            ]
+        , rowDecoder =
+            Sqlite.Decode.int "row_count" Sqlite.Decode.succeed
+        }
 
 
 {-| A session unused past the idle timeout fails to verify with `IdleTimeout` —

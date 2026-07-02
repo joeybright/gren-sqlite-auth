@@ -204,4 +204,119 @@ tests =
                 Sqlite.Auth.Password.PhcString.parse "$id$m=65536,bad"
                     |> Expect.equal (Err (Sqlite.Auth.Password.PhcString.KvPairMissingEquals "bad"))
             )
+        , fuzzWith { runs = 200, distribution = noDistribution }
+            phcFuzzer
+            "toString >> parse round-trips any well-formed PhcString"
+            (\phc ->
+                Sqlite.Auth.Password.PhcString.toString phc
+                    |> Sqlite.Auth.Password.PhcString.parse
+                    |> Expect.equal (Ok { phc | tail = padTail phc.tail })
+            )
         ]
+
+
+{-| A fuzzer for well-formed `PhcString` records: segments drawn from
+alphabets the format round-trips losslessly (no `$`, `=`, or `,` in the wrong
+places, no trailing base64 padding).
+-}
+phcFuzzer : Fuzzer Sqlite.Auth.Password.PhcString.PhcString
+phcFuzzer =
+    Fuzz.map3
+        (\id params tail -> { id = id, params = params, tail = tail })
+        (stringFrom "abcdefghijklmnopqrstuvwxyz0123456789-" 1 10)
+        paramsFuzzer
+        tailFuzzer
+
+
+{-| A fuzzer for the params dict, drawing names from a small alphabet that
+includes `v` so the version-hoisting path in `toString` gets exercised.
+-}
+paramsFuzzer : Fuzzer (Dict.Dict String String)
+paramsFuzzer =
+    Fuzz.arrayOfLengthBetween 0 3
+        (Fuzz.map2
+            (\name value -> 
+                { name = name
+                , value = value 
+                }
+            )
+            (stringFrom "imtpv" 1 3)
+            (stringFrom "0123456789" 0 4)
+        )
+        |> Fuzz.map 
+            (Array.foldl 
+                (\{ name, value } -> 
+                    Dict.set name value
+                )
+                Dict.empty
+            )
+
+
+{-| A fuzzer over all three tail shapes, with salt and hash chunks drawn from
+the base64 alphabet (never `=`, so `toString` strips nothing).
+-}
+tailFuzzer : Fuzzer Sqlite.Auth.Password.PhcString.Tail
+tailFuzzer =
+    Fuzz.oneOf
+        [ Fuzz.constant Sqlite.Auth.Password.PhcString.NoTail
+        , Fuzz.map Sqlite.Auth.Password.PhcString.SaltOnly base64Chunk
+        , Fuzz.map2
+            (\salt hash -> 
+                Sqlite.Auth.Password.PhcString.SaltAndHash 
+                    { salt = salt
+                    , hash = hash 
+                    }
+            )
+            base64Chunk
+            base64Chunk
+        ]
+
+
+{-| A fuzzer for an unpadded base64 chunk.
+-}
+base64Chunk : Fuzzer String
+base64Chunk =
+    stringFrom "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" 0 12
+
+
+{-| A fuzzer for strings of the given length range drawn from a fixed alphabet.
+-}
+stringFrom : String -> Int -> Int -> Fuzzer String
+stringFrom alphabet minLength maxLength =
+    Fuzz.arrayOfLengthBetween minLength maxLength 
+        (Fuzz.oneOfValues 
+            (String.toArray alphabet)
+        )
+        |> Fuzz.map String.fromArray
+
+
+{-| What the parser hands back for a tail `toString` emitted: salt and hash
+re-padded to a multiple of four, mirroring the parser's `padBase64`.
+-}
+padTail : Sqlite.Auth.Password.PhcString.Tail -> Sqlite.Auth.Password.PhcString.Tail
+padTail tail =
+    when tail is
+        Sqlite.Auth.Password.PhcString.NoTail ->
+            Sqlite.Auth.Password.PhcString.NoTail
+
+        Sqlite.Auth.Password.PhcString.SaltOnly salt ->
+            Sqlite.Auth.Password.PhcString.SaltOnly (pad salt)
+
+        Sqlite.Auth.Password.PhcString.SaltAndHash { salt, hash } ->
+            Sqlite.Auth.Password.PhcString.SaltAndHash { salt = pad salt, hash = pad hash }
+
+
+{-| Re-pad an unpadded base64 chunk with trailing `=` to a multiple of four,
+the way the parser does before handing chunks back.
+-}
+pad : String -> String
+pad string =
+    when Math.remainderBy 4 (String.count string) is
+        2 ->
+            string ++ "=="
+
+        3 ->
+            string ++ "="
+
+        _ ->
+            string

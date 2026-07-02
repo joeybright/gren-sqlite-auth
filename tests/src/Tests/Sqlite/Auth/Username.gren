@@ -74,6 +74,7 @@ tests fsPermission secureContext =
                                 , changeRenameTests database secureContext suffix
                                 , changeScopingTests database secureContext suffix
                                 , changeTakenTests database secureContext suffix
+                                , changeWithoutUsernameTests database secureContext suffix
                                 ]
                         )
                 )
@@ -275,6 +276,33 @@ changeScopingTests database secureContext suffix =
                                                         )
                                                 )
                                         )
+                                )
+                        )
+                )
+        )
+
+
+{-| Renaming a user who holds no username row is a silent no-op: the task
+succeeds, and the target name is not created. Surprising, so pinned here.
+-}
+changeWithoutUsernameTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeWithoutUsernameTests database secureContext suffix =
+    normalizeUsername ("orphan-" ++ suffix)
+        (\target ->
+            await
+                "Create a user with no username (no-op)"
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        "Rename the user who has no username row"
+                        (Username.change database { newUsername = target } (Internal.Verified { userId = User.id user }))
+                        (\_ ->
+                            await
+                                "Look up the target username after the no-op rename"
+                                (Username.user database { username = target })
+                                (\maybeOwner ->
+                                    test "renaming without a username row creates nothing"
+                                        (\_ -> Expect.equal Nothing (Maybe.map User.id maybeOwner))
                                 )
                         )
                 )
