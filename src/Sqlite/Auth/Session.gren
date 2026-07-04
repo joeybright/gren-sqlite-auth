@@ -136,13 +136,9 @@ type alias Options =
 {-| The default, recommended, options for sessions: a 30-day lifetime and a
 7-day idle timeout.
 
-    { lifetimeMillis = 30 * 24 * 60 * 60 * 1000
-    , idleTimeoutMillis = 7 * 24 * 60 * 60 * 1000
+    { lifetimeMillis = 30 * 24 * 60 * 60 * 1000 -- 30 days
+    , idleTimeoutMillis = 7 * 24 * 60 * 60 * 1000 -- 7 days
     }
-
-Pass as-is, or override individual fields:
-
-    { Session.defaultOptions | lifetimeMillis = 60 * 60 * 1000 }
 -}
 defaultOptions : Options
 defaultOptions =
@@ -151,13 +147,15 @@ defaultOptions =
     }
 
 
-{-| Issue a session for a verified user, the final step of a login pipeline.
-This requires the `Verified` type, which a credential check such as
-[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) produces, so a
-session can never be issued for a user who merely exists.
+{-| Issue a session for a verified user. This requires the `Verified` type, 
+which a credential check such as 
+[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) produces.
 
 Returns `{ session, token }`. Hand `token` to the client exactly once; it is a
-base64 string. Only the token's hash is stored in the database.
+standard base64 string, so it can contain `+`, `/`, and `=`. This library does
+not make the token safe for any particular transport: if it travels in a URL,
+cookie, or form field, encode it for that context and hand [`verify`](#verify)
+back the exact original string. Only the token's hash is stored in the database.
 
     Username.user database { username = candidateName }
         |> Task.andThen (Password.validate database secureContext options candidate)
@@ -211,7 +209,8 @@ issue database secureContext options (Internal.Verified { userId }) =
 fault; the rest are expected rejections — the token names no live session.
 
   - `TokenNotFound` — the token matches no session row at all.
-  - `Revoked` — the session was revoked.
+  - `Revoked` — the session was revoked, including when the revocation lands
+    while the verification is in flight.
   - `Expired` — the session is past its absolute lifetime.
   - `IdleTimeout` — the session went unused for longer than `idleTimeoutMillis`.
 
@@ -225,7 +224,7 @@ type VerifyError
 
 
 {-| Verify a presented raw token, succeeding with the [`Session`](#Session) it
-names together with the `Verified` witness for its user. A successful
+names together with the `Verified` type for the user the token relates to. A successful
 verification bumps the session's `last_used_at` to now, and the returned session
 reflects it. Anything that makes the token unusable — a revoked, expired, or
 idle session, or a token matching no session at all — fails the task with the
@@ -240,54 +239,91 @@ The `verified` field lets a live session authorize actions that require
                 Username.change database { newUsername = new } verified
             )
 
-This trades "credential proven just now" for "holds a live session": a stolen
-token can reach every action `Verified` gates, including
-[`Sqlite.Auth.Password.change`](Sqlite.Auth.Password#change). Require the
-stricter proof from
-[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) where that is
-not acceptable.
+This functionality opens stolen tokens up to being able to complete any action that
+requires the `Verified` type in this package. As such, ensure you're following best-practices
+when sending and saving tokens to a client! For example, use HTTP-only cookies!
+
+The read and the touch run in a single transaction, and the touch re-checks
+liveness in its own `WHERE` clause, so a session revoked while a verification
+is in flight cannot slip through — it fails with `Revoked`.
 -}
 verify : Sqlite.Database -> Crypto.SecureContext -> Options -> { token : String } -> Task VerifyError { session : Session, verified : Internal.Verified }
 verify database secureContext options input =
-    getByToken database secureContext input
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.inTransaction database
+                    (getByToken database secureContext input
+                        |> Task.andThen
+                            (\maybeSession ->
+                                when maybeSession is
+                                    Nothing ->
+                                        Task.succeed NoSession
+
+                                    Just session ->
+                                        when session.revokedAt is
+                                            Just _ ->
+                                                Task.succeed RevokedSession
+
+                                            Nothing ->
+                                                if session.expiresAt <= now then
+                                                    Task.succeed ExpiredSession
+
+                                                else if session.lastUsedAt + options.idleTimeoutMillis <= now then
+                                                    Task.succeed IdleSession
+
+                                                else
+                                                    touch database options { sessionToken = session.sessionToken, now = now }
+                                                        |> Task.map
+                                                            (\summary ->
+                                                                if summary.changes == 0 then
+                                                                    RevokedSession
+
+                                                                else
+                                                                    LiveSession { session | lastUsedAt = now }
+                                                            )
+                            )
+                    )
+            )
         |> Task.mapError StorageError
         |> Task.andThen
-            (\maybeSession ->
-                Utils.Time.nowMillis
-                    |> Task.andThen
-                        (\now ->
-                            when maybeSession is
-                                Nothing ->
-                                    Task.fail TokenNotFound
+            (\outcome ->
+                when outcome is
+                    LiveSession session ->
+                        Task.succeed
+                            { session = session
+                            , verified = Internal.Verified { userId = session.userId }
+                            }
 
-                                Just session ->
-                                    when session.revokedAt is
-                                        Just _ ->
-                                            Task.fail Revoked
+                    NoSession ->
+                        Task.fail TokenNotFound
 
-                                        Nothing ->
-                                            if session.expiresAt <= now then
-                                                Task.fail Expired
+                    RevokedSession ->
+                        Task.fail Revoked
 
-                                            else if session.lastUsedAt + options.idleTimeoutMillis <= now then
-                                                Task.fail IdleTimeout
+                    ExpiredSession ->
+                        Task.fail Expired
 
-                                            else
-                                                touch database { sessionToken = session.sessionToken, lastUsedAt = now }
-                                                    |> Task.mapError StorageError
-                                                    |> Task.map
-                                                        (\_ ->
-                                                            let
-                                                                updated : Session
-                                                                updated =
-                                                                    { session | lastUsedAt = now }
-                                                            in
-                                                            { session = updated
-                                                            , verified = Internal.Verified { userId = updated.userId }
-                                                            }
-                                                        )
-                        )
+                    IdleSession ->
+                        Task.fail IdleTimeout
             )
+
+
+{-| What the transactional read-and-touch inside [`verify`](#verify) found the
+presented token to name. Each dead variant maps to the matching
+[`VerifyError`](#VerifyError); this type exists because a task inside
+[`Sqlite.inTransaction`](Sqlite#inTransaction) can only fail with
+`Sqlite.Error`, so the expected rejections travel as values. A
+[`touch`](#touch) that changed zero rows means the session stopped being live
+between the read and the write — revocation is the only cause the shared `now`
+leaves open — so it counts as `RevokedSession`.
+-}
+type TouchOutcome
+    = LiveSession Session
+    | NoSession
+    | RevokedSession
+    | ExpiredSession
+    | IdleSession
 
 
 {-| Revoke a session by its presented raw token. If the given token does
@@ -423,20 +459,28 @@ getByToken database secureContext { token } =
 
 
 {-| Bump a session row's `last_used_at` — the "touch on use" behind
-[`verify`](#verify). Keyed by the stored token hash, not the raw token.
+[`verify`](#verify). Keyed by the stored token hash, not the raw token. The
+`WHERE` clause only matches a live row: not revoked, not past its absolute
+lifetime, and not idle. A revocation landing after the row was read therefore
+cannot be overwritten — the update changes zero rows, and the returned
+summary's `changes` count says so.
 -}
-touch : Sqlite.Database -> { sessionToken : String, lastUsedAt : Int } -> Task Sqlite.Error Sqlite.ExecutionSummary
-touch database { sessionToken, lastUsedAt } =
+touch : Sqlite.Database -> Options -> { sessionToken : String, now : Int } -> Task Sqlite.Error Sqlite.ExecutionSummary
+touch database options { sessionToken, now } =
     Sqlite.execute database
         { statement =
             """
             UPDATE sessions
-            SET last_used_at = :last_used_at
+            SET last_used_at = :now
             WHERE session_token = :session_token
+                AND revoked_at IS NULL
+                AND expires_at > :now
+                AND last_used_at > :idle_cutoff
             """
         , parameters =
-            [ Sqlite.Encode.int "last_used_at" lastUsedAt
+            [ Sqlite.Encode.int "now" now
             , Sqlite.Encode.string "session_token" sessionToken
+            , Sqlite.Encode.int "idle_cutoff" (now - options.idleTimeoutMillis)
             ]
         }
 
