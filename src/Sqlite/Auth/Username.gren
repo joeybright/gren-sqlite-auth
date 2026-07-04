@@ -42,7 +42,13 @@ find a user by that username. These functions ensure usernames are properly
 formatted before being saved to or searched within the database.
 
 If you want to manipulate a username in any way, you must do so to the raw
-`String` before calling `fromString`.
+`String` before calling `fromString`. That includes content policy:
+[`normalize`](#normalize) only trims, rejects empty strings, and lowercases.
+
+Invisible characters (like zero-width spaces) and lookalike glyphs are not
+removed. Two visually identical usernames can be distinct rows. If that matters 
+to your application — for example, to prevent impersonation — reject or strip
+such characters before calling [`fromString`](#fromString).
 
 @docs Username, Raw, Normalized
 @docs fromString
@@ -176,16 +182,13 @@ new database { username } ((Internal.User { userId }) as userWitness) =
             )
 
 
-{-| Change a users username. The user whos username will be changed depends
-on the given `Verified` type.
+{-| Change a user's username. Which user's username changes depends on the
+given `Verified` type.
 
-You can obtain the `Verified` type by using any functions in this package that 
-verify credentials. This restriction forces callers of this function to go
-through the process of properly verifying who a user is before being able to
-complete actions on their behalf.
-
-At the time of writing, the only function that can produce the `Verified` type
-is the [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) function.
+A password check with
+[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) creates the
+`Verified` type, and so does verifying a live session through
+[`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify).
 -}
 change : Sqlite.Database -> { newUsername : Username Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
 change database { newUsername } ((Internal.Verified { userId }) as verified) =
