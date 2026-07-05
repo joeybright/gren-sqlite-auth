@@ -13,12 +13,16 @@ The spec lives at <https://github.com/P-H-C/phc-string-format>.
 
 This module's job is *string → structured data*. It deliberately does no
 semantic validation: charset rules, length limits, base64 well-formedness,
-duplicate-name checks, and algorithm-specific requirements are the
-consumer's responsibility. The one normalization it does perform is
-re-padding the salt and hash: PHC stores them as unpadded base64, so the
-parser restores the trailing `=` so the chunks are ready to decode.
-Duplicate parameter names are collapsed by the underlying `Dict`. The
-version (`v=<n>`) lives in `params` under the key `"v"`.
+and algorithm-specific requirements are the consumer's responsibility. The
+one normalization it does perform is re-padding the salt and hash: PHC
+stores them as unpadded base64, so the parser restores the trailing `=` so
+the chunks are ready to decode.
+
+Two structural details are lossy and cannot be checked after the fact:
+duplicate parameter names collapse to the last occurrence, and multiple
+kv segments merge into the single `params` `Dict`. Callers that need to
+reject non-canonical input on those grounds must not rely on `parse`.
+The version (`v=<n>`) lives in `params` under the key `"v"`.
 
 The parser is a sequential, no-backtracking state machine driven by
 `String.Parser.Advanced.loop`. Each chomp is terminator-driven: we walk
@@ -134,6 +138,14 @@ isDomainDeadEnd de =
 string form. If `params` contains the key `"v"` it is emitted as its
 own `$v=<value>` segment; any remaining params are emitted as a
 single comma-separated segment.
+
+The output is canonical for *this module*, not input-preserving:
+params are emitted in the `Dict`'s alphabetical key order, so
+algorithm-mandated orders (like Argon2's `m,t,p`) are not preserved
+and strict external decoders may reject the result. Fields are also
+emitted verbatim — a `$`, `,`, or `=` inside `id`, a param, the salt,
+or the hash is neither escaped nor rejected, and produces a string
+that parses back to a different structure.
 -}
 toString : PhcString -> String
 toString phc =
@@ -171,7 +183,7 @@ toString phc =
 
 
 {-| Strip the trailing `=` padding so the output is spec-conforming
-PHC. Recursive but bounded to two iterations by the base64 rules.
+PHC. Tail-recursive, so safe on any input.
 -}
 stripTrailingEquals : String -> String
 stripTrailingEquals string =
