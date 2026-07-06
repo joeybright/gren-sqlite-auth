@@ -1,0 +1,658 @@
+module Sqlite.Auth.Email exposing
+    ( migrationV1
+    , Email
+    , Raw
+    , Normalized
+    , fromString
+    , normalize
+    , toString
+    , new
+    , change
+    , user
+    , Verification(..)
+    , Options
+    , defaultOptions
+    , requestVerification
+    , verify
+    , VerificationError(..)
+    )
+
+{-| Manage users' email addresses in the database, including the whole
+confirm-your-email loop — everything except sending the mail.
+
+## Expected database schema
+
+The minimum required table schemas for this module to work are below:
+
+    CREATE TABLE IF NOT EXISTS emails (
+        email TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL,
+        verified_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        verification_token TEXT PRIMARY KEY NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        FOREIGN KEY (email)
+            REFERENCES emails(email)
+            ON DELETE CASCADE
+    );
+
+In `emails`, `email` is the normalized address as a `String` and `user_id`
+references the users (in the [Sqlite.Auth.User module](Sqlite.Auth.User)).
+`verified_at` is the posix timestamp the address was confirmed, or `NULL`
+while it is unconfirmed. In `email_verification_tokens`,
+`verification_token` stores the SHA-256 hash of an issued token — never the
+raw token — and `email` is unique so each address has at most one live
+token. All `created_at`, `updated_at`, and `expires_at` values are posix
+timestamps.
+
+## Migrations
+
+@docs migrationV1
+
+# Creating an email
+
+You must create an `Email` before being able to save it for a user or find
+a user by that address. These functions ensure addresses are structurally
+valid and consistently cased before being saved to or searched within the
+database.
+
+If you want to manipulate an address in any way, you must do so to the raw
+`String` before calling `fromString`. That includes anything beyond
+structure: [`normalize`](#normalize) only trims, lowercases, and checks the
+address against the WHATWG email grammar via
+[`Sqlite.Auth.Email.Parser`](Sqlite.Auth.Email.Parser).
+
+Lowercasing the whole address is a deliberate simplification: RFC 5321
+technically allows mail hosts to treat local parts as case-sensitive, but
+in practice none do, and case-folding prevents `Alice@example.com` and
+`alice@example.com` from becoming distinct rows. If your application must
+preserve local-part case, keep the original string on your side.
+
+@docs Email, Raw, Normalized
+@docs fromString
+@docs normalize
+@docs toString
+
+# Working with emails
+
+Adding & changing email addresses are supported, as is finding users by a
+given address.
+
+@docs new
+@docs change
+@docs user
+@docs Verification
+
+# Verifying an email
+
+Proving a user controls an address is a two-phase flow:
+[`requestVerification`](#requestVerification) mints a single-use token for
+you to embed in a mail to that address, and [`verify`](#verify) redeems the
+token the user brings back, stamping the row verified.
+
+@docs Options, defaultOptions
+@docs requestVerification
+@docs verify
+@docs VerificationError
+
+-}
+
+import Bytes
+import Crypto
+import Sqlite
+import Sqlite.Auth.Email.Parser as Parser
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Decode
+import Sqlite.Encode
+import Task exposing ( Task )
+import Utils.Base64
+import Utils.Crypto
+import Utils.Time
+
+
+{-| Migrate the database to add the `emails` and `email_verification_tokens`
+tables with the minimum required schema for this module to operate.
+
+This migration is meant to be plug-and-play with the `gren-sqlite-migrate`
+package. If you are using a different method of migration, the individual
+SQL statements can be extracted from the records `statements` field.
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Sqlite.Auth.Email.migrationV1` - Add emails and email_verification_tokens tables"
+    , statements =
+        [ addEmailsTableMigrationSQL
+        , addEmailVerificationTokensTableMigrationSQL
+        ]
+    }
+
+
+{-|-}
+addEmailsTableMigrationSQL : String
+addEmailsTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS emails (
+        email TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL,
+        verified_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+    """
+
+
+{-|-}
+addEmailVerificationTokensTableMigrationSQL : String
+addEmailVerificationTokensTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        verification_token TEXT PRIMARY KEY NOT NULL,
+        email TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        FOREIGN KEY (email)
+            REFERENCES emails(email)
+            ON DELETE CASCADE
+    );
+    """
+
+
+{-| A raw, non-normalized, email address.
+-}
+type Raw
+    = Raw
+
+
+{-| A normalized email address — trimmed, lowercased, structurally valid,
+and ready to be saved to the database.
+-}
+type Normalized
+    = Normalized
+
+
+{-| An email address, with a phantom type state of either `Raw` or
+`Normalized`.
+-}
+type Email state
+    = Email String
+
+
+{-| Turn a `String` into a raw [`Email`](#Email), ready to
+[`normalize`](#normalize).
+-}
+fromString : String -> Email Raw
+fromString =
+    Email
+
+
+{-| Trim and lowercase the address, then check it against the WHATWG email
+grammar. The error is the parser's own, naming exactly what made the
+address invalid.
+-}
+normalize : Email Raw -> Result Parser.Error (Email Normalized)
+normalize (Email string) =
+    let
+        lowered : String
+        lowered =
+            String.toLower (String.trim string)
+    in
+    Parser.parse lowered
+        |> Result.map (\_ -> Email lowered)
+
+
+{-| Get the underlying email address `String`.
+-}
+toString : Email state -> String
+toString (Email string) =
+    string
+
+
+{-| Whether an address has been confirmed through [`verify`](#verify).
+`Verified` carries the posix timestamp the confirmation happened.
+-}
+type Verification
+    = Verified { verifiedAt : Int }
+    | Unverified
+
+
+{-| Add an email address to the given user, returning the user for further
+pipeline steps. The passed address must be normalized using the
+[`normalize`](#normalize) function. New addresses always start
+[`Unverified`](#Verification).
+-}
+new : Sqlite.Database -> { email : Email Normalized } -> Internal.User -> Task Sqlite.Error Internal.User
+new database { email } ((Internal.User { userId }) as userWitness) =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        INSERT INTO emails (email, user_id, verified_at, created_at, updated_at)
+                        VALUES (:email, :user_id, NULL, :created_at, :updated_at)
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.string "email" (toString email)
+                        , Sqlite.Encode.string "user_id" userId
+                        , Sqlite.Encode.int "created_at" now
+                        , Sqlite.Encode.int "updated_at" now
+                        ]
+                    }
+                    |> Task.map (\_ -> userWitness)
+            )
+
+
+{-| Change a user's email address. Which user's address changes depends on
+the given `Verified` type.
+
+A password check with
+[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) creates the
+`Verified` type, and so does verifying a live session through
+[`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify).
+
+The new address starts over [`Unverified`](#Verification), and any
+outstanding verification token for the user's addresses is deleted — a
+link mailed to the old address must not be able to confirm the new one.
+All operations are completed in a SQLite transaction, preventing data
+corruption.
+-}
+change : Sqlite.Database -> { newEmail : Email Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
+change database { newEmail } ((Internal.Verified { userId }) as verified) =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.inTransaction database
+                    (deleteVerificationTokenRowsForUser database { userId = userId }
+                        |> Task.andThen
+                            (\_ ->
+                                Sqlite.execute database
+                                    { statement =
+                                        """
+                                        UPDATE emails
+                                        SET email = :to, verified_at = NULL, updated_at = :updated_at
+                                        WHERE user_id = :user_id
+                                        """
+                                    , parameters =
+                                        [ Sqlite.Encode.string "to" (toString newEmail)
+                                        , Sqlite.Encode.int "updated_at" now
+                                        , Sqlite.Encode.string "user_id" userId
+                                        ]
+                                    }
+                            )
+                    )
+                    |> Task.map (\_ -> verified)
+            )
+
+
+{-| Get the user who owns the given email address and whether the address
+has been verified. Returns `Nothing` if the given address is not associated
+with any user.
+-}
+user : Sqlite.Database -> { email : Email Normalized } -> Task Sqlite.Error (Maybe { user : Internal.User, verification : Verification })
+user database { email } =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT user_id, verified_at
+            FROM emails
+            WHERE email = :email
+            """
+        , parameters =
+            [ Sqlite.Encode.string "email" (toString email)
+            ]
+        , rowDecoder =
+            Sqlite.Decode.string "user_id"
+                (\userId ->
+                    Sqlite.Decode.maybe Sqlite.Decode.int "verified_at"
+                        (\maybeVerifiedAt ->
+                            Sqlite.Decode.succeed
+                                { user = Internal.User { userId = userId }
+                                , verification =
+                                    when maybeVerifiedAt is
+                                        Just verifiedAt ->
+                                            Verified { verifiedAt = verifiedAt }
+
+                                        Nothing ->
+                                            Unverified
+                                }
+                        )
+                )
+        }
+
+
+
+-- verification
+
+
+{-| Tunable values for the verification flow.
+
+  - `verificationTokenLifetimeMillis` — how long a minted verification
+    token stays redeemable.
+
+-}
+type alias Options =
+    { verificationTokenLifetimeMillis : Int
+    }
+
+
+{-| The default [`Options`](#Options): verification tokens live for 24
+hours.
+-}
+defaultOptions : Options
+defaultOptions =
+    { verificationTokenLifetimeMillis = 24 * 60 * 60 * 1000
+    }
+
+
+{-| Phase one of confirming an email address. Creates a verification token
+for the given address and returns `{ token }` exactly once. It's intended
+for this token to be embedded in a mail sent to that address, proving
+whoever redeems it controls the inbox.
+
+The token is a standard base64 string, so it can contain `+`, `/`, and `=`.
+This library does not make the token safe for any particular transport: if
+it travels in a URL or form field, encode it for that context and hand
+[`verify`](#verify) back the exact original string.
+
+Each address holds at most one live token, so requesting again replaces the
+previous token and invalidates any earlier mail. Requesting for an address
+that is already verified is allowed — re-sending a confirmation is
+harmless. Requesting for an address that has no row in the `emails` table
+fails on the foreign key.
+
+Phase two is [`verify`](#verify) with the generated token.
+-}
+requestVerification : Sqlite.Database -> Crypto.SecureContext -> Options -> { email : Email Normalized } -> Task Sqlite.Error { token : String }
+requestVerification database secureContext options { email } =
+    sweepVerificationTokens database
+        |> Task.andThen (\_ -> Crypto.getRandomUInt8Values 32)
+        |> Task.andThen
+            (\tokenBytes ->
+                Utils.Time.nowMillis
+                    |> Task.andThen
+                        (\now ->
+                            let
+                                token : String
+                                token =
+                                    Utils.Base64.encodeBytes tokenBytes
+                            in
+                            Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
+                                |> Task.andThen
+                                    (\hashed ->
+                                        insertVerificationTokenRow database
+                                            { verificationToken = hashed
+                                            , email = toString email
+                                            , createdAt = now
+                                            , expiresAt = now + options.verificationTokenLifetimeMillis
+                                            }
+                                            |> Task.map (\_ -> { token = token })
+                                    )
+                        )
+            )
+
+
+{-| The ways redeeming a verification token can go wrong.
+
+  - `InvalidVerificationToken` is a token that matches no live row, whether
+    it is unknown, already used, replaced, or expired. The caller cannot
+    tell which, deliberately.
+  - `VerificationStorageError` is a database fault.
+
+-}
+type VerificationError
+    = InvalidVerificationToken
+    | VerificationStorageError Sqlite.Error
+
+
+{-| Phase two of confirming an email address. Use the generated token to
+stamp the address verified. No user is needed, because the token resolves
+the address — and through it the user — itself.
+
+A token redeems at most once: the redemption only proceeds if this call is
+the one that deleted the token row, so concurrent attempts with the same
+token cannot all succeed.
+
+This function returns the `User` who owns the address, not `Verified`:
+a verification token is sent to a *not-yet-confirmed* address, so treating
+its redemption as authentication would let whoever registered the address
+be logged in by the inbox owner's click — the classic account
+pre-hijacking attack. To act on the user's behalf after confirmation, have
+them authenticate normally.
+-}
+verify : Sqlite.Database -> Crypto.SecureContext -> { token : String } -> Task VerificationError { user : Internal.User, email : Email Normalized }
+verify database secureContext { token } =
+    sweepVerificationTokens database
+        |> Task.mapError VerificationStorageError
+        |> Task.andThen (\_ -> Utils.Crypto.digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token))
+        |> Task.andThen
+            (\hashedToken ->
+                Utils.Time.nowMillis
+                    |> Task.andThen
+                        (\now ->
+                            getVerificationTokenRow database { verificationToken = hashedToken }
+                                |> Task.mapError VerificationStorageError
+                                |> Task.andThen
+                                    (\maybeRow ->
+                                        when maybeRow is
+                                            Nothing ->
+                                                Task.fail InvalidVerificationToken
+
+                                            Just row ->
+                                                if row.expiresAt > now then
+                                                    redeem database
+                                                        { verificationToken = hashedToken
+                                                        , email = row.email
+                                                        , now = now
+                                                        }
+                                                        |> Task.mapError VerificationStorageError
+                                                        |> Task.andThen
+                                                            (\outcome ->
+                                                                when outcome is
+                                                                    Redeemed ->
+                                                                        Task.succeed
+                                                                            { user = Internal.User { userId = row.userId }
+                                                                            , email = Email row.email
+                                                                            }
+
+                                                                    AlreadyRedeemed ->
+                                                                        Task.fail InvalidVerificationToken
+                                                            )
+
+                                                else
+                                                    Task.fail InvalidVerificationToken
+                                    )
+                        )
+            )
+
+
+{-| The two ways the redemption transaction can finish: this call consumed
+the token row and stamped the address verified, or a concurrent redemption
+consumed the token first and nothing was written.
+-}
+type RedeemOutcome
+    = Redeemed
+    | AlreadyRedeemed
+
+
+{-| The redemption transaction behind [`verify`](#verify). Deleting the
+token row by its hash is the single-use guard: a delete that reports zero
+changed rows means another redemption already consumed the token, and no
+other write happens. The verified stamp gets the same treatment — an email
+row that vanished between statements also redeems nothing.
+-}
+redeem : Sqlite.Database -> { verificationToken : String, email : String, now : Int } -> Task Sqlite.Error RedeemOutcome
+redeem database { verificationToken, email, now } =
+    Sqlite.inTransaction database
+        (deleteVerificationTokenRowByToken database { verificationToken = verificationToken }
+            |> Task.andThen
+                (\summary ->
+                    if summary.changes == 0 then
+                        Task.succeed AlreadyRedeemed
+
+                    else
+                        markVerifiedRow database { email = email, now = now }
+                            |> Task.map
+                                (\stamped ->
+                                    if stamped.changes == 0 then
+                                        AlreadyRedeemed
+
+                                    else
+                                        Redeemed
+                                )
+                )
+        )
+
+
+
+-- `email_verification_tokens` rows
+
+
+{-| Write an address's verification token row, replacing any existing one.
+`email` is unique, so the replace is what enforces one live token per
+address. `verificationToken` is the already-hashed value, never the raw
+token.
+-}
+insertVerificationTokenRow :
+    Sqlite.Database
+    -> { verificationToken : String, email : String, createdAt : Int, expiresAt : Int }
+    -> Task Sqlite.Error Sqlite.ExecutionSummary
+insertVerificationTokenRow database { verificationToken, email, createdAt, expiresAt } =
+    Sqlite.execute database
+        { statement =
+            """
+            INSERT OR REPLACE INTO email_verification_tokens (verification_token, email, created_at, expires_at)
+            VALUES (:verification_token, :email, :created_at, :expires_at)
+            """
+        , parameters =
+            [ Sqlite.Encode.string "verification_token" verificationToken
+            , Sqlite.Encode.string "email" email
+            , Sqlite.Encode.int "created_at" createdAt
+            , Sqlite.Encode.int "expires_at" expiresAt
+            ]
+        }
+
+
+{-| Read a verification token row by the hash of a presented token,
+returning `Nothing` when no such row exists. The owning user is joined in
+from the `emails` table. Expiry is the caller's check.
+-}
+getVerificationTokenRow : Sqlite.Database -> { verificationToken : String } -> Task Sqlite.Error (Maybe { email : String, expiresAt : Int, userId : String })
+getVerificationTokenRow database { verificationToken } =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT email_verification_tokens.email AS email, email_verification_tokens.expires_at AS expires_at, emails.user_id AS user_id
+            FROM email_verification_tokens
+            INNER JOIN emails ON emails.email = email_verification_tokens.email
+            WHERE email_verification_tokens.verification_token = :verification_token
+            """
+        , parameters =
+            [ Sqlite.Encode.string "verification_token" verificationToken
+            ]
+        , rowDecoder =
+            Sqlite.Decode.string "email"
+                (\email ->
+                    Sqlite.Decode.int "expires_at"
+                        (\expiresAt ->
+                            Sqlite.Decode.string "user_id"
+                                (\userId ->
+                                    Sqlite.Decode.succeed
+                                        { email = email
+                                        , expiresAt = expiresAt
+                                        , userId = userId
+                                        }
+                                )
+                        )
+                )
+        }
+
+
+{-| Delete a verification token row by the hash of a presented token. The
+returned summary's `changes` count is the single-use guard in
+[`redeem`](#redeem): `1` when this call consumed the token, `0` when it was
+already gone.
+-}
+deleteVerificationTokenRowByToken : Sqlite.Database -> { verificationToken : String } -> Task Sqlite.Error Sqlite.ExecutionSummary
+deleteVerificationTokenRowByToken database { verificationToken } =
+    Sqlite.execute database
+        { statement =
+            """
+            DELETE FROM email_verification_tokens
+            WHERE verification_token = :verification_token
+            """
+        , parameters =
+            [ Sqlite.Encode.string "verification_token" verificationToken
+            ]
+        }
+
+
+{-| Delete the verification token rows for every address a user owns, the
+step that makes an email change invalidate an outstanding confirmation
+link.
+-}
+deleteVerificationTokenRowsForUser : Sqlite.Database -> { userId : String } -> Task Sqlite.Error Sqlite.ExecutionSummary
+deleteVerificationTokenRowsForUser database { userId } =
+    Sqlite.execute database
+        { statement =
+            """
+            DELETE FROM email_verification_tokens
+            WHERE email IN (SELECT email FROM emails WHERE user_id = :user_id)
+            """
+        , parameters =
+            [ Sqlite.Encode.string "user_id" userId
+            ]
+        }
+
+
+{-| Stamp an email row verified as of `now`. The returned summary's
+`changes` count tells [`redeem`](#redeem) whether the row still existed.
+-}
+markVerifiedRow : Sqlite.Database -> { email : String, now : Int } -> Task Sqlite.Error Sqlite.ExecutionSummary
+markVerifiedRow database { email, now } =
+    Sqlite.execute database
+        { statement =
+            """
+            UPDATE emails
+            SET verified_at = :now, updated_at = :now
+            WHERE email = :email
+            """
+        , parameters =
+            [ Sqlite.Encode.int "now" now
+            , Sqlite.Encode.string "email" email
+            ]
+        }
+
+
+{-| Delete every expired verification token row as of now. Run by
+[`requestVerification`](#requestVerification) and [`verify`](#verify), so
+the table tends itself during normal use.
+-}
+sweepVerificationTokens : Sqlite.Database -> Task Sqlite.Error {}
+sweepVerificationTokens database =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        DELETE FROM email_verification_tokens
+                        WHERE expires_at <= :now
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.int "now" now
+                        ]
+                    }
+            )
+        |> Task.map (\_ -> {})

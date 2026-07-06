@@ -1,0 +1,297 @@
+module Sqlite.Auth.Email.Parser exposing
+    ( Parts
+    , Error(..)
+    , parse
+    )
+
+{-| Parser for email addresses as defined by the WHATWG HTML specification —
+the grammar every `<input type=email>` enforces.
+
+The spec lives at
+<https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address>.
+
+This module's job is *string → structured data*. The local part is one or
+more atext characters (ASCII letters, digits, and ``!#$%&'*+-/=?^_`{|}~``)
+or dots; following WHATWG, dots may lead, trail, and repeat — a deliberate,
+documented deviation from RFC 5322's dot-atom. The domain is one or more
+dot-separated labels of 1–63 ASCII letters, digits, or hyphens, where no
+label starts or ends with a hyphen.
+
+Anything beyond that structure is the consumer's responsibility: there is
+no overall length cap, no case normalization (lowercasing is
+[`Sqlite.Auth.Email.normalize`](Sqlite.Auth.Email#normalize)'s job), and no
+handling of internationalized addresses — non-ASCII characters simply fail
+to parse, so encode internationalized domains to punycode before calling
+[`parse`](#parse).
+
+The parser is a sequential, no-backtracking state machine driven by
+`String.Parser.Advanced.loop`. Each chomp is terminator-driven: we walk
+to the next `@`, `.`, or end of input and let the terminating character
+decide the transition.
+
+@docs Parts, Error, parse
+
+-}
+
+import Result exposing ( Result(..) )
+import String
+import String.Parser.Advanced as Parser exposing ( Step(..) )
+
+
+{-| A parsed email address: the text before the `@` and the text after it.
+The domain is the joined label string, exactly as it appeared in the input.
+-}
+type alias Parts =
+    { localPart : String
+    , domain : String
+    }
+
+
+{-| Reasons `parse` can fail.
+
+  - `EmptyInput` — the input was empty.
+  - `EmptyLocalPart` — nothing before the `@`, as in `@example.com`.
+  - `InvalidLocalPartCharacter` — a character before the `@` that is not
+    atext or a dot; the wrapped string is the offending character.
+  - `MissingAtSign` — the input ended before any `@` appeared.
+  - `EmptyDomain` — nothing after the `@`, as in `alice@`.
+  - `EmptyDomainLabel` — a zero-length domain label, as in `alice@.com`,
+    `alice@b..c`, or `alice@b.`.
+  - `InvalidDomainCharacter` — a character after the `@` that is not an
+    ASCII letter, digit, hyphen, or dot; the wrapped string is the
+    offending character.
+  - `DomainLabelTooLong` — a domain label longer than 63 characters; the
+    wrapped string is the label.
+  - `DomainLabelHyphenAtEdge` — a domain label starting or ending with a
+    hyphen; the wrapped string is the label.
+  - `UnexpectedParseFailure` — defensive catch-all for parser dead-ends
+    that do not map to a public error; should never fire given the
+    current parser.
+-}
+type Error
+    = EmptyInput
+    | EmptyLocalPart
+    | InvalidLocalPartCharacter String
+    | MissingAtSign
+    | EmptyDomain
+    | EmptyDomainLabel
+    | InvalidDomainCharacter String
+    | DomainLabelTooLong String
+    | DomainLabelHyphenAtEdge String
+    | UnexpectedParseFailure String
+
+
+{-| Parse an email address into its [`Parts`](#Parts). The input is returned
+exactly as parsed — no trimming, no case folding.
+-}
+parse : String -> Result Error Parts
+parse input =
+    if String.isEmpty input then
+        Err EmptyInput
+
+    else
+        Parser.run emailParser {} input
+            |> Result.mapError deadEndsToError
+
+
+{-|-}
+unexpectedEnd : Error
+unexpectedEnd =
+    UnexpectedParseFailure "expected end of input"
+
+
+{-| Translate the most useful advanced parser dead-end into a typed
+[`Error`](#Error). `unexpectedEnd` is only used to satisfy parser
+primitive APIs in branches that should be unreachable, so we prefer any
+more specific domain error when one is present.
+-}
+deadEndsToError : Array (Parser.DeadEnd {} Error) -> Error
+deadEndsToError des =
+    when Array.findFirst isDomainDeadEnd des is
+        Just found ->
+            found.value.problem
+
+        Nothing ->
+            when Array.popFirst des is
+                Just { first } ->
+                    first.problem
+
+                Nothing ->
+                    UnexpectedParseFailure "parser failed without a dead end"
+
+
+{-|-}
+isDomainDeadEnd : Parser.DeadEnd {} Error -> Bool
+isDomainDeadEnd de =
+    when de.problem is
+        UnexpectedParseFailure _ ->
+            False
+
+        _ ->
+            True
+
+
+type alias EmailParser a =
+    Parser.Parser {} Error a
+
+
+{-| Loop state. Each variant carries the fields already parsed when the
+state is entered.
+-}
+type LoopState
+    = ParsingLocalPart
+    | ParsingLabel { localPart : String, labels : Array String }
+
+
+{-| Top-level parser: drive the state machine from the local part.
+-}
+emailParser : EmailParser Parts
+emailParser =
+    Parser.loop ParsingLocalPart step
+
+
+{-| One step of the loop. Dispatches to the per-state parser so each
+state's logic can be read (and reviewed) in isolation.
+-}
+step : LoopState -> EmailParser (Step LoopState Parts)
+step state =
+    when state is
+        ParsingLocalPart ->
+            parseLocalPart
+
+        ParsingLabel r ->
+            parseLabel { localPart = r.localPart, labels = r.labels }
+
+
+{-| Parse the local part. Terminates on `@` (the domain follows); end of
+input means the `@` never came, and any other character is not valid in a
+local part.
+-}
+parseLocalPart : EmailParser (Step LoopState Parts)
+parseLocalPart =
+    Parser.getChompedString (Parser.chompWhile isLocalPartChar)
+        |> Parser.andThen
+            (\chunk ->
+                Parser.oneOf
+                    [ Parser.chompChar '@' unexpectedEnd
+                        |> Parser.andThen
+                            (\_ ->
+                                if String.isEmpty chunk then
+                                    Parser.problem EmptyLocalPart
+
+                                else
+                                    Parser.succeed
+                                        (Loop
+                                            (ParsingLabel
+                                                { localPart = chunk
+                                                , labels = []
+                                                }
+                                            )
+                                        )
+                            )
+                    , Parser.end unexpectedEnd
+                        |> Parser.andThen (\_ -> Parser.problem MissingAtSign)
+                    , offendingCharacter InvalidLocalPartCharacter
+                    ]
+            )
+
+
+{-| Parse one domain label. A `.` continues with the next label; end of
+input finishes the parse, and any other character is not valid in a label.
+The chomped chunk is validated on the way out of either terminator.
+-}
+parseLabel : { localPart : String, labels : Array String } -> EmailParser (Step LoopState Parts)
+parseLabel r =
+    Parser.getChompedString (Parser.chompWhile isLabelChar)
+        |> Parser.andThen
+            (\chunk ->
+                Parser.oneOf
+                    [ Parser.chompChar '.' unexpectedEnd
+                        |> Parser.andThen
+                            (\_ ->
+                                when checkLabel chunk is
+                                    Just error ->
+                                        Parser.problem error
+
+                                    Nothing ->
+                                        Parser.succeed
+                                            (Loop
+                                                (ParsingLabel
+                                                    { localPart = r.localPart
+                                                    , labels = Array.pushLast chunk r.labels
+                                                    }
+                                                )
+                                            )
+                            )
+                    , Parser.end unexpectedEnd
+                        |> Parser.andThen
+                            (\_ ->
+                                if String.isEmpty chunk && Array.isEmpty r.labels then
+                                    Parser.problem EmptyDomain
+
+                                else
+                                    when checkLabel chunk is
+                                        Just error ->
+                                            Parser.problem error
+
+                                        Nothing ->
+                                            Parser.succeed
+                                                (Done
+                                                    { localPart = r.localPart
+                                                    , domain = String.join "." (Array.pushLast chunk r.labels)
+                                                    }
+                                                )
+                            )
+                    , offendingCharacter InvalidDomainCharacter
+                    ]
+            )
+
+
+{-| Chomp the single character the previous `chompWhile` stopped on and
+fail with it wrapped in the given error constructor.
+-}
+offendingCharacter : (String -> Error) -> EmailParser a
+offendingCharacter toError =
+    Parser.getChompedString (Parser.chompIf (\_ -> True) unexpectedEnd)
+        |> Parser.andThen (\char -> Parser.problem (toError char))
+
+
+{-| Reject a chomped domain label that is empty, longer than 63 characters,
+or hyphen-edged; `Nothing` means the label is valid.
+-}
+checkLabel : String -> Maybe Error
+checkLabel label =
+    if String.isEmpty label then
+        Just EmptyDomainLabel
+
+    else if String.count label > 63 then
+        Just (DomainLabelTooLong label)
+
+    else if String.startsWith "-" label || String.endsWith "-" label then
+        Just (DomainLabelHyphenAtEdge label)
+
+    else
+        Nothing
+
+
+{-| Whether the character may appear in a local part: atext or a dot.
+-}
+isLocalPartChar : Char -> Bool
+isLocalPartChar c =
+    Char.isAlphaNum c || c == '.' || isAtextSpecial c
+
+
+{-| The nineteen special characters RFC 5322 atext allows alongside
+letters and digits.
+-}
+isAtextSpecial : Char -> Bool
+isAtextSpecial c =
+    String.contains (String.fromChar c) "!#$%&'*+-/=?^_`{|}~"
+
+
+{-| Whether the character may appear in a domain label: an ASCII letter,
+digit, or hyphen.
+-}
+isLabelChar : Char -> Bool
+isLabelChar c =
+    Char.isAlphaNum c || c == '-'

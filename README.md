@@ -6,7 +6,7 @@ The ideal use for this package is to setup simple applications, prototypes, or s
 
 ## What this package does
 
-This package gives you username and password authentication out-of-the-box without much work. This is usually all you need for simple applications. Other identifiers (email) and/or credentials (one-time codes, etc.) may be added in the future.
+This package gives you username, email, and password authentication out-of-the-box without much work, including a full email verification flow — you only supply the sending of the mail. This is usually all you need for simple applications. Other credentials (one-time codes, etc.) may be added in the future.
 
 More importantly, this package, when used properly (see _What this package does not do_ below) prevents you from mishandling credentials at the type-level. In other words: If you use functions in this package to handle credential information, it is difficult, if not impossible in some cases, to compromise the security of your application. This includes ensuring you handle credentials properly within your Gren program _and_ ensuring that any data saved to the database is done so as safely as possible.
 

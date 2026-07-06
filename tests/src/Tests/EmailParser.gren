@@ -1,0 +1,133 @@
+module Tests.EmailParser exposing ( tests )
+
+{-| Tests for `Sqlite.Auth.Email.Parser` — the WHATWG email grammar, pinned
+acceptance-by-acceptance and one test per reachable error variant.
+
+@docs tests
+
+-}
+
+import Expect
+import Sqlite.Auth.Email.Parser as Parser
+import Test exposing ( Test, describe, test )
+
+
+{-|-}
+tests : Test
+tests =
+    describe "Sqlite.Auth.Email.Parser tests"
+        [ describe "accepted addresses"
+            [ test "parses a plain address into its parts"
+                (\_ ->
+                    Parser.parse "a.b@ex.co"
+                        |> Expect.equal (Ok { localPart = "a.b", domain = "ex.co" })
+                )
+            , test "accepts every atext special in the local part"
+                (\_ ->
+                    Parser.parse "!#$%&'*+-/=?^_`{|}~@example.com"
+                        |> Expect.equal (Ok { localPart = "!#$%&'*+-/=?^_`{|}~", domain = "example.com" })
+                )
+            , test "WHATWG deviation: dots may lead, trail, and repeat in the local part"
+                (\_ ->
+                    Parser.parse ".a..b.@example.com"
+                        |> Expect.equal (Ok { localPart = ".a..b.", domain = "example.com" })
+                )
+            , test "accepts a single-label domain"
+                (\_ ->
+                    Parser.parse "alice@localhost"
+                        |> Expect.equal (Ok { localPart = "alice", domain = "localhost" })
+                )
+            , test "accepts a multi-label domain"
+                (\_ ->
+                    Parser.parse "alice@mail.example.co.uk"
+                        |> Expect.equal (Ok { localPart = "alice", domain = "mail.example.co.uk" })
+                )
+            , test "accepts digits and interior hyphens in domain labels"
+                (\_ ->
+                    Parser.parse "alice@ex-1.example42.com"
+                        |> Expect.equal (Ok { localPart = "alice", domain = "ex-1.example42.com" })
+                )
+            , test "accepts a domain label of exactly 63 characters"
+                (\_ ->
+                    Parser.parse ("alice@" ++ String.repeat 63 "a" ++ ".com")
+                        |> Expect.equal (Ok { localPart = "alice", domain = String.repeat 63 "a" ++ ".com" })
+                )
+            , test "no case normalization: the parser preserves case"
+                (\_ ->
+                    Parser.parse "Alice@Example.COM"
+                        |> Expect.equal (Ok { localPart = "Alice", domain = "Example.COM" })
+                )
+            ]
+        , describe "rejected addresses"
+            [ test "an empty string is EmptyInput"
+                (\_ ->
+                    Parser.parse ""
+                        |> Expect.equal (Err Parser.EmptyInput)
+                )
+            , test "nothing before the @ is EmptyLocalPart"
+                (\_ ->
+                    Parser.parse "@example.com"
+                        |> Expect.equal (Err Parser.EmptyLocalPart)
+                )
+            , test "a space in the local part is InvalidLocalPartCharacter"
+                (\_ ->
+                    Parser.parse "a b@example.com"
+                        |> Expect.equal (Err (Parser.InvalidLocalPartCharacter " "))
+                )
+            , test "a non-ASCII local part is InvalidLocalPartCharacter (IDN is the caller's job)"
+                (\_ ->
+                    Parser.parse "é@example.com"
+                        |> Expect.equal (Err (Parser.InvalidLocalPartCharacter "é"))
+                )
+            , test "no @ at all is MissingAtSign"
+                (\_ ->
+                    Parser.parse "alice.example.com"
+                        |> Expect.equal (Err Parser.MissingAtSign)
+                )
+            , test "nothing after the @ is EmptyDomain"
+                (\_ ->
+                    Parser.parse "alice@"
+                        |> Expect.equal (Err Parser.EmptyDomain)
+                )
+            , test "a leading domain dot is EmptyDomainLabel"
+                (\_ ->
+                    Parser.parse "alice@.com"
+                        |> Expect.equal (Err Parser.EmptyDomainLabel)
+                )
+            , test "consecutive domain dots are EmptyDomainLabel"
+                (\_ ->
+                    Parser.parse "alice@b..c"
+                        |> Expect.equal (Err Parser.EmptyDomainLabel)
+                )
+            , test "a trailing domain dot is EmptyDomainLabel"
+                (\_ ->
+                    Parser.parse "alice@example.com."
+                        |> Expect.equal (Err Parser.EmptyDomainLabel)
+                )
+            , test "an underscore in the domain is InvalidDomainCharacter"
+                (\_ ->
+                    Parser.parse "alice@b_c.com"
+                        |> Expect.equal (Err (Parser.InvalidDomainCharacter "_"))
+                )
+            , test "a second @ is InvalidDomainCharacter"
+                (\_ ->
+                    Parser.parse "alice@b@c.com"
+                        |> Expect.equal (Err (Parser.InvalidDomainCharacter "@"))
+                )
+            , test "a 64-character domain label is DomainLabelTooLong"
+                (\_ ->
+                    Parser.parse ("alice@" ++ String.repeat 64 "a" ++ ".com")
+                        |> Expect.equal (Err (Parser.DomainLabelTooLong (String.repeat 64 "a")))
+                )
+            , test "a label starting with a hyphen is DomainLabelHyphenAtEdge"
+                (\_ ->
+                    Parser.parse "alice@-b.com"
+                        |> Expect.equal (Err (Parser.DomainLabelHyphenAtEdge "-b"))
+                )
+            , test "a label ending with a hyphen is DomainLabelHyphenAtEdge"
+                (\_ ->
+                    Parser.parse "alice@b-.com"
+                        |> Expect.equal (Err (Parser.DomainLabelHyphenAtEdge "b-"))
+                )
+            ]
+        ]

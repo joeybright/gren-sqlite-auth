@@ -8,6 +8,8 @@
     "exposed-modules": [
         "Sqlite.Auth.User",
         "Sqlite.Auth.Username",
+        "Sqlite.Auth.Email",
+        "Sqlite.Auth.Email.Parser",
         "Sqlite.Auth.Password",
         "Sqlite.Auth.Session"
     ],

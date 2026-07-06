@@ -9,7 +9,9 @@ import Init
 import Node
 import Task exposing ( Task )
 import Test.Runner.Effectful exposing ( await, concat )
+import Tests.EmailParser
 import Tests.PhcString
+import Tests.Sqlite.Auth.Email
 import Tests.Sqlite.Auth.Password
 import Tests.Sqlite.Auth.Session
 import Tests.Sqlite.Auth.User
@@ -30,9 +32,11 @@ main =
                                 (\_ ->
                                     concat
                                         [ Test.Runner.Effectful.wrap Tests.PhcString.tests
+                                        , Test.Runner.Effectful.wrap Tests.EmailParser.tests
                                         , Tests.Sqlite.Auth.User.tests fsPermission secureContext
                                         , Tests.Sqlite.Auth.Password.tests fsPermission secureContext
                                         , Tests.Sqlite.Auth.Username.tests fsPermission secureContext
+                                        , Tests.Sqlite.Auth.Email.tests fsPermission secureContext
                                         , Tests.Sqlite.Auth.Session.tests fsPermission secureContext
                                         , Tests.SqliteAuth.tests fsPermission secureContext
                                         ]
@@ -51,6 +55,7 @@ removeTestDatabases fsPermission =
     [ "test-sqlite-auth.sqlite"
     , "test-sqlite-auth-user.sqlite"
     , "test-sqlite-auth-username.sqlite"
+    , "test-sqlite-auth-email.sqlite"
     , "test-sqlite-auth-password.sqlite"
     , "test-sqlite-auth-session.sqlite"
     ]

@@ -1,0 +1,650 @@
+module Tests.Sqlite.Auth.Email exposing ( tests )
+
+{-| Tests isolated to `Sqlite.Auth.Email` — its pure API (`normalize`,
+`fromString`, `toString`) and its SQL behavior (`new`, `change`, `user`,
+`requestVerification`, `verify`) exercised against an on-disk database.
+
+Each database-backed group interleaves work and assertions: a task runs, its
+result is awaited, a test runs against it, and only then does the next task
+run. Witnesses are minted directly from `Sqlite.Auth.Internal` so the
+credential layer stays out of it; `Sqlite.Auth.User.new` is used only as a
+fixture to satisfy the `emails.user_id` foreign key. Database state is always
+read back through `Email.user`, the module's own lookup — except the sweep
+test, where a raw count is the point.
+
+@docs tests
+
+-}
+
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Sqlite
+import Sqlite.Auth.Email as Email
+import Sqlite.Auth.Email.Parser as Parser
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.User as User
+import Sqlite.Decode
+import Sqlite.Encode
+import Sqlite.Migrate
+import Task exposing ( Task )
+import Test
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test, wrap )
+
+
+{-| Normalize a fixture address and run `toTest` with it, or fail with a clear
+test naming the raw fixture when it does not normalize.
+-}
+normalizeEmail : String -> (Email.Email Email.Normalized -> Test.Runner.Effectful.Test) -> Test.Runner.Effectful.Test
+normalizeEmail string toTest =
+    when Email.normalize (Email.fromString string) is
+        Ok email ->
+            toTest email
+
+        Err _ ->
+            test ("fixture email should normalize: " ++ string)
+                (\_ -> Expect.fail ("expected \"" ++ string ++ "\" to normalize"))
+
+
+{-| Open the database, migrate, and run the pure and database-backed
+`Sqlite.Auth.Email` tests, each derived from a fresh UUID suffix so they
+never collide across groups or runs.
+-}
+tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests fsPermission secureContext =
+    let
+        migrations : Array Sqlite.Migrate.Migration
+        migrations =
+            [ User.migrationV1
+            , Email.migrationV1
+            ]
+    in
+    await
+        "Open the on-disk test database (Sqlite.Auth.Email)"
+        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth-email.sqlite"))
+        (\database ->
+            await
+                "Apply migrations (Sqlite.Auth.Email)"
+                (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
+                (\_ ->
+                    await
+                        "Generate a unique email suffix (Sqlite.Auth.Email)"
+                        (Crypto.randomUuidV4 secureContext)
+                        (\suffix ->
+                            concat
+                                [ wrap pureTests
+                                , userLookupTests database secureContext suffix
+                                , newDuplicateTests database secureContext suffix
+                                , changeRenameTests database secureContext suffix
+                                , changeScopingTests database secureContext suffix
+                                , changeTakenTests database secureContext suffix
+                                , changeWithoutEmailTests database secureContext suffix
+                                , verifyTests database secureContext suffix
+                                , verifyExpiredTokenTests database secureContext suffix
+                                , verifySingleUseTests database secureContext suffix
+                                , verifyTokenReplacementTests database secureContext suffix
+                                , changeInvalidatesVerificationTests database secureContext suffix
+                                , requestVerificationSweepTests database secureContext suffix
+                                ]
+                        )
+                )
+        )
+
+
+{-| `normalize`, `fromString`, and `toString` — no database needed.
+-}
+pureTests : Test.Test
+pureTests =
+    Test.describe "Sqlite.Auth.Email pure tests"
+        [ Test.test "normalize trims surrounding whitespace and lowercases"
+            (\_ ->
+                Email.normalize (Email.fromString "  Alice@Example.COM  ")
+                    |> Result.map Email.toString
+                    |> Expect.equal (Ok "alice@example.com")
+            )
+        , Test.test "differently-cased and -spaced addresses normalize to the same value"
+            (\_ ->
+                Expect.equal
+                    (Result.map Email.toString (Email.normalize (Email.fromString "ALICE@EXAMPLE.COM")))
+                    (Result.map Email.toString (Email.normalize (Email.fromString " alice@example.com ")))
+            )
+        , Test.test "an empty string does not normalize"
+            (\_ ->
+                Email.normalize (Email.fromString "")
+                    |> Result.map Email.toString
+                    |> Expect.equal (Err Parser.EmptyInput)
+            )
+        , Test.test "a structurally invalid address surfaces the parser's error"
+            (\_ ->
+                Email.normalize (Email.fromString "not-an-email")
+                    |> Result.map Email.toString
+                    |> Expect.equal (Err Parser.MissingAtSign)
+            )
+        , Test.test "toString returns the raw string of a fromString value"
+            (\_ ->
+                Email.toString (Email.fromString "RawValue")
+                    |> Expect.equal "RawValue"
+            )
+        ]
+
+
+{-| `user` resolves an inserted address to its owner (unverified), and an
+un-inserted one to `Nothing`.
+-}
+userLookupTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+userLookupTests database secureContext suffix =
+    normalizeEmail ("lookup-" ++ suffix ++ "@example.com")
+        (\email ->
+            normalizeEmail ("ghost-" ++ suffix ++ "@example.com")
+                (\ghost ->
+                    await
+                        "Create a user (lookup)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the email"
+                                (Email.new database { email = email } user)
+                                (\_ ->
+                                    await
+                                        "Look up the inserted email"
+                                        (Email.user database { email = email })
+                                        (\maybeOwner ->
+                                            concat
+                                                [ test "user resolves an inserted email to its owner, unverified"
+                                                    (\_ ->
+                                                        maybeOwner
+                                                            |> Maybe.map (\row -> { userId = User.id row.user, verification = row.verification })
+                                                            |> Expect.equal (Just { userId = User.id user, verification = Email.Unverified })
+                                                    )
+                                                , await
+                                                    "Look up the unowned email"
+                                                    (Email.user database { email = ghost })
+                                                    (\maybeGhost ->
+                                                        test "user resolves an unowned email to Nothing"
+                                                            (\_ -> Expect.equal Nothing (Maybe.map (\row -> User.id row.user) maybeGhost))
+                                                    )
+                                                ]
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| Inserting an address that already exists fails on the primary key.
+-}
+newDuplicateTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+newDuplicateTests database secureContext suffix =
+    normalizeEmail ("dupe-" ++ suffix ++ "@example.com")
+        (\email ->
+            await
+                "Create a user (duplicate)"
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        "Insert the email"
+                        (Email.new database { email = email } user)
+                        (\_ ->
+                            awaitError
+                                "Insert the same email again"
+                                (Email.new database { email = email } user)
+                                (\_ ->
+                                    test "inserting a duplicate email fails on the primary key"
+                                        (\_ -> Expect.pass)
+                                )
+                        )
+                )
+        )
+
+
+{-| With the owner's proof, the old address stops resolving and the new
+address resolves to the same user.
+-}
+changeRenameTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeRenameTests database secureContext suffix =
+    normalizeEmail ("rename-from-" ++ suffix ++ "@example.com")
+        (\from ->
+            normalizeEmail ("rename-to-" ++ suffix ++ "@example.com")
+                (\to ->
+                    await
+                        "Create a user (rename)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the original email"
+                                (Email.new database { email = from } user)
+                                (\_ ->
+                                    await
+                                        "Rename with the owner's proof"
+                                        (Email.change database { newEmail = to } (Internal.Verified { userId = User.id user }))
+                                        (\_ ->
+                                            await
+                                                "Look up the old email after renaming"
+                                                (Email.user database { email = from })
+                                                (\maybeOld ->
+                                                    await
+                                                        "Look up the new email after renaming"
+                                                        (Email.user database { email = to })
+                                                        (\maybeNew ->
+                                                            concat
+                                                                [ test "after change the old email no longer resolves"
+                                                                    (\_ -> Expect.equal Nothing (Maybe.map (\row -> User.id row.user) maybeOld))
+                                                                , test "after change the new email resolves to the same user"
+                                                                    (\_ -> Expect.equal (Just (User.id user)) (Maybe.map (\row -> User.id row.user) maybeNew))
+                                                                ]
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| A proof for a different user renames nothing: the write is scoped to the
+witness's user, so a `from` it does not own matches zero rows.
+-}
+changeScopingTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeScopingTests database secureContext suffix =
+    normalizeEmail ("scope-a-" ++ suffix ++ "@example.com")
+        (\from ->
+            normalizeEmail ("scope-b-" ++ suffix ++ "@example.com")
+                (\to ->
+                    await
+                        "Create the original owner (scoping)"
+                        (User.new database secureContext)
+                        (\userA ->
+                            await
+                                "Create the mismatched user (scoping)"
+                                (User.new database secureContext)
+                                (\userB ->
+                                    await
+                                        "Insert the original email for the first user"
+                                        (Email.new database { email = from } userA)
+                                        (\_ ->
+                                            await
+                                                "Rename with a mismatched proof"
+                                                (Email.change database { newEmail = to } (Internal.Verified { userId = User.id userB }))
+                                                (\_ ->
+                                                    await
+                                                        "Look up the original email after the mismatched rename"
+                                                        (Email.user database { email = from })
+                                                        (\maybeFrom ->
+                                                            await
+                                                                "Look up the target email after the mismatched rename"
+                                                                (Email.user database { email = to })
+                                                                (\maybeTo ->
+                                                                    concat
+                                                                        [ test "a mismatched proof leaves the original owner unchanged"
+                                                                            (\_ -> Expect.equal (Just (User.id userA)) (Maybe.map (\row -> User.id row.user) maybeFrom))
+                                                                        , test "a mismatched proof does not create the target email"
+                                                                            (\_ -> Expect.equal Nothing (Maybe.map (\row -> User.id row.user) maybeTo))
+                                                                        ]
+                                                                )
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| Renaming to an address that is already taken fails on the primary key.
+-}
+changeTakenTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeTakenTests database secureContext suffix =
+    normalizeEmail ("taken-one-" ++ suffix ++ "@example.com")
+        (\one ->
+            normalizeEmail ("taken-two-" ++ suffix ++ "@example.com")
+                (\two ->
+                    await
+                        "Create a user (taken)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the first email"
+                                (Email.new database { email = one } user)
+                                (\_ ->
+                                    await
+                                        "Insert the second email"
+                                        (Email.new database { email = two } user)
+                                        (\_ ->
+                                            awaitError
+                                                "Rename the second email to the first"
+                                                (Email.change database { newEmail = one } (Internal.Verified { userId = User.id user }))
+                                                (\_ ->
+                                                    test "renaming to a taken email fails on the primary key"
+                                                        (\_ -> Expect.pass)
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| Renaming a user who holds no email row is a silent no-op: the task
+succeeds, and the target address is not created. Surprising, so pinned here.
+-}
+changeWithoutEmailTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeWithoutEmailTests database secureContext suffix =
+    normalizeEmail ("orphan-" ++ suffix ++ "@example.com")
+        (\target ->
+            await
+                "Create a user with no email (no-op)"
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        "Rename the user who has no email row"
+                        (Email.change database { newEmail = target } (Internal.Verified { userId = User.id user }))
+                        (\_ ->
+                            await
+                                "Look up the target email after the no-op rename"
+                                (Email.user database { email = target })
+                                (\maybeOwner ->
+                                    test "renaming without an email row creates nothing"
+                                        (\_ -> Expect.equal Nothing (Maybe.map (\row -> User.id row.user) maybeOwner))
+                                )
+                        )
+                )
+        )
+
+
+{-| The happy path: a requested token redeems, names the owning user and the
+confirmed address, and the row reads back verified.
+-}
+verifyTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+verifyTests database secureContext suffix =
+    normalizeEmail ("verify-" ++ suffix ++ "@example.com")
+        (\email ->
+            await
+                "Create a user (verify)"
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        "Insert the email"
+                        (Email.new database { email = email } user)
+                        (\_ ->
+                            await
+                                "Request a verification token"
+                                (Email.requestVerification database secureContext Email.defaultOptions { email = email })
+                                (\{ token } ->
+                                    await
+                                        "Redeem the verification token"
+                                        (Email.verify database secureContext { token = token })
+                                        (\confirmed ->
+                                            concat
+                                                [ test "verify names the owning user"
+                                                    (\_ -> Expect.equal (User.id user) (User.id confirmed.user))
+                                                , test "verify names the confirmed address"
+                                                    (\_ -> Expect.equal (Email.toString email) (Email.toString confirmed.email))
+                                                , await
+                                                    "Look up the email after verifying"
+                                                    (Email.user database { email = email })
+                                                    (\maybeOwner ->
+                                                        test "the address reads back verified"
+                                                            (\_ ->
+                                                                when maybeOwner is
+                                                                    Just row ->
+                                                                        when row.verification is
+                                                                            Email.Verified _ ->
+                                                                                Expect.pass
+
+                                                                            Email.Unverified ->
+                                                                                Expect.fail "expected the address to be Verified"
+
+                                                                    Nothing ->
+                                                                        Expect.fail "expected the address to resolve to its owner"
+                                                            )
+                                                    )
+                                                ]
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| A token past its lifetime is rejected as `InvalidVerificationToken`.
+-}
+verifyExpiredTokenTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+verifyExpiredTokenTests database secureContext suffix =
+    let
+        expiredOptions : Email.Options
+        expiredOptions =
+            { Email.defaultOptions | verificationTokenLifetimeMillis = 0 }
+    in
+    normalizeEmail ("expired-" ++ suffix ++ "@example.com")
+        (\email ->
+            await
+                "Create a user (expired token)"
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        "Insert the email (expired token)"
+                        (Email.new database { email = email } user)
+                        (\_ ->
+                            await
+                                "Request a token that expires immediately"
+                                (Email.requestVerification database secureContext expiredOptions { email = email })
+                                (\{ token } ->
+                                    awaitError
+                                        "Redeem the expired token"
+                                        (Email.verify database secureContext { token = token })
+                                        (\error ->
+                                            test "an expired verification token is rejected"
+                                                (\_ -> Expect.equal Email.InvalidVerificationToken error)
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| A redeemed token does not redeem again: the second attempt is rejected —
+the delete-then-check-changes guard behind concurrent redemptions.
+-}
+verifySingleUseTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+verifySingleUseTests database secureContext suffix =
+    normalizeEmail ("single-use-" ++ suffix ++ "@example.com")
+        (\email ->
+            await
+                "Create a user (single use)"
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        "Insert the email (single use)"
+                        (Email.new database { email = email } user)
+                        (\_ ->
+                            await
+                                "Request a verification token (single use)"
+                                (Email.requestVerification database secureContext Email.defaultOptions { email = email })
+                                (\{ token } ->
+                                    await
+                                        "Redeem the verification token (single use)"
+                                        (Email.verify database secureContext { token = token })
+                                        (\_ ->
+                                            awaitError
+                                                "Redeem the same token again"
+                                                (Email.verify database secureContext { token = token })
+                                                (\error ->
+                                                    test "the second redemption is rejected"
+                                                        (\_ -> Expect.equal Email.InvalidVerificationToken error)
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| A second `requestVerification` replaces the first token: only the latest
+token per address redeems — the `INSERT OR REPLACE` one-live-token invariant.
+-}
+verifyTokenReplacementTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+verifyTokenReplacementTests database secureContext suffix =
+    normalizeEmail ("replacement-" ++ suffix ++ "@example.com")
+        (\email ->
+            await
+                "Create a user (token replacement)"
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        "Insert the email (token replacement)"
+                        (Email.new database { email = email } user)
+                        (\_ ->
+                            await
+                                "Request the first verification token"
+                                (Email.requestVerification database secureContext Email.defaultOptions { email = email })
+                                (\first ->
+                                    await
+                                        "Request a second verification token"
+                                        (Email.requestVerification database secureContext Email.defaultOptions { email = email })
+                                        (\second ->
+                                            concat
+                                                [ awaitError
+                                                    "Redeem the replaced first token"
+                                                    (Email.verify database secureContext { token = first.token })
+                                                    (\error ->
+                                                        test "the replaced token no longer redeems"
+                                                            (\_ -> Expect.equal Email.InvalidVerificationToken error)
+                                                    )
+                                                , await
+                                                    "Redeem the latest token"
+                                                    (Email.verify database secureContext { token = second.token })
+                                                    (\confirmed ->
+                                                        test "the latest token redeems"
+                                                            (\_ -> Expect.equal (User.id user) (User.id confirmed.user))
+                                                    )
+                                                ]
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| Changing the address invalidates an outstanding verification token, and
+the new address starts over unverified.
+-}
+changeInvalidatesVerificationTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeInvalidatesVerificationTests database secureContext suffix =
+    normalizeEmail ("invalidate-from-" ++ suffix ++ "@example.com")
+        (\from ->
+            normalizeEmail ("invalidate-to-" ++ suffix ++ "@example.com")
+                (\to ->
+                    await
+                        "Create a user (change invalidates token)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the original email (change invalidates token)"
+                                (Email.new database { email = from } user)
+                                (\_ ->
+                                    await
+                                        "Request a verification token before the change"
+                                        (Email.requestVerification database secureContext Email.defaultOptions { email = from })
+                                        (\{ token } ->
+                                            await
+                                                "Change the email"
+                                                (Email.change database { newEmail = to } (Internal.Verified { userId = User.id user }))
+                                                (\_ ->
+                                                    concat
+                                                        [ awaitError
+                                                            "Redeem the pre-change verification token"
+                                                            (Email.verify database secureContext { token = token })
+                                                            (\error ->
+                                                                test "a verification token from before the change is rejected"
+                                                                    (\_ -> Expect.equal Email.InvalidVerificationToken error)
+                                                            )
+                                                        , await
+                                                            "Look up the new address after the change"
+                                                            (Email.user database { email = to })
+                                                            (\maybeNew ->
+                                                                test "the new address starts over unverified"
+                                                                    (\_ ->
+                                                                        maybeNew
+                                                                            |> Maybe.map (\row -> row.verification)
+                                                                            |> Expect.equal (Just Email.Unverified)
+                                                                    )
+                                                            )
+                                                        ]
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| `requestVerification` sweeps expired token rows: after any later request,
+an expired token row is gone from the table, not just unredeemable.
+-}
+requestVerificationSweepTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+requestVerificationSweepTests database secureContext suffix =
+    let
+        expiredOptions : Email.Options
+        expiredOptions =
+            { Email.defaultOptions | verificationTokenLifetimeMillis = 0 }
+    in
+    normalizeEmail ("sweep-expired-" ++ suffix ++ "@example.com")
+        (\expiredEmail ->
+            normalizeEmail ("sweep-other-" ++ suffix ++ "@example.com")
+                (\otherEmail ->
+                    await
+                        "Create a user whose token expires immediately (sweep)"
+                        (User.new database secureContext)
+                        (\user ->
+                            await
+                                "Insert the expiring email (sweep)"
+                                (Email.new database { email = expiredEmail } user)
+                                (\_ ->
+                                    await
+                                        "Insert the second email (sweep)"
+                                        (Email.new database { email = otherEmail } user)
+                                        (\_ ->
+                                            await
+                                                "Request a token that expires immediately (sweep)"
+                                                (Email.requestVerification database secureContext expiredOptions { email = expiredEmail })
+                                                (\_ ->
+                                                    await
+                                                        "Request a token for the second email (sweep)"
+                                                        (Email.requestVerification database secureContext Email.defaultOptions { email = otherEmail })
+                                                        (\_ ->
+                                                            await
+                                                                "Count the expiring email's token rows"
+                                                                (countVerificationTokenRows database { email = Email.toString expiredEmail })
+                                                                (\count ->
+                                                                    test "the expired token row was swept"
+                                                                        (\_ -> Expect.equal 0 count)
+                                                                )
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| Count an address's rows in `email_verification_tokens` directly — the one
+place a raw query is needed, because sweeping is about the row being gone,
+not about any observable `verify` outcome.
+-}
+countVerificationTokenRows : Sqlite.Database -> { email : String } -> Task Sqlite.Error Int
+countVerificationTokenRows database { email } =
+    Sqlite.getOne database
+        { query =
+            """
+            SELECT COUNT(*) AS row_count
+            FROM email_verification_tokens
+            WHERE email = :email
+            """
+        , parameters =
+            [ Sqlite.Encode.string "email" email
+            ]
+        , rowDecoder =
+            Sqlite.Decode.int "row_count" Sqlite.Decode.succeed
+        }
