@@ -82,8 +82,8 @@ functions in this package to operate.
 It's _highly_ recommended that you immediately create a 
 [username](Sqlite.Auth.Username) for the new user in the same SQLite
 transaction. After a user is created, the only method of retrieving
-it from the database is by it's id (via the [get](#get) function) or by
-the users created username. If you plan on using this package for user-facing 
+it from the database is by its id (via the [get](#get) function) or by
+the user's created username. If you plan on using this package for user-facing
 authentication, user ids are not the most friendly way to remember how
 to log into an account!
 -}
@@ -112,8 +112,8 @@ new database secureContext =
             )
 
 
-{-| Look up a user by id, returning the [`User`](#User) for the row. The 
-task fails when there's no user with the given id.
+{-| Look up a user by id, returning the `User` for the row. The task
+fails when there's no user with the given id.
 -}
 get : Sqlite.Database -> { id : String } -> Task Sqlite.Error Internal.User
 get database input =
@@ -133,7 +133,7 @@ get database input =
         }
 
 
-{-| Get the id of the given [`User`](#User) as a `String`.
+{-| Get the id of the given `User` as a `String`.
 -}
 id : Internal.User -> String
 id (Internal.User { userId }) =

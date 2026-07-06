@@ -132,7 +132,7 @@ fromString =
     Username
 
 
-{-| Ensures the users has has been trimmed, is not empty, and all characters 
+{-| Ensures the username has been trimmed, is not empty, and all characters
 are lowercase. This function does not remove empty spaces.
 -}
 normalize : Username Raw -> Maybe (Username Normalized)
@@ -212,7 +212,7 @@ change database { newUsername } ((Internal.Verified { userId }) as verified) =
             )
 
 
-{-| Get the user who owns the given username. Returns `Nothing` is the given
+{-| Get the user who owns the given username. Returns `Nothing` if the given
 username is not associated with any user.
 -}
 user : Sqlite.Database -> { username : Username Normalized } -> Task Sqlite.Error (Maybe Internal.User)

@@ -8,11 +8,11 @@ The ideal use for this package is to setup simple applications, prototypes, or s
 
 This package gives you username and password authentication out-of-the-box without much work. This is usually all you need for simple applications. Other identifiers (email) and/or credentials (one-time codes, etc.) may be added in the future.
 
-More importantly, this package, when used properly (see _What this package does not do_ below) prevents you from mishandling credentials at the type-level. In other words: If you use functions in this package to handle credential information, it is difficult, if not impossible in some cases, to comprimise the security of your application. This includes ensuring you handle credentials properly within your Gren program _and_ ensuring that any data saved to the database is done so as safely as possible.
+More importantly, this package, when used properly (see _What this package does not do_ below) prevents you from mishandling credentials at the type-level. In other words: If you use functions in this package to handle credential information, it is difficult, if not impossible in some cases, to compromise the security of your application. This includes ensuring you handle credentials properly within your Gren program _and_ ensuring that any data saved to the database is done so as safely as possible.
 
 ## What this package does _not_ do
 
-This package is not meant to provide production-grade authencation. While great care has gone into ensuring information is saved to the database properly, I (the author) am not a security engineer, nor has this codebase been reviewed by security professionals. As such, it's highly recommended to review and deeply interrogate the implemention of all functionality in this package before using it in any critical systems.
+This package is not meant to provide production-grade authentication. While great care has gone into ensuring information is saved to the database properly, I (the author) am not a security engineer, nor has this codebase been reviewed by security professionals. As such, it's highly recommended to review and deeply interrogate the implementation of all functionality in this package before using it in any critical systems.
 
 This package does not help in setting up proper endpoints for authentication or handling sessions with proper HTTP cookies and such. Modules to help with this - particularly in handling session tokens via HTTP cookies - may be added in the future.
 

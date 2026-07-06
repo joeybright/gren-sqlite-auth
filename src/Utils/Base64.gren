@@ -1,12 +1,8 @@
-module Utils.Base64 exposing
-    ( encodeBytes
-    , encodeBytesUrlSafe
-    )
+module Utils.Base64 exposing ( encodeBytes )
 
 {-| Base64 encoding helpers.
 
 @docs encodeBytes
-@docs encodeBytesUrlSafe
 
 -}
 
@@ -20,14 +16,3 @@ encodeBytes : Bytes -> String
 encodeBytes bytes =
     Base64.Encode.bytes bytes
         |> Base64.Encode.encode
-
-
-{-| Encode bytes as a URL-safe base64 string: standard base64 with `+`/`/`
-swapped for `-`/`_` and padding dropped — safe to embed in URLs and cookies.
--}
-encodeBytesUrlSafe : Bytes -> String
-encodeBytesUrlSafe bytes =
-    encodeBytes bytes
-        |> String.replace "+" "-"
-        |> String.replace "/" "_"
-        |> String.replace "=" ""
