@@ -210,24 +210,4 @@ tests =
                 Sqlite.Auth.Password.PhcString.parse "$id$m=65536,bad"
                     |> Expect.equal (Err (Sqlite.Auth.Password.PhcString.KvPairMissingEquals "bad"))
             )
-
         ]
-
-        Sqlite.Auth.Password.PhcString.SaltAndHash { salt, hash } ->
-            Sqlite.Auth.Password.PhcString.SaltAndHash { salt = pad salt, hash = pad hash }
-
-
-{-| Re-pad an unpadded base64 chunk with trailing `=` to a multiple of four,
-the way the parser does before handing chunks back.
--}
-pad : String -> String
-pad string =
-    when Math.remainderBy 4 (String.count string) is
-        2 ->
-            string ++ "=="
-
-        3 ->
-            string ++ "="
-
-        _ ->
-            string
