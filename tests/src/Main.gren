@@ -9,7 +9,7 @@ import Init
 import Node
 import Task exposing ( Task )
 import Test.Runner.Effectful exposing ( await, concat )
-import Tests.PhcString
+import Tests.Sqlite.Auth.Password.PhcString
 import Tests.Sqlite.Auth.Password
 import Tests.Sqlite.Auth.Session
 import Tests.Sqlite.Auth.User
@@ -29,7 +29,7 @@ main =
                             await "Remove test databases left by a previous run" (removeTestDatabases fsPermission)
                                 (\_ ->
                                     concat
-                                        [ Test.Runner.Effectful.wrap Tests.PhcString.tests
+                                        [ Test.Runner.Effectful.wrap Tests.Sqlite.Auth.Password.PhcString.tests
                                         , Tests.Sqlite.Auth.User.tests fsPermission secureContext
                                         , Tests.Sqlite.Auth.Password.tests fsPermission secureContext
                                         , Tests.Sqlite.Auth.Username.tests fsPermission secureContext

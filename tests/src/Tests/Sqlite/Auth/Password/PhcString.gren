@@ -1,4 +1,4 @@
-module Tests.PhcString exposing (tests)
+module Tests.Sqlite.Auth.Password.PhcString exposing (tests)
 
 {-| Tests for `Sqlite.Auth.Password.PhcString`.
 -}
