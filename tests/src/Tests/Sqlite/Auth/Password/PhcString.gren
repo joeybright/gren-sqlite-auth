@@ -28,7 +28,7 @@ tests =
                         |> Expect.equal (Err Sqlite.Auth.Password.PhcString.EmptyInput)
                 )
         , describe "Examples in PHC string format docs"
-            -- Source: https://github.com/P-H-C/phc-string-format/blob/master/phc-sf-spec.md
+            -- Source: https://github.com/C2SP/C2SP/blob/main/phc-strings.md
             [ test "Parses the Argon2id example in docs exactly"
                 (\_ ->
                     Sqlite.Auth.Password.PhcString.parse "$argon2id$v=19$m=65536,t=2,p=1$gZiV/M1gPc22ElAH/Jh1Hw$CWOrkoo7oJBQ/iyh7uJ0LO2aLEfrHwTWllSAxT0zRno"
