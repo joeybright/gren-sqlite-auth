@@ -24,7 +24,7 @@ main =
         (\env ->
             Init.await FileSystem.initialize
                 (\fsPermission ->
-                    await "Get secure context for Crypto functions" Crypto.getSecureContext
+                    await "Get secure context" Crypto.getSecureContext
                         (\secureContext ->
                             await "Remove test databases left by a previous run" (removeTestDatabases fsPermission)
                                 (\_ ->
@@ -43,17 +43,20 @@ main =
         )
 
 
-{-| Delete the on-disk databases every suite writes, tolerating files that do
-not exist, so each run starts from empty tables instead of accreting rows.
+{-| Delete the on-disk databases every suite writes.
 -}
 removeTestDatabases : FileSystem.Permission -> Task x {}
 removeTestDatabases fsPermission =
-    [ "test-sqlite-auth.sqlite"
-    , "test-sqlite-auth-user.sqlite"
-    , "test-sqlite-auth-username.sqlite"
-    , "test-sqlite-auth-password.sqlite"
-    , "test-sqlite-auth-session.sqlite"
-    ]
+    let
+        testDatabases =
+            [ "test-sqlite-auth.sqlite"
+            , "test-sqlite-auth-user.sqlite"
+            , "test-sqlite-auth-username.sqlite"
+            , "test-sqlite-auth-password.sqlite"
+            , "test-sqlite-auth-session.sqlite"
+            ]
+    in
+    testDatabases
         |> Array.map
             (\name ->
                 FileSystem.remove fsPermission { recursive = False } (FileSystem.Path.fromPosixString name)
