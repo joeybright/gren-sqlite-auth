@@ -112,15 +112,19 @@ new database secureContext =
             )
 
 
-{-| Look up a user by id, returning the `User` for the row. The task
-fails when there's no user with the given id.
+{-| Look up a user by id, returning the `User` for the row along with its
+`created_at` and `updated_at` timestamps. The task fails when there's no
+user with the given id.
 -}
-get : Sqlite.Database -> { id : String } -> Task Sqlite.Error Internal.User
+get :
+    Sqlite.Database
+    -> { id : String }
+    -> Task Sqlite.Error { user : Internal.User, createdAt : Int, updatedAt : Int }
 get database input =
     Sqlite.getOne database
         { query =
             """
-            SELECT id
+            SELECT id, created_at, updated_at
             FROM users
             WHERE id = :id
             """
@@ -129,7 +133,19 @@ get database input =
             ]
         , rowDecoder =
             Sqlite.Decode.string "id"
-                (\userId -> Sqlite.Decode.succeed (Internal.User { userId = userId }))
+                (\userId ->
+                    Sqlite.Decode.int "created_at"
+                        (\createdAt ->
+                            Sqlite.Decode.int "updated_at"
+                                (\updatedAt ->
+                                    Sqlite.Decode.succeed
+                                        { user = Internal.User { userId = userId }
+                                        , createdAt = createdAt
+                                        , updatedAt = updatedAt
+                                        }
+                                )
+                        )
+                )
         }
 
 
