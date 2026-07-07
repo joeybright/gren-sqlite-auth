@@ -145,7 +145,10 @@ tests =
             [ test "Emits id-only string for empty params and NoTail"
                 (\_ ->
                     Sqlite.Auth.Password.PhcString.toString
-                        { id = "argon2id", params = Dict.empty, tail = Sqlite.Auth.Password.PhcString.NoTail }
+                        { id = "argon2id"
+                        , params = Dict.empty
+                        , tail = Sqlite.Auth.Password.PhcString.NoTail 
+                        }
                         |> Expect.equal "$argon2id"
                 )
             , test "Emits version segment when only 'v' is present"
@@ -172,7 +175,10 @@ tests =
             , test "Emits SaltOnly with a single trailing segment"
                 (\_ ->
                     Sqlite.Auth.Password.PhcString.toString
-                        { id = "argon2id", params = Dict.empty, tail = Sqlite.Auth.Password.PhcString.SaltOnly "gZiV" }
+                        { id = "argon2id"
+                        , params = Dict.empty
+                        , tail = Sqlite.Auth.Password.PhcString.SaltOnly "gZiV" 
+                        }
                         |> Expect.equal "$argon2id$gZiV"
                 )
             , test "Emits SaltAndHash with two trailing segments"
@@ -180,7 +186,11 @@ tests =
                     Sqlite.Auth.Password.PhcString.toString
                         { id = "argon2id"
                         , params = Dict.empty
-                        , tail = Sqlite.Auth.Password.PhcString.SaltAndHash { salt = "gZiV", hash = "CWOr" }
+                        , tail = 
+                            Sqlite.Auth.Password.PhcString.SaltAndHash 
+                                { salt = "gZiV"
+                                , hash = "CWOr" 
+                                }
                         }
                         |> Expect.equal "$argon2id$gZiV$CWOr"
                 )
@@ -189,7 +199,11 @@ tests =
                     Sqlite.Auth.Password.PhcString.toString
                         { id = "argon2id"
                         , params = Dict.empty
-                        , tail = Sqlite.Auth.Password.PhcString.SaltAndHash { salt = "gZiV==", hash = "CWOr=" }
+                        , tail = 
+                            Sqlite.Auth.Password.PhcString.SaltAndHash 
+                                { salt = "gZiV=="
+                                , hash = "CWOr=" 
+                                }
                         }
                         |> Expect.equal "$argon2id$gZiV$CWOr"
                 )
