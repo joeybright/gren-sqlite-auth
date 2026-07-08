@@ -17,3 +17,27 @@ This package is not meant to provide production-grade authentication. While grea
 This package issues and verifies session tokens (see `Sqlite.Auth.Session`), but it does not handle HTTP cookie transport. You must put the token into a cookie (or whatever transport you use) yourself. Helpers for cookie-based session transport may be added in the future.
 
 Finally, this package does not prevent you from manipulating data saved to the database in a way that breaks the functionality provided by this package. In other words: Be very careful when writing your own SQL that interacts with the tables this package relies on. You have been warned!
+
+## Setup
+
+Install the package:
+
+    gren package install joeybright/gren-sqlite-auth
+
+Every entry point takes a `Sqlite.Database` (open one with `Sqlite.open`) and a `Crypto.SecureContext` (create one with `Crypto.getSecureContext`).
+
+### Migrations
+
+Run these in order — the last three reference the `users` table the first one creates:
+
+    [ Sqlite.Auth.User.migrationV1
+    , Sqlite.Auth.Username.migrationV1
+    , Sqlite.Auth.Password.migrationV1
+    , Sqlite.Auth.Session.migrationV1
+    ]
+
+Each migration is plug-and-play with `gren-sqlite-migrate`. If you use a different tool, read the SQL from each migration's `statements` field.
+
+### Usage
+
+Register a user with [`Sqlite.Auth.User.new`](Sqlite.Auth.User#new), attach a [`Sqlite.Auth.Username`](Sqlite.Auth.Username) and a [`Sqlite.Auth.Password`](Sqlite.Auth.Password), then issue a [`Sqlite.Auth.Session`](Sqlite.Auth.Session). See each module's docs for worked examples.
