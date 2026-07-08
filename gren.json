@@ -2,7 +2,7 @@
     "type": "package",
     "platform": "node",
     "name": "joeybright/gren-sqlite-auth",
-    "summary": "",
+    "summary": "Authentication primitives for Gren applications backed by SQLite.",
     "license": "BSD-3-Clause",
     "version": "1.0.0",
     "exposed-modules": [
