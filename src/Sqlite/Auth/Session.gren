@@ -121,10 +121,17 @@ type alias Session =
     }
 
 
-{-| Options for sessions. `lifetimeMillis` caps a session's absolute age; 
-`idleTimeoutMillis` caps how long it survives without being used. A stolen 
-token on an abandoned session should not stay live for the rest of the absolute 
-lifetime.
+{-| Options for sessions.
+
+- `lifetimeMillis` caps a session's absolute age. A value of `0` means a
+session is expired the moment it is issued.
+- `idleTimeoutMillis` caps how long a session survives without being used. A
+value of `0` means a session is idle-timed-out the moment it is issued, so the
+first `verify` fails with `IdleTimeout`.
+
+A stolen token on an abandoned session should not stay live for the rest of
+the absolute lifetime, so `idleTimeoutMillis` should be shorter than
+`lifetimeMillis`.
 -}
 type alias Options =
     { lifetimeMillis : Int
