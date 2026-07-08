@@ -1,8 +1,8 @@
-module Utils.Crypto exposing ( digestAsBase64 )
+module Utils.Crypto exposing ( digestAsBase64, hashTokenForStorage )
 
 {-| Cryptographic digest helpers.
 
-@docs digestAsBase64
+@docs digestAsBase64, hashTokenForStorage
 
 -}
 
@@ -21,3 +21,11 @@ digestAsBase64 : Crypto.SecureContext -> Crypto.DigestAlgorithm -> Bytes -> Task
 digestAsBase64 secureContext algorithm bytes =
     Crypto.digest secureContext algorithm bytes
         |> Task.map Utils.Base64.encodeBytes
+
+
+{-| Hash a raw token for storage. The base64-encoded SHA-256 digest of the token's 
+UTF-8 bytes. This is the stored form the session and reset-token tables key on.
+-}
+hashTokenForStorage : Crypto.SecureContext -> String -> Task x String
+hashTokenForStorage secureContext token =
+    digestAsBase64 secureContext Crypto.Sha256 (Bytes.fromString token)
