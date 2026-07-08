@@ -14,6 +14,6 @@ More importantly, this package, when used properly (see _What this package does 
 
 This package is not meant to provide production-grade authentication. While great care has gone into ensuring information is saved to the database properly, I (the author) am not a security engineer, nor has this codebase been reviewed by security professionals. As such, it's highly recommended to review and deeply interrogate the implementation of all functionality in this package before using it in any critical systems.
 
-This package does not help in setting up proper endpoints for authentication or handling sessions with proper HTTP cookies and such. Modules to help with this - particularly in handling session tokens via HTTP cookies - may be added in the future.
+This package issues and verifies session tokens (see `Sqlite.Auth.Session`), but it does not handle HTTP cookie transport. You must put the token into a cookie (or whatever transport you use) yourself. Helpers for cookie-based session transport may be added in the future.
 
 Finally, this package does not prevent you from manipulating data saved to the database in a way that breaks the functionality provided by this package. In other words: Be very careful when writing your own SQL that interacts with the tables this package relies on. You have been warned!
