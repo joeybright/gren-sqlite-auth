@@ -1,14 +1,6 @@
 module Tests.Sqlite.Auth.Session exposing ( tests )
 
-{-| Tests isolated to `Sqlite.Auth.Session` — the session-token lifecycle:
-`issue`/`verify`/`validate`/`revoke`/`revokeAll`, exercised against an on-disk
-database.
-
-Behavior is observed through the module's own `verify`/`validate`, so no raw SQL
-is needed. Each group creates its own user (the `sessions.user_id` foreign
-key) and mints the `Verified` witness `issue` demands directly from
-`Sqlite.Auth.Internal`. Expiry and idle timeout are forced deterministically by
-zeroing the relevant `Options` field rather than waiting on the clock.
+{-| Tests for `Sqlite.Auth.Session`.
 
 @docs tests
 
@@ -30,17 +22,13 @@ import Test
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
 
 
-{-| Mint the `Verified` witness for a user — the proof `Session.issue` demands.
-A credential check would mint this in production; the suite mints it directly.
--}
+{-|-}
 verifiedFor : Internal.User -> Internal.Verified
 verifiedFor user =
     Internal.Verified { userId = User.id user }
 
 
-{-| Open the database, migrate, and run the database-backed
-`Sqlite.Auth.Session` tests.
--}
+{-|-}
 tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
 tests fsPermission secureContext =
     let
@@ -116,7 +104,7 @@ verifyUnknownTests database secureContext =
         )
 
 
-{-| `verify` mints the `Verified` witness for a live token and fails with
+{-| `verify` mints the `Verified` type for a live token and fails with
 `TokenNotFound` for an unknown one.
 -}
 validateTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
@@ -134,7 +122,7 @@ validateTests database secureContext =
                         (Session.verify database secureContext Session.defaultOptions { token = issued.token })
                         (\proof ->
                             concat
-                                [ test "verify mints the Verified witness for a live token"
+                                [ test "verify mints the Verified type for a live token"
                                     (\_ -> Expect.equal (verifiedFor user) proof.verified)
                                 , awaitError
                                     "Verify an unknown token"
@@ -149,7 +137,7 @@ validateTests database secureContext =
         )
 
 
-{-| Successful verification is what keeps a session alive: each `verify` bumps
+{-| Successful verification is what keeps a session alive. Each `verify` bumps
 `lastUsedAt`, and the returned session reflects the bump.
 -}
 touchOnUseTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
@@ -182,8 +170,7 @@ touchOnUseTests database secureContext =
         )
 
 
-{-| Two issued sessions carry distinct raw tokens — a canary for a broken or
-misused random source.
+{-| Two issued sessions carry distinct raw tokens.
 -}
 tokenUniquenessTests : Sqlite.Database -> Crypto.SecureContext -> Test.Runner.Effectful.Test
 tokenUniquenessTests database secureContext =
