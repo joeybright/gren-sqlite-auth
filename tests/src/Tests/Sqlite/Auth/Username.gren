@@ -20,7 +20,7 @@ import Expect
 import FileSystem
 import FileSystem.Path
 import Sqlite
-import Sqlite.Auth.Internal as Internal
+import Tests.Sqlite.Auth.Helpers exposing (verifiedFor)
 import Sqlite.Auth.User as User
 import Sqlite.Auth.Username as Username
 import Sqlite.Migrate
@@ -208,7 +208,7 @@ changeRenameTests database secureContext suffix =
                                 (\_ ->
                                     await
                                         "Rename with the owner's proof"
-                                        (Username.change database { newUsername = to } (Internal.Verified { userId = User.id user }))
+                                        (Username.change database { newUsername = to } (verifiedFor user))
                                         (\_ ->
                                             await
                                                 "Look up the old username after renaming"
@@ -256,7 +256,7 @@ changeScopingTests database secureContext suffix =
                                         (\_ ->
                                             await
                                                 "Rename with a mismatched proof"
-                                                (Username.change database { newUsername = to } (Internal.Verified { userId = User.id userB }))
+                                                (Username.change database { newUsername = to } (verifiedFor userB))
                                                 (\_ ->
                                                     await
                                                         "Look up the original username after the mismatched rename"
@@ -295,7 +295,7 @@ changeWithoutUsernameTests database secureContext suffix =
                 (\user ->
                     await
                         "Rename the user who has no username row"
-                        (Username.change database { newUsername = target } (Internal.Verified { userId = User.id user }))
+                        (Username.change database { newUsername = target } (verifiedFor user))
                         (\_ ->
                             await
                                 "Look up the target username after the no-op rename"
@@ -331,7 +331,7 @@ changeTakenTests database secureContext suffix =
                                         (\_ ->
                                             awaitError
                                                 "Rename the second username to the first"
-                                                (Username.change database { newUsername = one } (Internal.Verified { userId = User.id user }))
+                                                (Username.change database { newUsername = one } (verifiedFor user))
                                                 (\_ ->
                                                     test "renaming to a taken username fails on the primary key"
                                                         (\_ -> Expect.pass)

@@ -45,6 +45,7 @@ import Sqlite.Decode
 import Sqlite.Migrate
 import Task exposing ( Task )
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
+import Tests.Sqlite.Auth.Helpers exposing (hashed)
 
 
 {-| The ways the combined pipelines can fail: hashing the new password, a
@@ -119,7 +120,7 @@ register :
 register database secureContext { username, password } =
     Task.map2
         (\hashedPassword username_ -> { hashedPassword = hashedPassword, username = username_ })
-        (Password.hash secureContext Password.defaultOptions (Password.fromString password)
+        (hashed secureContext password
             |> Task.mapError HashError
         )
         (normalized username)
@@ -172,7 +173,7 @@ changePassword :
 changePassword database secureContext { username, current, new } =
     Task.map2
         (\hashedNew maybeUser -> { hashedNew = hashedNew, maybeUser = maybeUser })
-        (Password.hash secureContext Password.defaultOptions (Password.fromString new)
+        (hashed secureContext new
             |> Task.mapError HashError
         )
         (resolve database username)
@@ -268,7 +269,7 @@ redeemReset :
     -> { token : String, new : String }
     -> Task Error { session : Session.Session, token : String }
 redeemReset database secureContext input =
-    Password.hash secureContext Password.defaultOptions (Password.fromString input.new)
+    hashed secureContext input.new
         |> Task.mapError HashError
         |> Task.andThen
             (\hashedNew ->

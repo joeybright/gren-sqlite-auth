@@ -11,21 +11,11 @@ import Expect
 import FileSystem
 import FileSystem.Path
 import Sqlite
-import Sqlite.Auth.Internal as Internal
 import Sqlite.Auth.Session as Session
 import Sqlite.Auth.User as User
-import Sqlite.Decode
-import Sqlite.Encode
 import Sqlite.Migrate
-import Task exposing ( Task )
-import Test
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
-
-
-{-|-}
-verifiedFor : Internal.User -> Internal.Verified
-verifiedFor user =
-    Internal.Verified { userId = User.id user }
+import Tests.Sqlite.Auth.Helpers exposing (verifiedFor, countRowsByUserId)
 
 
 {-|-}
@@ -353,7 +343,7 @@ issueSweepTests database secureContext =
                                 (\_ ->
                                     await
                                         "Count the first user's session rows"
-                                        (countSessionRows database { userId = User.id expiredUser })
+                                        (countRowsByUserId database { table = "sessions", userId = User.id expiredUser })
                                         (\count ->
                                             test "the expired session row was swept"
                                                 (\_ -> Expect.equal 0 count)
@@ -362,27 +352,6 @@ issueSweepTests database secureContext =
                         )
                 )
         )
-
-
-{-| Count a user's rows in `sessions` directly — the one place a raw query is
-needed, because sweeping is about the row being gone, not about any observable
-`verify` outcome.
--}
-countSessionRows : Sqlite.Database -> { userId : String } -> Task Sqlite.Error Int
-countSessionRows database { userId } =
-    Sqlite.getOne database
-        { query =
-            """
-            SELECT COUNT(*) AS row_count
-            FROM sessions
-            WHERE user_id = :user_id
-            """
-        , parameters =
-            [ Sqlite.Encode.string "user_id" userId
-            ]
-        , rowDecoder =
-            Sqlite.Decode.int "row_count" Sqlite.Decode.succeed
-        }
 
 
 {-| A session unused past the idle timeout fails to verify with `IdleTimeout` —

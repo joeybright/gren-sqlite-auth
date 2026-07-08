@@ -1,0 +1,49 @@
+module Tests.Sqlite.Auth.Helpers exposing
+    ( verifiedFor
+    , hashed
+    , countRowsByUserId
+    )
+
+{-| Shared fixtures and query helpers for the `Sqlite.Auth` test suites.
+
+@docs verifiedFor, hashed, countRowsByUserId
+
+-}
+
+import Crypto
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.Password as Password
+import Sqlite.Auth.User as User
+import Sqlite.Decode
+import Sqlite.Encode
+import Task exposing ( Task )
+
+
+{-| The `Verified` type for a user.
+-}
+verifiedFor : Internal.User -> Internal.Verified
+verifiedFor user =
+    Internal.Verified { userId = User.id user }
+
+
+{-| Hash a plain-text password with the default options.
+-}
+hashed : Crypto.SecureContext -> String -> Task Password.HashError (Password.Password Password.Hashed)
+hashed secureContext string =
+    Password.hash secureContext Password.defaultOptions (Password.fromString string)
+
+
+{-| Count rows in `table` belonging to `userId`.
+-}
+countRowsByUserId : Sqlite.Database -> { table : String, userId : String } -> Task Sqlite.Error Int
+countRowsByUserId database { table, userId } =
+    Sqlite.getOne database
+        { query =
+            "SELECT COUNT(*) AS row_count FROM " ++ table ++ " WHERE user_id = :user_id"
+        , parameters =
+            [ Sqlite.Encode.string "user_id" userId 
+            ]
+        , rowDecoder =
+            Sqlite.Decode.int "row_count" Sqlite.Decode.succeed
+        }
