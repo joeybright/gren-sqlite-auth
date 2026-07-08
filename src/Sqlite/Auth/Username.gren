@@ -189,6 +189,9 @@ A password check with
 [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) creates the
 `Verified` type, and so does verifying a live session through
 [`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify).
+
+If the user has no username row, this is a silent no-op: the task succeeds but
+no row is created or changed.
 -}
 change : Sqlite.Database -> { newUsername : Username Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
 change database { newUsername } ((Internal.Verified { userId }) as verified) =
