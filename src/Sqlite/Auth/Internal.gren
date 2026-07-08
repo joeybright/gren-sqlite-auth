@@ -9,8 +9,9 @@ can mint a witness; consumers can merely pass them along.
 -}
 
 
-{-| Proof that a `users` row exists. Minted by `Sqlite.Auth.User.new` (and, in
-future slices, by lookups that resolve an identifier to its user).
+{-| Proof that a `users` row exists. Created by `Sqlite.Auth.User.new` and by
+lookups that resolve an identifier to its user, such as
+`Sqlite.Auth.Username.user`.
 -}
 type User
     = User { userId : String }
