@@ -100,7 +100,17 @@ validParseTests =
                     |> Expect.equal
                         (Ok
                             { localPart = DotAtom [ "user" ]
-                            , domain = Literal (Ipv6 "2001:db8::1")
+                            , domain = Literal (Ipv6 { tag = "IPv6:", address = "2001:db8::1" })
+                            }
+                        )
+            )
+        , Test.test "an unspecified IPv6 address literal is classified and validated"
+            (\_ ->
+                Parser.parse "user@[IPv6:::]"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = DotAtom [ "user" ]
+                            , domain = Literal (Ipv6 { tag = "IPv6:", address = "::" })
                             }
                         )
             )
@@ -120,6 +130,8 @@ roundTripTests =
         , roundTrip "\"a@b\"@example.com"
         , roundTrip "user@[192.168.0.1]"
         , roundTrip "user@[IPv6:2001:db8::1]"
+        , roundTrip "user@[ipv6:2001:db8::1]"
+        , roundTrip "user@[IPv6:::]"
         ]
 
 

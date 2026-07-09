@@ -87,14 +87,15 @@ type Domain
 
 {-| The content of an `[address-literal]`.
 
-`Ipv4` and `Ipv6` carry the validated address text (without the surrounding
-brackets; for `Ipv6` the `IPv6:` tag has been consumed). General `[tag:value]`
-address literals are deliberately rejected.
+`Ipv4` carries the validated address text without the surrounding brackets.
+`Ipv6` carries the tag exactly as it appeared (`IPv6:`, `ipv6:`, etc.) plus the
+validated address text, so [`toString`](#toString) can preserve caller input.
+General `[tag:value]` address literals are deliberately rejected.
 
 -}
 type AddressLiteral
     = Ipv4 String
-    | Ipv6 String
+    | Ipv6 { tag : String, address : String }
 
 
 {-| Reasons `parse` can fail.
@@ -481,11 +482,14 @@ validateLiteral body =
 
     else if String.startsWith "ipv6:" (String.toLower body) then
         let
+            tag =
+                String.dropLast (String.count body - 5) body
+
             address =
                 String.dropFirst 5 body
         in
         if isValidIpv6 address then
-            Parser.succeed (Ipv6 address)
+            Parser.succeed (Ipv6 { tag = tag, address = address })
 
         else
             hardFail (InvalidIpv6 address)
@@ -691,8 +695,8 @@ literalLiteralOctets literal =
                 Ipv4 address ->
                     address
 
-                Ipv6 address ->
-                    "IPv6:" ++ address
+                Ipv6 ipv6 ->
+                    ipv6.tag ++ ipv6.address
 
     in
     String.count inner + 2
@@ -755,7 +759,7 @@ only on strings known to hold exactly one chomped character.
 -}
 firstChar : String -> Char
 firstChar string =
-    String.foldl (\c _ -> c) ' ' string
+    String.foldr (\c _ -> c) ' ' string
 
 
 
@@ -898,8 +902,8 @@ hardFail err =
 For a `DotAtom` local-part or `Labels` domain the output is canonical for this
 module (atoms and labels are re-joined with `.`); a `QuotedString` local-part
 is emitted verbatim from its `raw` text, so a parsed quoted-string round-trips
-exactly. Address literals are re-wrapped in brackets, with the `IPv6:` tag
-restored for `Ipv6`.
+exactly. Address literals are re-wrapped in brackets, preserving an `Ipv6` tag's
+original casing.
 
 -}
 toString : EmailAddress -> String
@@ -933,5 +937,5 @@ literalToString literal =
         Ipv4 address ->
             address
 
-        Ipv6 address ->
-            "IPv6:" ++ address
+        Ipv6 ipv6 ->
+            ipv6.tag ++ ipv6.address
