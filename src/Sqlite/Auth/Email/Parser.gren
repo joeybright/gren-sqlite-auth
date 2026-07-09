@@ -1,0 +1,955 @@
+module Sqlite.Auth.Email.Parser exposing
+    ( EmailAddress
+    , LocalPart(..)
+    , Domain(..)
+    , AddressLiteral(..)
+    , Error(..)
+    , parse
+    , toString
+    )
+
+{-| Parser and encoder for email addresses as defined by RFC 5321, restricted
+to the ASCII subset that real SMTP delivery can actually accept.
+
+This module's job is *string → structured data*. It performs the full
+structural parse — local-part (dot-string or quoted-string), domain (dot-atom
+of labels or an `[address-literal]`), and `@` separator — and the RFC 5321
+octet limits (local-part ≤ 64, each domain label ≤ 63, domain ≤ 255, total
+≤ 254). IPv4 and IPv6 address literals are validated; a `[tag:value]` form that
+is neither is captured structurally as a `General` literal without deep
+validation.
+
+Two things are deliberately out of scope and left to the caller:
+
+  - **Internationalization.** Only ASCII is accepted. A non-ASCII character in
+    the local-part or domain is a parse failure, not silently accepted. IDN
+    domains must be punycode-encoded by the caller before parsing, and
+    SMTPUTF8 (RFC 6531) is not supported.
+  - **Content policy.** Disposable-provider rejection, lookalike-glyph
+    stripping, and case folding are the caller's responsibility. The parser is
+    case-neutral; [`Sqlite.Auth.Email`](Sqlite.Auth.Email) owns the
+    lowercasing that makes a normalized email a stable primary key.
+
+Comments and folding whitespace (RFC 5322 CFWS) are not supported: any
+whitespace inside an unquoted local-part is a parse failure, which keeps a
+lookalike-bypass off an auth primary key.
+
+The parser is a sequential, no-backtracking pipeline driven by
+`String.Parser.Advanced`. Each segment chomps to its terminator and lets an
+`andThen` validate the chomped chunk, the same discipline
+[`Sqlite.Auth.Password.PhcString`](Sqlite.Auth.Password.PhcString) uses.
+
+@docs EmailAddress, LocalPart, Domain, AddressLiteral
+@docs Error
+@docs parse, toString
+
+-}
+
+import Array exposing (Array)
+import Char exposing (Char)
+import Maybe exposing (Maybe(..))
+import Result exposing (Result(..))
+import String
+import String.Parser.Advanced as Parser exposing (Step(..))
+
+
+{-| A parsed email address: a [`LocalPart`](#LocalPart) and a
+[`Domain`](#Domain) joined by `@`.
+-}
+type alias EmailAddress =
+    { localPart : LocalPart
+    , domain : Domain
+    }
+
+
+{-| The local part (before `@`).
+
+A dot-string is split into its `atoms` so the dot structure is inspectable;
+the array is never empty and contains no empty atoms. A quoted-string carries
+its `raw` text verbatim, including the surrounding `"` characters and any
+backslash escapes, so it round-trips through [`toString`](#toString) exactly.
+
+-}
+type LocalPart
+    = DotAtom (Array String)
+    | QuotedString { raw : String }
+
+
+{-| The domain (after `@`).
+
+`Labels` is the dot-atom form, split into labels; the array is never empty and
+contains no empty labels. `Literal` is the bracketed `[address-literal]` form.
+
+-}
+type Domain
+    = Labels (Array String)
+    | Literal AddressLiteral
+
+
+{-| The content of an `[address-literal]`.
+
+`Ipv4` and `Ipv6` carry the validated address text (without the surrounding
+brackets; for `Ipv6` the `IPv6:` tag has been consumed). `General` captures a
+`[tag:value]` form that is neither, keeping the `tag` and `value` without deep
+validation.
+
+-}
+type AddressLiteral
+    = Ipv4 String
+    | Ipv6 String
+    | General { tag : String, value : String }
+
+
+{-| Reasons `parse` can fail.
+
+  - `EmptyInput` — the input was empty (after the caller trims).
+  - `MissingAtSign` — no `@` separated a local-part from a domain.
+  - `EmptyLocalPart` — the `@` was present but nothing preceded it.
+  - `EmptyDomain` — the `@` was present but nothing followed it.
+  - `InvalidLocalPartChar` — a character illegal in an unquoted local-part;
+    the wrapped `Char` is the offender.
+  - `DotAtLocalStart` / `DotAtLocalEnd` / `ConsecutiveDotInLocal` — the
+    dot-string had a leading dot, trailing dot, or `..`.
+  - `UnclosedQuote` — a quoted-string never saw its closing `"`.
+  - `InvalidQuotedChar` — a character illegal even inside quotes (a control
+    character); the wrapped `Char` is the offender.
+  - `BadEscape` — a `\` was followed by a character that is not a printable
+    ASCII character; the wrapped `Char` is the offender.
+  - `EmptyDomainLabel` — the dot-atom domain had a leading dot, trailing dot,
+    or `..`.
+  - `InvalidDomainLabelChar` — a character illegal in a domain label; the
+    wrapped `Char` is the offender.
+  - `LabelStartsOrEndsWithHyphen` — a label began or ended with `-`; the
+    wrapped `String` is the offending label.
+  - `UnclosedDomainLiteral` — a `[` was never closed by `]`.
+  - `EmptyDomainLiteral` — the brackets were empty (`[]`).
+  - `InvalidIpv4` / `InvalidIpv6` — an address literal did not validate; the
+    wrapped `String` is the offending content.
+  - `LocalPartTooLong` / `DomainTooLong` / `EmailTooLong` / `LabelTooLong` —
+    an RFC 5321 octet limit was exceeded; the wrapped `Int`/`String` is the
+    actual count or label.
+  - `UnexpectedParseFailure` — defensive catch-all for parser dead-ends that
+    do not map to a public error; should never fire given the current parser.
+
+-}
+type Error
+    = EmptyInput
+    | MissingAtSign
+    | EmptyLocalPart
+    | EmptyDomain
+    | InvalidLocalPartChar Char
+    | DotAtLocalStart
+    | DotAtLocalEnd
+    | ConsecutiveDotInLocal
+    | UnclosedQuote
+    | InvalidQuotedChar Char
+    | BadEscape Char
+    | EmptyDomainLabel
+    | InvalidDomainLabelChar Char
+    | LabelStartsOrEndsWithHyphen String
+    | UnclosedDomainLiteral
+    | EmptyDomainLiteral
+    | InvalidIpv4 String
+    | InvalidIpv6 String
+    | LocalPartTooLong Int
+    | DomainTooLong Int
+    | EmailTooLong Int
+    | LabelTooLong String
+    | UnexpectedParseFailure String
+
+
+{-| Parse an email address into a structured [`EmailAddress`](#EmailAddress).
+The input should already be trimmed by the caller; an empty string yields
+`EmptyInput`. Everything else is returned exactly as parsed, with the RFC 5321
+octet limits enforced.
+
+Because the parser is ASCII-only and case-neutral, callers that need a stable
+primary key (such as [`Sqlite.Auth.Email`](Sqlite.Auth.Email)) should lowercase
+the string themselves after a successful parse.
+-}
+parse : String -> Result Error EmailAddress
+parse input =
+    if String.isEmpty input then
+        Err EmptyInput
+
+    else
+        Parser.run emailParser {} input
+            |> Result.mapError deadEndsToError
+            |> Result.andThen enforceLengths
+
+
+unexpectedEnd : Error
+unexpectedEnd =
+    UnexpectedParseFailure "expected end of input"
+
+
+{-| Translate the most useful advanced parser dead-end into a typed
+[`Error`](#Error), preferring the most specific domain error. Mirrors the
+strategy in `Sqlite.Auth.Password.PhcString`.
+-}
+deadEndsToError : Array (Parser.DeadEnd {} Error) -> Error
+deadEndsToError deadEnds =
+    when Array.findFirst isDomainDeadEnd deadEnds is
+        Just found ->
+            found.value.problem
+
+        Nothing ->
+            when Array.popFirst deadEnds is
+                Just { first } ->
+                    first.problem
+
+                Nothing ->
+                    UnexpectedParseFailure "parser failed without a dead end"
+
+
+isDomainDeadEnd : Parser.DeadEnd {} Error -> Bool
+isDomainDeadEnd deadEnd =
+    when deadEnd.problem is
+        UnexpectedParseFailure _ ->
+            False
+
+        _ ->
+            True
+
+
+type alias EmailParser a =
+    Parser.Parser {} Error a
+
+
+{-| Top-level parser: local-part (which consumes its terminating `@`), domain,
+and end of input. Consuming the `@` inside the local-part parser lets a
+dot-string report an invalid local-part character (the char that broke the
+chomp) rather than a misleading `MissingAtSign` when an `@` exists later.
+-}
+emailParser : EmailParser EmailAddress
+emailParser =
+    Parser.succeed (\local domain -> { localPart = local, domain = domain })
+        |> Parser.keep localPartParser
+        |> Parser.keep domainParser
+        |> Parser.skip (Parser.end unexpectedEnd)
+
+
+
+-- LOCAL PART
+
+
+{-| A quoted-string begins with `"`; a dot-string does not. The branch is
+chosen by that first character with no backtracking cost. Each branch consumes
+its terminating `@` so it can report the right error for what followed.
+-}
+localPartParser : EmailParser LocalPart
+localPartParser =
+    Parser.oneOf
+        [ quotedStringParser
+        , dotStringParser
+        ]
+
+
+{-| Parse a quoted-string and its terminating `@`. The whole quoted region —
+opening `"`, body, closing `"` — is captured as `raw` so it round-trips through
+[`toString`](#toString) byte for byte. The closing `"` is consumed by the body
+loop (its `Done` step), so `getChompedString` captures both quotes. After the
+closing `"`, anything other than `@` (or end of input) is a `MissingAtSign`.
+-}
+quotedStringParser : EmailParser LocalPart
+quotedStringParser =
+    Parser.getChompedString
+        (Parser.succeed {}
+            |> Parser.skip (Parser.chompChar '"' UnclosedQuote)
+            |> Parser.skip (Parser.loop InQuoteContent quoteStep)
+        )
+        |> Parser.map (\raw -> QuotedString { raw = raw })
+        |> Parser.andThen
+            (\localPart ->
+                atSignAfterQuoted
+                    |> Parser.map (\_ -> localPart)
+            )
+
+
+{-| Consume the `@` that terminates a quoted-string local-part. After a closing
+`"`, any character that is not `@` — including a perfectly valid `atext`
+character — means the separator is missing, so it is reported as
+`MissingAtSign`, not as an invalid local-part character.
+-}
+atSignAfterQuoted : EmailParser {}
+atSignAfterQuoted =
+    Parser.oneOf
+        [ Parser.chompChar '@' unexpectedEnd
+        , Parser.end unexpectedEnd
+            |> Parser.andThen (\_ -> hardFail MissingAtSign)
+        , Parser.commit {}
+            |> Parser.andThen (\_ -> Parser.problem MissingAtSign)
+        ]
+
+
+type QuoteState
+    = InQuoteContent
+    | AfterBackslash
+
+
+{-| One step of the quoted-string body loop. Stops at the closing `"`, enters
+`AfterBackslash` on `\`, and hard-fails on an unclosed quote at end of input or
+on a character that is not valid quoted content.
+-}
+quoteStep : QuoteState -> EmailParser (Step QuoteState {})
+quoteStep state =
+    when state is
+        InQuoteContent ->
+            Parser.oneOf
+                [ Parser.chompChar '"' unexpectedEnd
+                    |> Parser.map (\_ -> Done {})
+                , Parser.chompChar '\\' unexpectedEnd
+                    |> Parser.map (\_ -> Loop AfterBackslash)
+                , Parser.end unexpectedEnd
+                    |> Parser.andThen (\_ -> hardFail UnclosedQuote)
+                , Parser.getChompedString (Parser.chompIf (\_ -> True) unexpectedEnd)
+                    |> Parser.andThen
+                        (\chomped ->
+                            let
+                                char =
+                                    firstChar chomped
+                            in
+                            if isQcontent char then
+                                Parser.succeed (Loop InQuoteContent)
+
+                            else
+                                hardFail (InvalidQuotedChar char)
+                        )
+                ]
+
+        AfterBackslash ->
+            Parser.oneOf
+                [ Parser.end unexpectedEnd
+                    |> Parser.andThen (\_ -> hardFail UnclosedQuote)
+                , Parser.getChompedString (Parser.chompIf (\_ -> True) unexpectedEnd)
+                    |> Parser.andThen
+                        (\chomped ->
+                            let
+                                char =
+                                    firstChar chomped
+                            in
+                            if isQuotedPairChar char then
+                                Parser.succeed (Loop InQuoteContent)
+
+                            else
+                                hardFail (BadEscape char)
+                        )
+                ]
+
+
+{-| Parse a dot-string and its terminating `@`: chomp the atext-and-dots run,
+validate the dot structure and limits, then consume the `@`. After a valid
+dot-string, a character that is not `@` and not end-of-input broke the chomp,
+so it is reported as an invalid local-part character.
+-}
+dotStringParser : EmailParser LocalPart
+dotStringParser =
+    Parser.getChompedString (Parser.chompWhile isLocalDotChar)
+        |> Parser.andThen
+            (\chunk ->
+                validateDotString chunk
+                    |> Parser.andThen
+                        (\localPart ->
+                            atSignAfterDotString
+                                |> Parser.map (\_ -> localPart)
+                        )
+            )
+
+
+{-| A character legal to chomp while scanning a dot-string: `atext` or `.`.
+Everything else stops the chomp so `validateDotString` can report it.
+-}
+isLocalDotChar : Char -> Bool
+isLocalDotChar c =
+    isAtext c || c == '.'
+
+
+{-| Consume the `@` that terminates a dot-string local-part. After a valid
+dot-string, the next character is either `@` (continue), end of input (the
+`@` is missing), or an invalid local-part character (the char that broke the
+`atext`/`.` chomp). The last case is consumed and reported precisely.
+-}
+atSignAfterDotString : EmailParser {}
+atSignAfterDotString =
+    Parser.oneOf
+        [ Parser.chompChar '@' unexpectedEnd
+        , Parser.end unexpectedEnd
+            |> Parser.andThen (\_ -> hardFail MissingAtSign)
+        , Parser.getChompedString (Parser.chompIf (\_ -> True) unexpectedEnd)
+            |> Parser.andThen
+                (\chomped ->
+                    if String.isEmpty chomped then
+                        hardFail MissingAtSign
+
+                    else
+                        hardFail (InvalidLocalPartChar (firstChar chomped))
+                )
+        ]
+
+
+{-| Validate a chomped dot-string chunk, raising the specific dot-structure or
+length error, or returning the split atoms. The terminating `@` is consumed
+by [`atSignAfterDotString`](#atSignAfterDotString) after a successful check.
+-}
+validateDotString : String -> EmailParser LocalPart
+validateDotString chunk =
+    if String.isEmpty chunk then
+        Parser.oneOf
+            [ Parser.chompChar '@' unexpectedEnd
+                |> Parser.andThen (\_ -> hardFail EmptyLocalPart)
+            , Parser.end unexpectedEnd
+                |> Parser.andThen (\_ -> hardFail EmptyLocalPart)
+            , Parser.getChompedString (Parser.chompIf (\_ -> True) unexpectedEnd)
+                |> Parser.andThen
+                    (\chomped ->
+                        if String.isEmpty chomped then
+                            hardFail EmptyLocalPart
+
+                        else
+                            hardFail (InvalidLocalPartChar (firstChar chomped))
+                    )
+            ]
+
+    else
+        let
+            atoms =
+                String.split "." chunk
+        in
+        if String.startsWith "." chunk then
+            hardFail DotAtLocalStart
+
+        else if String.endsWith "." chunk then
+            hardFail DotAtLocalEnd
+
+        else if Array.any String.isEmpty atoms then
+            hardFail ConsecutiveDotInLocal
+
+        else
+            let
+                octets =
+                    String.count chunk
+            in
+            if octets > 64 then
+                hardFail (LocalPartTooLong octets)
+
+            else
+                Parser.succeed (DotAtom atoms)
+
+
+
+-- DOMAIN
+
+
+{-| An address-literal begins with `[`; a dot-atom domain does not. The branch
+is chosen by that first character with no backtracking cost.
+-}
+domainParser : EmailParser Domain
+domainParser =
+    Parser.oneOf
+        [ literalParser
+        , labelsParser
+        ]
+
+
+{-| Parse a `[address-literal]`. The brackets are consumed; the body is
+classified as IPv4, IPv6, or a general tagged literal.
+-}
+literalParser : EmailParser Domain
+literalParser =
+    Parser.succeed (\literal -> Literal literal)
+        |> Parser.skip (Parser.chompChar '[' UnclosedDomainLiteral)
+        |> Parser.keep literalBodyParser
+        |> Parser.skip (Parser.chompChar ']' UnclosedDomainLiteral)
+
+
+{-| Chomp the literal body up to `]` or end of input, then classify it.
+-}
+literalBodyParser : EmailParser AddressLiteral
+literalBodyParser =
+    Parser.getChompedString (Parser.chompUntilEndOr "]")
+        |> Parser.andThen validateLiteral
+
+
+{-| Classify a chomped literal body as IPv4, IPv6 (by its `IPv6:` tag), or a
+general `[tag:value]` literal, validating IPv4 and IPv6 fully.
+-}
+validateLiteral : String -> EmailParser AddressLiteral
+validateLiteral body =
+    if String.isEmpty body then
+        hardFail EmptyDomainLiteral
+
+    else if String.startsWith "ipv6:" (String.toLower body) then
+        let
+            address =
+                String.dropFirst 5 body
+        in
+        if isValidIpv6 address then
+            Parser.succeed (Ipv6 address)
+
+        else
+            hardFail (InvalidIpv6 address)
+
+    else if String.contains ":" body then
+        let
+            parts =
+                String.split ":" body
+        in
+        when Array.first parts is
+            Just tag ->
+                Parser.succeed
+                    (General
+                        { tag = tag
+                        , value = String.join ":" (Array.dropFirst 1 parts)
+                        }
+                    )
+
+            Nothing ->
+                hardFail (InvalidIpv4 body)
+
+    else if isValidIpv4 body then
+        Parser.succeed (Ipv4 body)
+
+    else
+        hardFail (InvalidIpv4 body)
+
+
+{-| Parse a dot-atom domain: `label *("." label)`. Chomp the label-and-dots
+run, then validate label structure and limits in `andThen`.
+-}
+labelsParser : EmailParser Domain
+labelsParser =
+    Parser.getChompedString (Parser.chompWhile isDomainChar)
+        |> Parser.andThen validateLabels
+
+
+{-| A character legal to chomp while scanning a dot-atom domain: a letter,
+digit, `-`, or `.`. Everything else stops the chomp so `validateLabels` can
+report it.
+-}
+isDomainChar : Char -> Bool
+isDomainChar c =
+    Char.isAlphaNum c || c == '-' || c == '.'
+
+
+{-| Validate a chomped domain chunk, raising the specific label, dot-structure,
+or length error, or returning the split labels.
+-}
+validateLabels : String -> EmailParser Domain
+validateLabels chunk =
+    if String.isEmpty chunk then
+        Parser.oneOf
+            [ Parser.end unexpectedEnd
+                |> Parser.andThen (\_ -> hardFail EmptyDomain)
+            , Parser.getChompedString (Parser.chompIf (\_ -> True) unexpectedEnd)
+                |> Parser.andThen
+                    (\chomped ->
+                        if String.isEmpty chomped then
+                            hardFail EmptyDomain
+
+                        else
+                            hardFail (InvalidDomainLabelChar (firstChar chomped))
+                    )
+            ]
+
+    else
+        let
+            labels =
+                String.split "." chunk
+        in
+        if String.startsWith "." chunk || String.endsWith "." chunk then
+            hardFail EmptyDomainLabel
+
+        else if Array.any String.isEmpty labels then
+            hardFail EmptyDomainLabel
+
+        else
+            validateEachLabel labels
+
+
+{-| Validate per-label rules (charset, hyphen placement, length) and the
+whole-domain length.
+-}
+validateEachLabel : Array String -> EmailParser Domain
+validateEachLabel labels =
+    let
+        badChar =
+            Array.findFirst (\label -> not (labelStartsAndEndsWithLetDig label)) labels
+    in
+    when badChar is
+        Just found ->
+            let
+                label =
+                    found.value
+            in
+            if String.startsWith "-" label || String.endsWith "-" label then
+                hardFail (LabelStartsOrEndsWithHyphen label)
+
+            else
+                hardFail (InvalidDomainLabelChar (firstNonLabelChar label))
+
+        Nothing ->
+            let
+                tooLong =
+                    Array.findFirst (\label -> String.count label > 63) labels
+            in
+            when tooLong is
+                Just found ->
+                    hardFail (LabelTooLong found.value)
+
+                Nothing ->
+                    let
+                        octets =
+                            String.count (String.join "." labels)
+                    in
+                    if octets > 255 then
+                        hardFail (DomainTooLong octets)
+
+                    else
+                        Parser.succeed (Labels labels)
+
+
+{-| Whether a label starts and ends with a letter or digit (the `Let-dig`
+rule), ignoring any interior `-`.
+-}
+labelStartsAndEndsWithLetDig : String -> Bool
+labelStartsAndEndsWithLetDig label =
+    let
+        first =
+            String.foldl (\c _ -> c) ' ' label
+
+        last =
+            String.foldr (\c _ -> c) ' ' label
+    in
+    Char.isAlphaNum first && Char.isAlphaNum last
+
+
+{-| The first character in a label that is not a letter, digit, or `-`. Used
+only on a label that already failed `labelStartsAndEndsWithLetDig` for reasons
+other than a leading/trailing hyphen, so it always finds an offender.
+-}
+firstNonLabelChar : String -> Char
+firstNonLabelChar label =
+    let
+        offender =
+            String.foldl
+                (\c acc ->
+                    when acc is
+                        Nothing ->
+                            if Char.isAlphaNum c || c == '-' then
+                                Nothing
+
+                            else
+                                Just c
+
+                        Just found ->
+                            Just found
+                )
+                Nothing
+                label
+    in
+    when offender is
+        Just c ->
+            c
+
+        Nothing ->
+            ' '
+
+
+
+-- RFC 5321 LIMITS
+
+
+{-| Enforce the total-length limit (local-part + `@` + domain ≤ 254 octets)
+after a successful structural parse. Per-segment limits are enforced inside
+the segment parsers.
+-}
+enforceLengths : EmailAddress -> Result Error EmailAddress
+enforceLengths address =
+    let
+        total =
+            localOctets address.localPart + 1 + domainOctets address.domain
+    in
+    if total > 254 then
+        Err (EmailTooLong total)
+
+    else
+        Ok address
+
+
+localOctets : LocalPart -> Int
+localOctets localPart =
+    when localPart is
+        DotAtom atoms ->
+            String.count (String.join "." atoms)
+
+        QuotedString { raw } ->
+            String.count raw
+
+
+domainOctets : Domain -> Int
+domainOctets domain =
+    when domain is
+        Labels labels ->
+            String.count (String.join "." labels)
+
+        Literal literal ->
+            literalLiteralOctets literal
+
+
+literalLiteralOctets : AddressLiteral -> Int
+literalLiteralOctets literal =
+    let
+        inner =
+            when literal is
+                Ipv4 address ->
+                    address
+
+                Ipv6 address ->
+                    "IPv6:" ++ address
+
+                General { tag, value } ->
+                    tag ++ ":" ++ value
+    in
+    String.count inner + 2
+
+
+
+-- CHARSET PREDICATES
+
+
+{-| `atext` per RFC 5321: alphanumeric or one of the printable punctuation
+characters that need no quoting.
+-}
+isAtext : Char -> Bool
+isAtext c =
+    Char.isAlphaNum c || isAtextPunct c
+
+
+isAtextPunct : Char -> Bool
+isAtextPunct c =
+    when c is
+        '!' -> True
+        '#' -> True
+        '$' -> True
+        '%' -> True
+        '&' -> True
+        '\'' -> True
+        '*' -> True
+        '+' -> True
+        '-' -> True
+        '/' -> True
+        '=' -> True
+        '?' -> True
+        '^' -> True
+        '_' -> True
+        '`' -> True
+        '{' -> True
+        '|' -> True
+        '}' -> True
+        '~' -> True
+        _ -> False
+
+
+{-| `qcontent` per RFC 5321: printable ASCII except `"` and `\`.
+-}
+isQcontent : Char -> Bool
+isQcontent c =
+    c >= ' ' && c <= '~' && c /= '"' && c /= '\\'
+
+
+{-| A character legal after `\` in a quoted-pair: any printable ASCII
+(d32–126), including `"` and `\`.
+-}
+isQuotedPairChar : Char -> Bool
+isQuotedPairChar c =
+    c >= ' ' && c <= '~'
+
+
+{-| The first `Char` of a non-empty `String`, or `' '` if it is empty. Used
+only on strings known to hold exactly one chomped character.
+-}
+firstChar : String -> Char
+firstChar string =
+    String.foldl (\c _ -> c) ' ' string
+
+
+
+-- ADDRESS LITERAL VALIDATION
+
+
+{-| Whether a string is a valid dotted-quad IPv4 address: exactly four
+octets, each 0–255, with no leading zeros.
+-}
+isValidIpv4 : String -> Bool
+isValidIpv4 string =
+    let
+        groups =
+            String.split "." string
+    in
+    Array.length groups == 4
+        && Array.all isIpv4Octet groups
+
+
+isIpv4Octet : String -> Bool
+isIpv4Octet octet =
+    let
+        count =
+            String.count octet
+    in
+    count > 0
+        && count <= 3
+        && String.all Char.isDigit octet
+        && (count == 1 || not (String.startsWith "0" octet))
+        && (octetValue octet <= 255)
+
+
+octetValue : String -> Int
+octetValue octet =
+    String.foldl
+        (\c acc -> acc * 10 + (Char.toCode c - 48))
+        0
+        octet
+
+
+{-| Whether a string is a valid IPv6 address: colon-separated groups of 1–4
+hex digits, with at most one `::` compression standing in for one or more
+omitted zero groups. Splitting on `::` cleanly separates the left and right
+halves, and an empty half means `::` sits at that boundary; a stray third colon
+(such as `a:::b`) leaves an empty group in a half, which `isIpv6Group` rejects.
+IPv4-mapped IPv6 (a trailing dotted quad) is not accepted.
+-}
+isValidIpv6 : String -> Bool
+isValidIpv6 string =
+    let
+        halves =
+            String.split "::" string
+    in
+    if String.isEmpty string then
+        False
+
+    else if Array.length halves == 1 then
+        let
+            groups =
+                String.split ":" string
+        in
+        Array.length groups == 8 && Array.all isIpv6Group groups
+
+    else if Array.length halves == 2 then
+        let
+            leftHalf =
+                when Array.first halves is
+                    Just l ->
+                        l
+
+                    Nothing ->
+                        ""
+
+            rightHalf =
+                when Array.get 1 halves is
+                    Just r ->
+                        r
+
+                    Nothing ->
+                        ""
+
+            leftGroups =
+                if String.isEmpty leftHalf then
+                    Array.repeat 0 ""
+
+                else
+                    String.split ":" leftHalf
+
+            rightGroups =
+                if String.isEmpty rightHalf then
+                    Array.repeat 0 ""
+
+                else
+                    String.split ":" rightHalf
+        in
+        (Array.length leftGroups + Array.length rightGroups) <= 7
+            && Array.all isIpv6Group leftGroups
+            && Array.all isIpv6Group rightGroups
+
+    else
+        False
+
+
+isIpv6Group : String -> Bool
+isIpv6Group group =
+    let
+        count =
+            String.count group
+    in
+    count > 0 && count <= 4 && String.all isHexDigit group
+
+
+isHexDigit : Char -> Bool
+isHexDigit c =
+    Char.isDigit c
+        || (c >= 'a' && c <= 'f')
+        || (c >= 'A' && c <= 'F')
+
+
+
+-- HARD FAIL HELPER
+
+
+{-| Produce a hard (committed) failure carrying a typed `Error`, so `oneOf`
+stops and the error is not buried by a later branch. `problem` alone is a soft
+failure; `commit` followed by `problem` makes it committed.
+-}
+hardFail : Error -> EmailParser a
+hardFail err =
+    Parser.commit {}
+        |> Parser.andThen (\_ -> Parser.problem err)
+
+
+
+-- ENCODER
+
+
+{-| Encode an [`EmailAddress`](#EmailAddress) back into its string form.
+
+For a `DotAtom` local-part or `Labels` domain the output is canonical for this
+module (atoms and labels are re-joined with `.`); a `QuotedString` local-part
+is emitted verbatim from its `raw` text, so a parsed quoted-string round-trips
+exactly. Address literals are re-wrapped in brackets, with the `IPv6:` tag
+restored for `Ipv6`.
+
+-}
+toString : EmailAddress -> String
+toString address =
+    localToString address.localPart ++ "@" ++ domainToString address.domain
+
+
+localToString : LocalPart -> String
+localToString localPart =
+    when localPart is
+        DotAtom atoms ->
+            String.join "." atoms
+
+        QuotedString { raw } ->
+            raw
+
+
+domainToString : Domain -> String
+domainToString domain =
+    when domain is
+        Labels labels ->
+            String.join "." labels
+
+        Literal literal ->
+            "[" ++ literalToString literal ++ "]"
+
+
+literalToString : AddressLiteral -> String
+literalToString literal =
+    when literal is
+        Ipv4 address ->
+            address
+
+        Ipv6 address ->
+            "IPv6:" ++ address
+
+        General { tag, value } ->
+            tag ++ ":" ++ value

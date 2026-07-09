@@ -1,0 +1,270 @@
+module Sqlite.Auth.Email exposing
+    ( migrationV1
+    , Email
+    , Raw
+    , Normalized
+    , fromString
+    , normalize
+    , validate
+    , toString
+    , new
+    , change
+    , user
+    )
+
+{-| Manage users' email addresses in the database.
+
+An email identifies a user the way a
+[`Sqlite.Auth.Username`](Sqlite.Auth.Username) does, with one extra guarantee:
+the `emails` table enforces `user_id UNIQUE`, so a user holds at most one email
+at a time. Email one-time passcodes (see [`Sqlite.Auth.Otp`](Sqlite.Auth.Otp))
+resolve their target user through this lookup.
+
+Normalization is strict: a raw email must parse as a valid RFC 5321 address
+(see [`Sqlite.Auth.Email.Parser`](Sqlite.Auth.Email.Parser)) before it can be
+saved or looked up. [`normalize`](#normalize) returns `Nothing` on any parse
+failure; [`validate`](#validate) returns the typed parse error. The normalized
+value is lowercased so it is a stable primary key.
+
+This module does not enforce content policy: disposable-provider rejection,
+invisible-character stripping, and lookalike-glyph handling are the caller's
+responsibility. Run whatever policy your application needs on the raw `String`
+*before* calling [`fromString`](#fromString). Two visually distinct emails are
+always distinct rows; the parser only guarantees structural validity.
+
+## Expected database schema
+
+The minimum required table schema for this module to work is below:
+
+    CREATE TABLE IF NOT EXISTS emails (
+        email TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+
+- `email` is the normalized email address as a `String` and is the primary key.
+- `user_id` references the users (in the [Sqlite.Auth.User module](Sqlite.Auth.User))
+  and is `UNIQUE`, so there is at most one email per user.
+- Both `created_at` and `updated_at` are posix timestamp values.
+
+## Migrations
+
+@docs migrationV1
+
+# Creating an email
+
+You must create an [`Email`](#Email) before being able to save it for a user or
+find a user by that email. [`normalize`](#normalize) trims, parses the string
+as an RFC 5321 address, and lowercases — only a structurally valid email
+normalizes. For the typed parse error, use [`validate`](#validate).
+
+@docs Email, Raw, Normalized
+@docs fromString
+@docs normalize
+@docs validate
+@docs toString
+
+# Working with emails
+
+Adding, changing, and looking up emails by user are all supported.
+
+@docs new
+@docs change
+@docs user
+
+-}
+
+import Sqlite
+import Sqlite.Auth.Email.Parser as Parser
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Decode
+import Sqlite.Encode
+import Task exposing ( Task )
+import Utils.Time
+
+
+{-| Migrate the database to add an `emails` table with the minimum required
+schema for this module to operate. It references users, so run this after
+[`Sqlite.Auth.User.migrationV1`](Sqlite.Auth.User#migrationV1).
+
+This migration is meant to be plug-and-play with the `gren-sqlite-migrate`
+package. If you are using a different method of migration, the individual SQL
+statements can be extracted from the record's `statements` field.
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Sqlite.Auth.Email.migrationV1` - Add emails table"
+    , statements =
+        [ addEmailsTableMigrationSQL 
+        ]
+    }
+
+
+{-|-}
+addEmailsTableMigrationSQL : String
+addEmailsTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS emails (
+        email TEXT PRIMARY KEY NOT NULL,
+        user_id TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (user_id)
+            REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+    """
+
+
+{-| A raw, non-normalized email.
+-}
+type Raw
+    = Raw
+
+
+{-| A normalized email that is ready to be saved to the database.
+-}
+type Normalized
+    = Normalized
+
+
+{-| An email, with a phantom type state of either `Raw` or `Normalized`.
+-}
+type Email state
+    = Email String
+
+
+{-| Turn a `String` into a raw [`Email`](#Email), ready to
+[`normalize`](#normalize).
+
+Run any application content policy — format validation, disposable-provider
+rejection, invisible-character stripping — on the raw string before calling
+this. [`normalize`](#normalize) only trims, rejects empty, and lowercases.
+-}
+fromString : String -> Email Raw
+fromString =
+    Email
+
+
+{-| Validate a raw email and return a normalized one, or a typed parse error.
+
+The string is trimmed, then parsed as an RFC 5321 address by
+[`Sqlite.Auth.Email.Parser`](Sqlite.Auth.Email.Parser). Only a structurally
+valid email normalizes; the result is lowercased so it is a stable primary key.
+The parser runs on the original-case string (so an `IPv6:` address-literal tag
+is recognized), then the whole address is lowercased for storage.
+-}
+validate : Email Raw -> Result Parser.Error (Email Normalized)
+validate (Email string) =
+    let
+        trimmed : String
+        trimmed =
+            String.trim string
+    in
+    if String.isEmpty trimmed then
+        Err Parser.EmptyInput
+
+    else
+        Parser.parse trimmed
+            |> Result.map (\_ -> Email (String.toLower trimmed))
+
+
+{-| Normalize a raw email into a `Maybe`, returning `Nothing` if the string is
+empty or does not parse as a valid RFC 5321 address. Use
+[`validate`](#validate) when you need the typed parse error.
+-}
+normalize : Email Raw -> Maybe (Email Normalized)
+normalize =
+    validate >> Result.toMaybe
+
+
+{-| Get the underlying email `String`.
+-}
+toString : Email state -> String
+toString (Email string) =
+    string
+
+
+{-| Add an email to the given user, returning the user for further pipeline
+steps. The passed email must be normalized using the [`normalize`](#normalize)
+function.
+
+Because `user_id` is `UNIQUE` in the `emails` table, a user can hold at most
+one email at a time. Adding a second email for the same user fails on the
+unique constraint; use [`change`](#change) to swap a user's email instead.
+-}
+new : Sqlite.Database -> { email : Email Normalized } -> Internal.User -> Task Sqlite.Error Internal.User
+new database { email } ((Internal.User { userId }) as userWitness) =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        INSERT INTO emails (email, user_id, created_at, updated_at)
+                        VALUES (:email, :user_id, :created_at, :updated_at)
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.string "email" (toString email)
+                        , Sqlite.Encode.string "user_id" userId
+                        , Sqlite.Encode.int "created_at" now
+                        , Sqlite.Encode.int "updated_at" now
+                        ]
+                    }
+                    |> Task.map (\_ -> userWitness)
+            )
+
+
+{-| Change a user's email. Which user's email changes depends on the given
+`Verified` type — produced by a credential check such as
+[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) or
+[`Sqlite.Auth.Otp.verify`](Sqlite.Auth.Otp#verify), or by verifying a live
+session through [`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify).
+
+If the user has no email row, this is a silent no-op: the task succeeds but no
+row is created or changed. Use [`new`](#new) to attach a first email to a user.
+-}
+change : Sqlite.Database -> { newEmail : Email Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
+change database { newEmail } ((Internal.Verified { userId }) as verified) =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        UPDATE emails
+                        SET email = :to, updated_at = :updated_at
+                        WHERE user_id = :user_id
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.string "to" (toString newEmail)
+                        , Sqlite.Encode.int "updated_at" now
+                        , Sqlite.Encode.string "user_id" userId
+                        ]
+                    }
+                    |> Task.map (\_ -> verified)
+            )
+
+
+{-| Get the user who owns the given email. Returns `Nothing` if the given email
+is not associated with any user.
+-}
+user : Sqlite.Database -> { email : Email Normalized } -> Task Sqlite.Error (Maybe Internal.User)
+user database { email } =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT user_id
+            FROM emails
+            WHERE email = :email
+            """
+        , parameters =
+            [ Sqlite.Encode.string "email" (toString email) ]
+        , rowDecoder =
+            Sqlite.Decode.string "user_id"
+                (\userId -> Sqlite.Decode.succeed (Internal.User { userId = userId }))
+        }

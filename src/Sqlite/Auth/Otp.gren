@@ -1,0 +1,801 @@
+module Sqlite.Auth.Otp exposing
+    ( migrationV1
+    , Options
+    , defaultOptions
+    , request
+    , RequestOutcome(..)
+    , RequestError(..)
+    , verify
+    , VerifyOutcome(..)
+    , VerifyError(..)
+    )
+
+{-| Issue and verify one-time passcodes sent to a user's email.
+
+This module implements the *email one-time passcode* half of a passwordless
+login system (per Ben Houston's "Passwordless Login System"). It does **not**
+implement passkeys — every login here resolves to verifying a code that
+[`request`](#request) mints and your application delivers by email, exactly
+once. Passkeys are a future concern; this is the credential that establishes
+identity before any stronger mechanism is wired up.
+
+## The flow
+
+1. The application resolves the typed email to a user with
+   [`Sqlite.Auth.Email.user`](Sqlite.Auth.Email#user), producing a
+   `Maybe Internal.User`.
+2. `request` mints an 8-character alphanumeric code for that user. The raw code
+   is returned exactly once, for the application to email. Only its SHA-256 hash
+   is stored.
+3. `verify` consumes the code the user submits. On a match it returns the
+   [`Internal.Verified`](Sqlite.Auth.Internal#Verified) witness
+   [`Sqlite.Auth.Session.issue`](Sqlite.Auth.Session#issue) needs to log the
+   user in.
+
+`verify` takes the same `Maybe Internal.User` shape
+[`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) takes, so an
+unknown email and a wrong code both answer [`Rejected`](#VerifyOutcome) and
+both spend the same hashing work. Step 2 alone cannot distinguish "this email
+exists but the code is wrong" from "this email does not exist" by timing.
+
+## Expected database schema
+
+The minimum required table schema for this module to work is below:
+
+    CREATE TABLE IF NOT EXISTS login_otp_codes (
+        user_id TEXT PRIMARY KEY NOT NULL,
+        code TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        failed_attempts_count INTEGER NOT NULL CHECK (failed_attempts_count >= 0),
+        locked_until INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+- `user_id` is the primary key, so at most one live OTP row exists per user.
+- `code` is the SHA-256 hash of the raw code, never the raw code itself.
+- `created_at` and `expires_at` are posix timestamps; the code is redeemable
+  until `expires_at`.
+- `failed_attempts_count` counts consecutive failed verifies.
+- `locked_until` is the posix timestamp the code stays locked after too many
+  failures, or null when unlocked.
+
+## Migrations
+
+@docs migrationV1
+
+# Working with one-time passcodes
+
+@docs Options, defaultOptions
+
+## Issuing codes
+
+@docs request
+@docs RequestOutcome, RequestError
+
+## Verifying codes
+
+@docs verify
+@docs VerifyOutcome, VerifyError
+
+-}
+
+import Array exposing ( Array )
+import Bitwise
+import Bytes exposing ( Bytes )
+import Bytes.Decode
+import Char
+import Crypto
+import Math
+import Sqlite
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Decode
+import Sqlite.Encode
+import Task exposing ( Task )
+import Utils.Crypto
+import Utils.Time
+
+
+{-| Migrate the database to add the `login_otp_codes` table with the minimum
+required schema for this module to operate. It references users, so run this
+after [`Sqlite.Auth.User.migrationV1`](Sqlite.Auth.User#migrationV1).
+
+This migration is meant to be plug-and-play with the `gren-sqlite-migrate`
+package. If you are using a different method of migration, the individual SQL
+statements can be extracted from the record's `statements` field.
+-}
+migrationV1 : { name : String, statements : Array String }
+migrationV1 =
+    { name = "`Sqlite.Auth.Otp.migrationV1` - Add login_otp_codes table"
+    , statements =
+        [ addLoginOtpCodesTableMigrationSQL ]
+    }
+
+
+{-|-}
+addLoginOtpCodesTableMigrationSQL : String
+addLoginOtpCodesTableMigrationSQL =
+    """
+    CREATE TABLE IF NOT EXISTS login_otp_codes (
+        user_id TEXT PRIMARY KEY NOT NULL,
+        code TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        failed_attempts_count INTEGER NOT NULL CHECK (failed_attempts_count >= 0),
+        locked_until INTEGER,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    """
+
+
+
+-- options
+
+
+{-| Options for one-time passcodes.
+
+- `codeLength` is the number of alphanumeric symbols in a generated code. The
+  keyspace is `36^codeLength`, so `8` gives ~2.8 trillion possibilities. A
+  minimum of `1` is required.
+- `lifetimeMillis` is how long a code stays redeemable after it is issued. A
+  value of `0` means a freshly minted code is already expired.
+- `issueThrottleMillis` is the minimum spacing between two `request` calls for
+  the same user. A value of `0` disables throttling. The retry timestamp
+  returned with [`TooEarly`](#RequestOutcome) is `createdAt + issueThrottleMillis`.
+- `maxFailedAttempts` is how many consecutive failed verifies lock the code.
+  A minimum of `1` is required.
+- `lockoutDurationMillis` is how long a lock lasts. A value of `0` means a
+  lock expires the instant it engages.
+-}
+type alias Options =
+    { codeLength : Int
+    , lifetimeMillis : Int
+    , issueThrottleMillis : Int
+    , maxFailedAttempts : Int
+    , lockoutDurationMillis : Int
+    }
+
+
+{-| The default, recommended, options: an 8-character code, a 5-minute
+lifetime, a 60-second issue throttle, lockout after 5 failed attempts, and a
+15-minute lock duration.
+
+    { codeLength = 8
+    , lifetimeMillis = 300000          -- 5 minutes
+    , issueThrottleMillis = 60000       -- 60 seconds
+    , maxFailedAttempts = 5
+    , lockoutDurationMillis = 900000    -- 15 minutes
+    }
+-}
+defaultOptions : Options
+defaultOptions =
+    { codeLength = 8
+    , lifetimeMillis = 5 * 60 * 1000
+    , issueThrottleMillis = 60 * 1000
+    , maxFailedAttempts = 5
+    , lockoutDurationMillis = 15 * 60 * 1000
+    }
+
+
+
+-- issuing codes
+
+
+{-| The outcome of [`request`](#request).
+
+- `Issued { code }` carries the raw code, ready for the application to email.
+  It is returned exactly once; only its SHA-256 hash is stored.
+- `TooEarly { retryAt }` means the user requested another code sooner than
+  `options.issueThrottleMillis` allows. `retryAt` is the posix timestamp at
+  which `request` will accept the next call.
+- `RequestLocked` means the user's OTP row is currently locked after repeated
+  [`verify`](#verify) failures. The lock lifts after
+  `options.lockoutDurationMillis` from the locking attempt. The variant is
+  spelled `RequestLocked` so it does not clash with
+  [`VerifyOutcome`](#VerifyOutcome)'s own `Locked` at unqualified use sites.
+-}
+type RequestOutcome
+    = Issued { code : String }
+    | TooEarly { retryAt : Int }
+    | RequestLocked
+
+
+{-| The ways [`request`](#request) can fault: a database error, only. The
+expected outcomes — `TooEarly` and `RequestLocked` — travel as values inside
+[`RequestOutcome`](#RequestOutcome), not as errors. `RequestStorageError` is
+spelled apart from [`VerifyError`](#VerifyError)'s `StorageError` so the two
+do not clash at unqualified use sites.
+-}
+type RequestError
+    = RequestStorageError Sqlite.Error
+
+
+{-| Mint a one-time passcode for the given user, returning the raw code exactly
+once for the application to email. Only its SHA-256 hash is stored.
+
+- If the user's existing OTP row is still locked, returns `RequestLocked`
+  without generating a new code.
+- If the previous code was issued fewer than `options.issueThrottleMillis`
+  milliseconds ago, returns `TooEarly { retryAt }` without generating a new
+  code. The lock beats the throttle: a locked row never answers `TooEarly`.
+- Otherwise, generates a fresh code, replaces any existing row, and returns
+  `Issued { code }`.
+
+  Email.user database { email = normalizedEmail }
+      |> Task.andThen
+          (\maybeUser ->
+              when maybeUser is
+                  Just user ->
+                      Otp.request database secureContext Otp.defaultOptions user
+                          |> Task.andThen
+                              (\outcome ->
+                                  when outcome is
+                                      Otp.Issued { code } ->
+                                          sendEmail code
+                                              |> Task.map (\_ -> {})
+
+                                      Otp.TooEarly _ ->
+                                          Task.succeed {}
+
+                                      Otp.RequestLocked ->
+                                          Task.succeed {}
+                              )
+
+                  Nothing ->
+                      Task.succeed {}
+          )
+
+Expired and consumed code rows are swept at the start of every successful
+`request`, so the table tends itself during normal use.
+-}
+request : Sqlite.Database -> Crypto.SecureContext -> Options -> Internal.User -> Task RequestError RequestOutcome
+request database secureContext options ((Internal.User { userId }) as user) =
+    sweepExpired database
+        |> Task.mapError RequestStorageError
+        |> Task.andThen
+            (\_ ->
+                Utils.Time.nowMillis
+                    |> Task.andThen
+                        (\now ->
+                            getCodeRow database { userId = userId }
+                                |> Task.mapError RequestStorageError
+                                |> Task.andThen
+                                    (\maybeRow ->
+                                        when maybeRow is
+                                            Just row ->
+                                                when row.lockedUntil is
+                                                    Just lockedUntil ->
+                                                        if lockedUntil > now then
+                                                            Task.succeed RequestLocked
+                                                        else
+                                                            throttleOrIssue database secureContext options { now = now, userId = userId, row = row }
+
+                                                    Nothing ->
+                                                        throttleOrIssue database secureContext options { now = now, userId = userId, row = row }
+
+                                            Nothing ->
+                                                issueRow database secureContext options { now = now, userId = userId }
+                                                    |> Task.mapError RequestStorageError
+                                                    |> Task.map Issued
+                                    )
+                    )
+            )
+
+
+{-| Decide between `TooEarly` and a fresh re-issue for an existing
+unlocked row, based on `options.issueThrottleMillis`.
+-}
+throttleOrIssue :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Options
+    -> { now : Int, userId : String, row : Row }
+    -> Task RequestError RequestOutcome
+throttleOrIssue database secureContext options { now, userId, row } =
+    let
+        retryAt : Int
+        retryAt =
+            row.createdAt + options.issueThrottleMillis
+    in
+    if retryAt > now then
+        Task.succeed (TooEarly { retryAt = retryAt })
+    else
+        issueRow database secureContext options { now = now, userId = userId }
+            |> Task.mapError RequestStorageError
+            |> Task.map Issued
+
+
+{-| Generate a fresh unbiased code, hash it for storage, and write the row with
+`INSERT OR REPLACE` — fresh timestamps, zeroed failure counter, no lock.
+-}
+issueRow :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Options
+    -> { now : Int, userId : String }
+    -> Task Sqlite.Error { code : String }
+issueRow database secureContext options { now, userId } =
+    generateCode secureContext options.codeLength
+        |> Task.andThen
+            (\rawCode ->
+                Utils.Crypto.hashTokenForStorage secureContext rawCode
+                    |> Task.andThen
+                        (\hashed ->
+                            insertRow database
+                                { userId = userId
+                                , code = hashed
+                                , createdAt = now
+                                , expiresAt = now + options.lifetimeMillis
+                                }
+                                |> Task.map (\_ -> { code = rawCode })
+                        )
+            )
+
+
+
+-- verifying codes
+
+
+{-| The outcome of [`verify`](#verify).
+
+- `Verified` carries the [`Internal.Verified`](Sqlite.Auth.Internal#Verified)
+  witness [`Sqlite.Auth.Session.issue`](Sqlite.Auth.Session#issue) requires.
+- `Rejected` means the code did not match, the user has no row, or there is no
+  such user at all. The caller cannot tell which, deliberately.
+- `Locked` means the row is temporarily locked after repeated failures.
+-}
+type VerifyOutcome
+    = Verified Internal.Verified
+    | Rejected
+    | Locked
+
+
+{-| The ways [`verify`](#verify) can fault: a database error, only. Expected
+rejections — unknown user, wrong code, expired code, locked row — travel as
+values inside [`VerifyOutcome`](#VerifyOutcome).
+-}
+type VerifyError
+    = StorageError Sqlite.Error
+
+
+{-| Verify a submitted one-time passcode. The user argument is the `Maybe` that
+[`Sqlite.Auth.Email.user`](Sqlite.Auth.Email#user) returns, to make chaining
+easier and to keep the response uniform whether the email resolves to a user or
+not.
+
+An unknown user (`Nothing`), a user with no OTP row, and a wrong code all answer
+[`Rejected`](#VerifyOutcome), and all spend the same hashing work as a real
+attempt. A locked row answers [`Locked`](#VerifyOutcome) without touching the
+stored hash, and the lock beats expiry: a locked row stays locked even when its
+code would otherwise have expired.
+
+A successful verify deletes the row, so a code redeems at most once.
+
+    Email.user database { email = normalizedEmail }
+        |> Task.andThen (Otp.verify database secureContext Otp.defaultOptions)
+        |> Task.andThen
+            (\outcome ->
+                when outcome is
+                    Otp.Verified proof ->
+                        Session.issue database secureContext Session.defaultOptions proof
+
+                    Otp.Rejected ->
+                        Task.succeed {}
+
+                    Otp.Locked ->
+                        Task.succeed {}
+            )
+-}
+verify : Sqlite.Database -> Crypto.SecureContext -> Options -> Maybe Internal.User -> { code : String } -> Task VerifyError VerifyOutcome
+verify database secureContext options maybeUser input =
+    when maybeUser is
+        Nothing ->
+            burnCandidate secureContext input
+                |> Task.map (\_ -> Rejected)
+
+        Just (Internal.User { userId }) ->
+            Utils.Time.nowMillis
+                |> Task.andThen
+                    (\now ->
+                        getCodeRow database { userId = userId }
+                            |> Task.mapError StorageError
+                            |> Task.andThen
+                                (\maybeRow ->
+                                    when maybeRow is
+                                        Nothing ->
+                                            burnCandidate secureContext input
+                                                |> Task.map (\_ -> Rejected)
+
+                                        Just row ->
+                                            when row.lockedUntil is
+                                                Just lockedUntil ->
+                                                    if lockedUntil > now then
+                                                        burnCandidate secureContext input
+                                                            |> Task.map (\_ -> Locked)
+
+                                                    else
+                                                        verifyAgainstRow database secureContext options { now = now, candidate = input.code, row = row }
+
+                                                Nothing ->
+                                                    verifyAgainstRow database secureContext options { now = now, candidate = input.code, row = row }
+                                )
+                    )
+
+
+{-| Compare the hashed candidate against an unlocked, non-locked row. A
+matching hash consumes the row in a single transaction; a mismatch counts one
+failure and may engage the lock. An expired row answers `Rejected` and never
+reveals whether the code matched.
+-}
+verifyAgainstRow :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> Options
+    -> { now : Int, candidate : String, row : Row }
+    -> Task VerifyError VerifyOutcome
+verifyAgainstRow database secureContext options { now, candidate, row } =
+    if row.expiresAt <= now then
+        burnCandidate secureContext { code = candidate }
+            |> Task.map (\_ -> Rejected)
+
+    else
+        Utils.Crypto.hashTokenForStorage secureContext candidate
+            |> Task.andThen
+                (\hashedCandidate ->
+                    if constantTimeEqualString hashedCandidate row.code then
+                        consumeCode database { userId = row.userId, code = hashedCandidate, now = now }
+                            |> Task.mapError StorageError
+                            |> Task.map
+                                (\summary ->
+                                    if summary.changes == 0 then
+                                        Rejected
+
+                                    else
+                                        Verified (Internal.Verified { userId = row.userId })
+                                )
+
+                    else
+                        recordFailedAttempt database options { now = now, userId = row.userId }
+                            |> Task.mapError StorageError
+                            |> Task.map (\_ -> Rejected)
+                )
+
+
+{-| The single-use guard behind [`verifyAgainstRow`](#verifyAgainstRow): delete
+the row only if its stored code exactly matches the hashed candidate and the
+row is still live (non-locked, unexpired). The returned summary's `changes`
+count is the single-use check — `1` when this call consumed the row, `0` when
+a concurrent verify (or a revoking lock that landed between the read and the
+write) consumed it first.
+-}
+consumeCode : Sqlite.Database -> { userId : String, code : String, now : Int } -> Task Sqlite.Error Sqlite.ExecutionSummary
+consumeCode database { userId, code, now } =
+    Sqlite.inTransaction database
+        (Sqlite.execute database
+            { statement =
+                """
+                DELETE FROM login_otp_codes
+                WHERE user_id = :user_id
+                    AND code = :code
+                    AND expires_at > :now
+                    AND (locked_until IS NULL OR locked_until <= :now)
+                """
+            , parameters =
+                [ Sqlite.Encode.string "user_id" userId
+                , Sqlite.Encode.string "code" code
+                , Sqlite.Encode.int "now" now
+                ]
+            }
+        )
+
+
+{-| Record a failed verify for `userId`: bump the failure counter and, when
+the new count reaches `options.maxFailedAttempts`, engage the lock. The
+increment and the lock decision happen in one statement, so concurrent
+failures cannot read the same count and under-count toward the lockout.
+-}
+recordFailedAttempt : Sqlite.Database -> Options -> { now : Int, userId : String } -> Task Sqlite.Error Sqlite.ExecutionSummary
+recordFailedAttempt database options { now, userId } =
+    Sqlite.execute database
+        { statement =
+            """
+            UPDATE login_otp_codes
+            SET failed_attempts_count = failed_attempts_count + 1,
+                locked_until = CASE
+                    WHEN failed_attempts_count + 1 >= :max_failed_attempts
+                    THEN :locked_until
+                    ELSE NULL
+                END
+            WHERE user_id = :user_id
+            """
+        , parameters =
+            [ Sqlite.Encode.int "max_failed_attempts" options.maxFailedAttempts
+            , Sqlite.Encode.int "locked_until" (now + options.lockoutDurationMillis)
+            , Sqlite.Encode.string "user_id" userId
+            ]
+        }
+
+
+{-| Hash the submitted candidate and throw the result away. Costs the same
+SHA-256 work as a real verification and never fails, so [`verify`](#verify)
+can spend it when there is no row to check against and answer in uniform time.
+-}
+burnCandidate : Crypto.SecureContext -> { code : String } -> Task x {}
+burnCandidate secureContext { code } =
+    Utils.Crypto.hashTokenForStorage secureContext code
+        |> Task.map (\_ -> {})
+        |> Task.onError (\_ -> Task.succeed {})
+
+
+
+-- code generation
+
+
+{-| The 36-symbol alphabet Email OTP codes draw from: uppercase letters A–Z
+followed by digits 0–9. With this alphabet, an 8-character code has a keyspace
+of `36^8 ≈ 2.8 × 10^12`, the size Ben Houston's passwordless-login talk
+recommends.
+-}
+alphabet : String
+alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+{-| [`alphabet`](#alphabet) as an `Array Char`, computed once so the per-symbol
+lookup is `Array.get` instead of a `String` scan.
+-}
+alphabetArray : Array Char
+alphabetArray =
+    String.toArray alphabet
+
+
+{-| The largest multiple of 36 strictly below 256. Bytes in `[0, 252)` map
+without bias onto the 36 symbols via `Math.modBy 36`; bytes in `[252, 256)`
+would favour the first four symbols and are discarded by [`fillFromBytes`](#fillFromBytes).
+-}
+acceptanceThreshold : Int
+acceptanceThreshold =
+    252
+
+
+{-| Generate an unbiased `length`-character code by rejection sampling random
+bytes. Bytes in `[0, 252)` map to a symbol of [`alphabet`](#alphabet) via
+`Math.modBy 36`; bytes in `[252, 256)` bias the distribution and are discarded.
+The raw code is what [`Email.user`](Sqlite.Auth.Email#user)'s caller hands to
+the user — only its SHA-256 hash is stored at rest.
+-}
+generateCode : Crypto.SecureContext -> Int -> Task x String
+generateCode secureContext length =
+    fillFromBytes secureContext length ""
+
+
+{-| Tail-recursive sampler. Each pass draws `remaining` random bytes and walks
+them left-to-right, accepting any byte below [`acceptanceThreshold`](#acceptanceThreshold)
+and discarding the rest. If the pool drains with the code still unfilled —
+possible only when some bytes were rejected — we recurse for the shortfall.
+With a ~1.6% reject rate, one recursion typically suffices for length-8 codes.
+-}
+fillFromBytes : Crypto.SecureContext -> Int -> String -> Task x String
+fillFromBytes secureContext remaining acc =
+    if remaining <= 0 then
+        Task.succeed acc
+
+    else
+        Crypto.getRandomUInt8Values remaining
+            |> Task.andThen
+                (\bytes ->
+                    when unsignedInt8Values bytes is
+                        Just pool ->
+                            consumeFromIndex secureContext remaining acc 0 pool
+
+                        Nothing ->
+                            fillFromBytes secureContext remaining acc
+                )
+
+
+{-| Walk the byte pool from index `i`, accepting unbiased bytes into `acc`
+and decrementing `remaining`. When the pool drains with the code unfilled,
+refill via [`fillFromBytes`](#fillFromBytes); when the code is done, succeed.
+-}
+consumeFromIndex : Crypto.SecureContext -> Int -> String -> Int -> Array Int -> Task x String
+consumeFromIndex secureContext remaining acc i pool =
+    if remaining <= 0 then
+        Task.succeed acc
+
+    else if i >= Array.length pool then
+        fillFromBytes secureContext remaining acc
+
+    else
+        when Array.get i pool is
+            Just byte ->
+                if byte < acceptanceThreshold then
+                    let
+                        symbol : Char
+                        symbol =
+                            Array.get (Math.modBy 36 byte) alphabetArray
+                                |> Maybe.withDefault 'A'
+                    in
+                    consumeFromIndex secureContext (remaining - 1) (String.pushLast symbol acc) (i + 1) pool
+
+                else
+                    consumeFromIndex secureContext remaining acc (i + 1) pool
+
+            Nothing ->
+                consumeFromIndex secureContext remaining acc (i + 1) pool
+
+
+
+-- constant-time string compare
+
+
+{-| Compare two strings without short-circuiting. Only the lengths can leak,
+and digest lengths are not secret; the per-character comparison walks the whole
+string even after a mismatch by OR'ing the XOR of code-unit differences and
+checking the final fold is zero. `String` equality under `==` short-circuits,
+which is why this exists for comparing digests.
+-}
+constantTimeEqualString : String -> String -> Bool
+constantTimeEqualString left right =
+    if String.count left /= String.count right then
+        False
+
+    else
+        Array.map2
+            (\a b -> Bitwise.xor (Char.toCode a) (Char.toCode b))
+            (String.toArray left)
+            (String.toArray right)
+            |> Array.foldl Bitwise.or 0
+            |> (\difference -> difference == 0)
+
+
+
+-- bytes decoding
+
+
+{-| Decode bytes into an array of unsigned 8-bit ints, one entry per byte.
+Decoding exactly `Bytes.length` bytes cannot run out of input, so the only
+`Nothing` left is the defensive one.
+-}
+unsignedInt8Values : Bytes.Bytes -> Maybe (Array Int)
+unsignedInt8Values bytes =
+    Bytes.Decode.decode
+        (Bytes.Decode.loop
+            { remaining = Bytes.length bytes, values = [] }
+            unsignedInt8ValuesStep
+        )
+        bytes
+
+
+{-| One step of [`unsignedInt8Values`](#unsignedInt8Values)'s loop: decode the
+next byte and push it, finishing when `remaining` runs out.
+-}
+unsignedInt8ValuesStep :
+    { remaining : Int, values : Array Int }
+    -> Bytes.Decode.Decoder (Bytes.Decode.Step { remaining : Int, values : Array Int } (Array Int))
+unsignedInt8ValuesStep { remaining, values } =
+    if remaining <= 0 then
+        Bytes.Decode.succeed (Bytes.Decode.Done values)
+
+    else
+        Bytes.Decode.unsignedInt8
+            |> Bytes.Decode.map
+                (\byte ->
+                    Bytes.Decode.Loop
+                        { remaining = remaining - 1
+                        , values = Array.pushLast byte values
+                        }
+                )
+
+
+
+-- row access
+
+
+{-| A row from the `login_otp_codes` table. `lockedUntil` is `Nothing` for an
+unlocked row. `code` is the SHA-256 hash of the raw code, never the raw code.
+-}
+type alias Row =
+    { userId : String
+    , code : String
+    , createdAt : Int
+    , expiresAt : Int
+    , failedAttemptsCount : Int
+    , lockedUntil : Maybe Int
+    }
+
+
+{-| Decode a single `login_otp_codes` row into a [`Row`](#Row).
+-}
+rowDecoder : Sqlite.Decode.Decoder Row
+rowDecoder =
+    Sqlite.Decode.string "user_id"
+        (\userId ->
+            Sqlite.Decode.string "code"
+                (\code ->
+                    Sqlite.Decode.int "created_at"
+                        (\createdAt ->
+                            Sqlite.Decode.int "expires_at"
+                                (\expiresAt ->
+                                    Sqlite.Decode.int "failed_attempts_count"
+                                        (\failedAttemptsCount ->
+                                            Sqlite.Decode.maybe Sqlite.Decode.int "locked_until"
+                                                (\lockedUntil ->
+                                                    Sqlite.Decode.succeed
+                                                        { userId = userId
+                                                        , code = code
+                                                        , createdAt = createdAt
+                                                        , expiresAt = expiresAt
+                                                        , failedAttemptsCount = failedAttemptsCount
+                                                        , lockedUntil = lockedUntil
+                                                        }
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| Write a fresh OTP row, replacing any existing one. `userId` is the primary
+key, so the replace enforces one live code per user. `code` is the already-hashed
+value, never the raw code. The failure counter starts at zero and `locked_until`
+is null.
+-}
+insertRow :
+    Sqlite.Database
+    -> { userId : String, code : String, createdAt : Int, expiresAt : Int }
+    -> Task Sqlite.Error Sqlite.ExecutionSummary
+insertRow database { userId, code, createdAt, expiresAt } =
+    Sqlite.execute database
+        { statement =
+            """
+            INSERT OR REPLACE INTO login_otp_codes
+                (user_id, code, created_at, expires_at, failed_attempts_count, locked_until)
+            VALUES (:user_id, :code, :created_at, :expires_at, 0, NULL)
+            """
+        , parameters =
+            [ Sqlite.Encode.string "user_id" userId
+            , Sqlite.Encode.string "code" code
+            , Sqlite.Encode.int "created_at" createdAt
+            , Sqlite.Encode.int "expires_at" expiresAt
+            ]
+        }
+
+
+{-| Read a single user's OTP row by `userId`, returning `Nothing` when no row
+exists.
+-}
+getCodeRow : Sqlite.Database -> { userId : String } -> Task Sqlite.Error (Maybe Row)
+getCodeRow database { userId } =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT user_id, code, created_at, expires_at, failed_attempts_count, locked_until
+            FROM login_otp_codes
+            WHERE user_id = :user_id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "user_id" userId ]
+        , rowDecoder = rowDecoder
+        }
+
+
+{-| Delete every expired OTP row as of `now`. Run by [`request`](#request), so
+the table tends itself during normal use.
+-}
+sweepExpired : Sqlite.Database -> Task Sqlite.Error {}
+sweepExpired database =
+    Utils.Time.nowMillis
+        |> Task.andThen
+            (\now ->
+                Sqlite.execute database
+                    { statement =
+                        """
+                        DELETE FROM login_otp_codes
+                        WHERE expires_at <= :now
+                        """
+                    , parameters =
+                        [ Sqlite.Encode.int "now" now ]
+                    }
+            )
+        |> Task.map (\_ -> {})

@@ -6,5 +6,7 @@ tests/test-sqlite-auth-password.sqlite
 tests/test-sqlite-auth-session.sqlite
 tests/test-sqlite-auth-user.sqlite
 tests/test-sqlite-auth-username.sqlite
+tests/test-sqlite-auth-email.sqlite
+tests/test-sqlite-auth-otp.sqlite
 .gren
 app.js

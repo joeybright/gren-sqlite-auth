@@ -21,7 +21,9 @@ What remains is integration:
   - `Password.change` and `Password.reset` revoke the user's existing sessions,
     the reset auto-logs-in from the redeemed token and the token is single-use,
     and a reset for an unknown username mints nothing;
-  - a rename then logs in by the new username with the unchanged password.
+  - a rename then logs in by the new username with the unchanged password;
+  - the email-OTP `Email.user → Otp.request → Otp.verify → Session.issue` journey
+    hands the minted `Verified` witness straight into session issue for the right user.
 
 The database file persists across runs, so each run derives a unique username
 from a fresh UUID. Session idle expiry is not covered — it is unobservable
@@ -36,7 +38,9 @@ import Expect
 import FileSystem
 import FileSystem.Path
 import Sqlite
+import Sqlite.Auth.Email as Email
 import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.Otp as Otp
 import Sqlite.Auth.Password as Password
 import Sqlite.Auth.Session as Session
 import Sqlite.Auth.User as User
@@ -321,8 +325,10 @@ tests fsPermission secureContext =
         migrations =
             [ User.migrationV1
             , Username.migrationV1
+            , Email.migrationV1
             , Password.migrationV1
             , Session.migrationV1
+            , Otp.migrationV1
             ]
     in
     await
@@ -343,6 +349,7 @@ tests fsPermission secureContext =
                                 , passwordChangeTests database secureContext suffix
                                 , passwordResetTests database secureContext suffix
                                 , usernameChangeTests database secureContext suffix
+                                , emailOtpTests database secureContext suffix
                                 ]
                         )
                 )
@@ -583,5 +590,86 @@ usernameChangeTests database secureContext suffix =
                 (\loggedIn ->
                     test "the renamed account logs in with its existing password"
                         (\_ -> Expect.equal (User.id created.user) loggedIn.session.userId)
+                )
+        )
+
+
+{-| The end-to-end email-OTP journey: register an account with an attached
+email, request a one-time code, verify it, and issue a session from the minted
+`Verified` witness — the `Email.user → Otp.request → Otp.verify → Session.issue`
+handoff no single-module suite can see. The module-level guarantees (unknown-
+email rejection, lockout, throttle) are pinned in `Tests.Sqlite.Auth.Otp`.
+-}
+emailOtpTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+emailOtpTests database secureContext suffix =
+    let
+        rawEmail : String
+        rawEmail =
+            "otp-" ++ suffix ++ "@example.com"
+
+        noThrottle : Otp.Options
+        noThrottle =
+            { Otp.defaultOptions | issueThrottleMillis = 0 }
+
+        lockOptions : Otp.Options
+        lockOptions =
+            { Otp.defaultOptions
+            | issueThrottleMillis = 0
+            , maxFailedAttempts = 1
+            }
+    in
+    await
+        "Register an account and attach an email"
+        (User.new database secureContext
+            |> Task.mapError StorageError
+            |> Task.andThen
+                (\user ->
+                    when Email.normalize (Email.fromString rawEmail) is
+                        Just email ->
+                            Email.new database { email = email } user
+                                |> Task.mapError StorageError
+                                |> Task.map (\_ -> user)
+
+                        Nothing ->
+                            Task.fail InvalidUsername
+                )
+        )
+        (\user ->
+            await
+                "Request a one-time passcode"
+                (Otp.request database secureContext noThrottle user)
+                (\requestOutcome ->
+                    when requestOutcome is
+                        Otp.Issued { code } ->
+                            await
+                                "Verify the passcode and issue a session"
+                                (Otp.verify database secureContext noThrottle (Just user) { code = code }
+                                    |> Task.mapError
+                                        (\e ->
+                                            when e is
+                                                Otp.StorageError err -> StorageError err
+                                        )
+                                    |> Task.andThen
+                                        (\outcome ->
+                                            when outcome is
+                                                Otp.Verified proof ->
+                                                    Session.issue database secureContext Session.defaultOptions proof
+                                                        |> Task.mapError StorageError
+
+                                                Otp.Rejected ->
+                                                    Task.fail NotVerified
+
+                                                Otp.Locked ->
+                                                    Task.fail NotVerified
+                                        )
+                                )
+                                (\issued ->
+                                    test "a verified OTP issues a session for the right user"
+                                        (\_ -> Expect.equal (User.id user) issued.session.userId)
+                                )
+
+                        _ ->
+                            test "request returned a non-Issued outcome"
+                                (\_ -> Expect.fail "expected Otp.Issued")
                 )
         )

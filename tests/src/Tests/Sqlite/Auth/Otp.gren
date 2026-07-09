@@ -1,0 +1,472 @@
+module Tests.Sqlite.Auth.Otp exposing ( tests )
+
+{-| Tests isolated to `Sqlite.Auth.Otp`.
+
+Each scenario issues a code, hands it (or a wrong one) back to `verify`, and
+asserts the outcome plus the row-level side effect the contract names:
+hash-at-rest, single use (row deleted on success), lockout counter and lock,
+throttle between issues, expiry, and the `Maybe User` rejection path that
+matches `Sqlite.Auth.Password.validate`'s anti-enumeration stance.
+
+@docs tests
+
+-}
+
+import Crypto
+import Expect
+import FileSystem
+import FileSystem.Path
+import Sqlite
+import Sqlite.Auth.Email as Email
+import Sqlite.Auth.Internal as Internal
+import Sqlite.Auth.Otp as Otp
+import Sqlite.Auth.User as User
+import Sqlite.Decode
+import Sqlite.Encode
+import Sqlite.Migrate
+import Task exposing ( Task )
+import Test.Runner.Effectful exposing ( await, concat, test )
+import Tests.Sqlite.Auth.Helpers exposing (countRowsByUserId, verifiedFor)
+
+
+{-| Open the database, migrate, and run the `Sqlite.Auth.Otp` tests, each
+derived from a fresh UUID suffix so emails never collide across runs.
+-}
+tests : FileSystem.Permission -> Crypto.SecureContext -> Test.Runner.Effectful.Test
+tests fsPermission secureContext =
+    let
+        migrations : Array Sqlite.Migrate.Migration
+        migrations =
+            [ User.migrationV1
+            , Email.migrationV1
+            , Otp.migrationV1
+            ]
+    in
+    await
+        "Open the on-disk test database (Sqlite.Auth.Otp)"
+        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth-otp.sqlite"))
+        (\database ->
+            await
+                "Apply migrations (Sqlite.Auth.Otp)"
+                (Sqlite.Migrate.migrate database { secureContext = secureContext } migrations)
+                (\_ ->
+                    await
+                        "Generate a unique email suffix (Sqlite.Auth.Otp)"
+                        (Crypto.randomUuidV4 secureContext)
+                        (\suffix ->
+                            concat
+                                [ issueAndVerifyTests database secureContext suffix
+                                , throttleTests database secureContext suffix
+                                , distinctCodeTests database secureContext suffix
+                                , singleUseTests database secureContext suffix
+                                , lockoutCounterTests database secureContext suffix
+                                , lockoutBlocksRequestTests database secureContext suffix
+                                , expiryTests database secureContext suffix
+                                , unknownUserTests database secureContext suffix
+                                , sweepTests database secureContext suffix
+                                ]
+                        )
+                )
+        )
+
+
+{-| A freshly issued code verifies, mints `Verified`, and only the code's hash
+is stored.
+-}
+issueAndVerifyTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+issueAndVerifyTests database secureContext suffix =
+    withUserAndEmail database secureContext ("verify-" ++ suffix ++ "@example.com")
+        (\user ->
+            await
+                "Issue a code"
+                (Otp.request database secureContext Otp.defaultOptions user)
+                (\issued ->
+                    when issued is
+                        Otp.Issued { code } ->
+                            await
+                                "Read the stored code column"
+                                (getStoredCode database user)
+                                (\maybeStored ->
+                                    when maybeStored is
+                                        Just stored ->
+                                            await
+                                                "Verify the issued code"
+                                                (Otp.verify database secureContext Otp.defaultOptions (Just user) { code = code })
+                                                (\outcome ->
+                                                    concat
+                                                        [ test "the stored code is the hash, not the raw code"
+                                                            (\_ -> Expect.notEqual code stored)
+                                                        , test "the correct code verifies and mints Verified"
+                                                            (\_ -> Expect.equal (Otp.Verified (verifiedFor user)) outcome)
+                                                        ]
+                                                )
+
+                                        Nothing ->
+                                            test "an OTP row exists to read"
+                                                (\_ -> Expect.fail "expected a stored code row")
+                                )
+
+                        _ ->
+                            test "issue returned a non-Issued outcome"
+                                (\_ -> Expect.fail "expected Otp.Issued")
+                )
+        )
+
+
+{-| A second `request` inside the throttle window answers `TooEarly { retryAt }`.
+-}
+throttleTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+throttleTests database secureContext suffix =
+    withUserAndEmail database secureContext ("throttle-" ++ suffix ++ "@example.com")
+        (\user ->
+            await
+                "Issue the first code"
+                (Otp.request database secureContext Otp.defaultOptions user)
+                (\_ ->
+                    await
+                        "Issue a second code immediately"
+                        (Otp.request database secureContext Otp.defaultOptions user)
+                        (\second ->
+                            test "a back-to-back request answers TooEarly"
+                                (\_ ->
+                                    when second is
+                                        Otp.TooEarly _ ->
+                                            Expect.pass
+
+                                        _ ->
+                                            Expect.fail "expected Otp.TooEarly"
+                                )
+                        )
+                )
+        )
+
+
+{-| With throttle disabled, two issues produce distinct raw codes and distinct
+stored hashes (a fresh salt-effect: the underlying RNG differs each call).
+-}
+distinctCodeTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+distinctCodeTests database secureContext suffix =
+    let
+        noThrottle : Otp.Options
+        noThrottle =
+            { Otp.defaultOptions | issueThrottleMillis = 0 }
+    in
+    withUserAndEmail database secureContext ("distinct-" ++ suffix ++ "@example.com")
+        (\user ->
+            await
+                "Issue the first code (no throttle)"
+                (Otp.request database secureContext noThrottle user)
+                (\first ->
+                    await
+                        "Issue a second code immediately (no throttle)"
+                        (Otp.request database secureContext noThrottle user)
+                        (\second ->
+                            when first is
+                                Otp.Issued { code = firstCode } ->
+                                    when second is
+                                        Otp.Issued { code = secondCode } ->
+                                            test "two issues produce distinct raw codes"
+                                                (\_ -> Expect.notEqual firstCode secondCode)
+
+                                        _ ->
+                                            test "second issue returned a non-Issued outcome"
+                                                (\_ -> Expect.fail "expected Otp.Issued")
+
+                                _ ->
+                                    test "first issue returned a non-Issued outcome"
+                                        (\_ -> Expect.fail "expected Otp.Issued")
+                        )
+                )
+        )
+
+
+{-| A successfully verified code's row is gone — single use at the row level.
+-}
+singleUseTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+singleUseTests database secureContext suffix =
+    withUserAndEmail database secureContext ("single-" ++ suffix ++ "@example.com")
+        (\user ->
+            await
+                "Issue a code"
+                (Otp.request database secureContext Otp.defaultOptions user)
+                (\issued ->
+                    when issued is
+                        Otp.Issued { code } ->
+                            await
+                                "Verify the issued code"
+                                (Otp.verify database secureContext Otp.defaultOptions (Just user) { code = code })
+                                (\_ ->
+                                    concat
+                                        [ await
+                                            "Count the user's remaining OTP rows"
+                                            (countRowsByUserId database { table = "login_otp_codes", userId = User.id user })
+                                            (\count ->
+                                                test "the OTP row was deleted on successful verify"
+                                                    (\_ -> Expect.equal 0 count)
+                                            )
+                                        , await
+                                            "Verify the same code again"
+                                            (Otp.verify database secureContext Otp.defaultOptions (Just user) { code = code })
+                                            (\secondOutcome ->
+                                                test "a reused code is rejected"
+                                                    (\_ -> Expect.equal Otp.Rejected secondOutcome)
+                                            )
+                                        ]
+                                )
+
+                        _ ->
+                            test "issue returned a non-Issued outcome"
+                                (\_ -> Expect.fail "expected Otp.Issued")
+                )
+        )
+
+
+{-| The failure counter locks exactly at the limit. Below it a wrong code is
+`Rejected`; at the limit a further verify answers `Locked` even for the right
+code.
+-}
+lockoutCounterTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+lockoutCounterTests database secureContext suffix =
+    let
+        lockOptions : Otp.Options
+        lockOptions =
+            { Otp.defaultOptions
+            | issueThrottleMillis = 0
+            , maxFailedAttempts = 2
+            }
+    in
+    withUserAndEmail database secureContext ("lock-" ++ suffix ++ "@example.com")
+        (\user ->
+            await
+                "Issue a code (lockout)"
+                (Otp.request database secureContext lockOptions user)
+                (\issued ->
+                    when issued is
+                        Otp.Issued { code } ->
+                            await
+                                "Verify a wrong code below the limit"
+                                (Otp.verify database secureContext lockOptions (Just user) { code = "WRONGCODE" })
+                                (\firstWrong ->
+                                    concat
+                                        [ test "one failure below the limit is rejected"
+                                            (\_ -> Expect.equal Otp.Rejected firstWrong)
+                                        , await
+                                            "Verify a wrong code at the limit"
+                                            (Otp.verify database secureContext lockOptions (Just user) { code = "WRONGCODE" })
+                                            (\secondWrong ->
+                                                concat
+                                                    [ test "the second failure is rejected"
+                                                        (\_ -> Expect.equal Otp.Rejected secondWrong)
+                                                    , await
+                                                        "Verify the right code while locked"
+                                                        (Otp.verify database secureContext lockOptions (Just user) { code = code })
+                                                        (\lockedOutcome ->
+                                                            test "a locked code answers Locked even for the right candidate"
+                                                                (\_ -> Expect.equal Otp.Locked lockedOutcome)
+                                                        )
+                                                    ]
+                                            )
+                                        ]
+                                )
+
+                        _ ->
+                            test "issue returned a non-Issued outcome"
+                                (\_ -> Expect.fail "expected Otp.Issued")
+                )
+        )
+
+
+{-| Once locked, `request` answers `RequestLocked` and refuses to mint a new
+code, so an attacker cannot bypass the lock by harvesting fresh codes.
+-}
+lockoutBlocksRequestTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+lockoutBlocksRequestTests database secureContext suffix =
+    let
+        lockOptions : Otp.Options
+        lockOptions =
+            { Otp.defaultOptions
+            | issueThrottleMillis = 0
+            , maxFailedAttempts = 1
+            }
+    in
+    withUserAndEmail database secureContext ("lockreq-" ++ suffix ++ "@example.com")
+        (\user ->
+            await
+                "Issue a code (lockout blocks request)"
+                (Otp.request database secureContext lockOptions user)
+                (\issued ->
+                    when issued is
+                        Otp.Issued _ ->
+                            await
+                                "Engage the lock with a wrong verify"
+                                (Otp.verify database secureContext lockOptions (Just user) { code = "WRONGCODE" })
+                                (\_ ->
+                                    await
+                                        "Request a new code while locked"
+                                        (Otp.request database secureContext lockOptions user)
+                                        (\requestOutcome ->
+                                            test "a locked row answers RequestLocked for request"
+                                                (\_ -> Expect.equal Otp.RequestLocked requestOutcome)
+                                        )
+                                )
+
+                        _ ->
+                            test "issue returned a non-Issued outcome"
+                                (\_ -> Expect.fail "expected Otp.Issued")
+                )
+        )
+
+
+{-| A code issued with a zero lifetime is already expired, so verify answers
+`Rejected` (just like an unknown user), not `Verified` even for the right code.
+-}
+expiryTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+expiryTests database secureContext suffix =
+    let
+        expiredOptions : Otp.Options
+        expiredOptions =
+            { Otp.defaultOptions
+            | issueThrottleMillis = 0
+            , lifetimeMillis = 0
+            }
+    in
+    withUserAndEmail database secureContext ("exp-" ++ suffix ++ "@example.com")
+        (\user ->
+            await
+                "Issue a code that expires immediately"
+                (Otp.request database secureContext expiredOptions user)
+                (\issued ->
+                    when issued is
+                        Otp.Issued { code } ->
+                            await
+                                "Verify the expired code"
+                                (Otp.verify database secureContext expiredOptions (Just user) { code = code })
+                                (\outcome ->
+                                    test "an expired code is rejected"
+                                        (\_ -> Expect.equal Otp.Rejected outcome)
+                                )
+
+                        _ ->
+                            test "issue returned a non-Issued outcome"
+                                (\_ -> Expect.fail "expected Otp.Issued")
+                )
+        )
+
+
+{-| An unknown user (`Nothing`) and a wrong code both answer `Rejected`,
+matching `Sqlite.Auth.Password.validate`'s anti-enumeration stance.
+-}
+unknownUserTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+unknownUserTests database secureContext suffix =
+    concat
+        [ await
+            "Verify with no user"
+            (Otp.verify database secureContext Otp.defaultOptions Nothing { code = "WHATEVER" })
+            (\noUserOutcome ->
+                test "an unknown user is rejected"
+                    (\_ -> Expect.equal Otp.Rejected noUserOutcome)
+            )
+        , withUserAndEmail database secureContext ("unknown-" ++ suffix ++ "@example.com")
+            (\user ->
+                await
+                    "Issue a code for a real user (unknown)"
+                    (Otp.request database secureContext Otp.defaultOptions user)
+                    (\_ ->
+                        await
+                            "Verify the real user's code against a different user"
+                            (Otp.verify database secureContext Otp.defaultOptions (Just user) { code = "NOTTHECODE" })
+                            (\wrongOutcome ->
+                                test "a wrong code is rejected"
+                                    (\_ -> Expect.equal Otp.Rejected wrongOutcome)
+                            )
+                    )
+            )
+        ]
+
+
+{-| A successful `request` sweeps expired rows. After issuing an immediately
+expired code for user A and then issuing a fresh code for a second user B (which
+runs its own sweep at the top), A's expired row is gone. Mirrors
+`Password.requestResetSweepTests`'s two-user pattern.
+-}
+sweepTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+sweepTests database secureContext suffix =
+    let
+        expiredOptions : Otp.Options
+        expiredOptions =
+            { Otp.defaultOptions
+            | lifetimeMillis = 0
+            }
+    in
+    withUserAndEmail database secureContext ("sweep-a-" ++ suffix ++ "@example.com")
+        (\expiredUser ->
+            await
+                "Issue a code that expires immediately (sweep)"
+                (Otp.request database secureContext expiredOptions expiredUser)
+                (\_ ->
+                    withUserAndEmail database secureContext ("sweep-b-" ++ suffix ++ "@example.com")
+                        (\otherUser ->
+                            await
+                                "Issue a fresh code for a second user (triggers the sweep)"
+                                (Otp.request database secureContext Otp.defaultOptions otherUser)
+                                (\_ ->
+                                    await
+                                        "Count the first user's OTP rows after the sweep"
+                                        (countRowsByUserId database { table = "login_otp_codes", userId = User.id expiredUser })
+                                        (\count ->
+                                            test "the expired OTP row was swept"
+                                                (\_ -> Expect.equal 0 count)
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| Read the `code` column of a user's OTP row — used to prove the stored
+value is the hash, not the raw code.
+-}
+getStoredCode : Sqlite.Database -> Internal.User -> Task Sqlite.Error (Maybe String)
+getStoredCode database user =
+    Sqlite.getMaybeOne database
+        { query =
+            """
+            SELECT code FROM login_otp_codes WHERE user_id = :user_id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "user_id" (User.id user) ]
+        , rowDecoder =
+            Sqlite.Decode.string "code" Sqlite.Decode.succeed
+        }
+
+
+{-| Create a fresh user, attach a unique normalized email, and run `toTest`
+with that user — the fixture every OTP scenario starts from.
+-}
+withUserAndEmail :
+    Sqlite.Database
+    -> Crypto.SecureContext
+    -> String
+    -> (Internal.User -> Test.Runner.Effectful.Test)
+    -> Test.Runner.Effectful.Test
+withUserAndEmail database secureContext rawEmail toTest =
+    let
+        maybeEmail : Maybe (Email.Email Email.Normalized)
+        maybeEmail =
+            Email.normalize (Email.fromString rawEmail)
+    in
+    when maybeEmail is
+        Just email ->
+            await
+                ("Create a user for " ++ rawEmail)
+                (User.new database secureContext)
+                (\user ->
+                    await
+                        ("Attach the email " ++ rawEmail)
+                        (Email.new database { email = email } user)
+                        (\_ -> toTest user)
+                )
+
+        Nothing ->
+            test ("fixture email should normalize: " ++ rawEmail)
+                (\_ -> Expect.fail ("expected \"" ++ rawEmail ++ "\" to normalize"))

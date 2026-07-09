@@ -9,6 +9,9 @@ import Init
 import Node
 import Task exposing ( Task )
 import Test.Runner.Effectful exposing ( await, concat )
+import Tests.Sqlite.Auth.Email
+import Tests.Sqlite.Auth.Email.Parser
+import Tests.Sqlite.Auth.Otp
 import Tests.Sqlite.Auth.Password.PhcString
 import Tests.Sqlite.Auth.Password
 import Tests.Sqlite.Auth.Session
@@ -30,10 +33,13 @@ main =
                                 (\_ ->
                                     concat
                                         [ Test.Runner.Effectful.wrap Tests.Sqlite.Auth.Password.PhcString.tests
+                                        , Test.Runner.Effectful.wrap Tests.Sqlite.Auth.Email.Parser.tests
                                         , Tests.Sqlite.Auth.User.tests fsPermission secureContext
                                         , Tests.Sqlite.Auth.Password.tests fsPermission secureContext
                                         , Tests.Sqlite.Auth.Username.tests fsPermission secureContext
+                                        , Tests.Sqlite.Auth.Email.tests fsPermission secureContext
                                         , Tests.Sqlite.Auth.Session.tests fsPermission secureContext
+                                        , Tests.Sqlite.Auth.Otp.tests fsPermission secureContext
                                         , Tests.SqliteAuth.tests fsPermission secureContext
                                         ]
                                 )
@@ -52,8 +58,10 @@ removeTestDatabases fsPermission =
             [ "test-sqlite-auth.sqlite"
             , "test-sqlite-auth-user.sqlite"
             , "test-sqlite-auth-username.sqlite"
+            , "test-sqlite-auth-email.sqlite"
             , "test-sqlite-auth-password.sqlite"
             , "test-sqlite-auth-session.sqlite"
+            , "test-sqlite-auth-otp.sqlite"
             ]
     in
     testDatabases

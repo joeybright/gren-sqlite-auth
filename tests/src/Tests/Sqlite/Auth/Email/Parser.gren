@@ -1,0 +1,317 @@
+module Tests.Sqlite.Auth.Email.Parser exposing (tests)
+
+{-| Tests for `Sqlite.Auth.Email.Parser`, all pure — no database needed. They
+mirror the style of `Tests.Sqlite.Auth.Password.PhcString`: valid parses assert
+the full structured value, round-trips assert `parse >> toString` is identity,
+and each `Error` variant has at least one dedicated case.
+
+@docs tests
+
+-}
+
+import Array exposing (Array)
+import Expect
+import Sqlite.Auth.Email.Parser as Parser exposing (AddressLiteral(..), Domain(..), LocalPart(..))
+import String
+import Test
+
+
+{-| Pure parser tests for `Sqlite.Auth.Email.Parser`.
+-}
+tests : Test.Test
+tests =
+    Test.describe "Sqlite.Auth.Email.Parser tests"
+        [ validParseTests
+        , roundTripTests
+        , errorTests
+        , lengthLimitTests
+        ]
+
+
+
+{-| Valid inputs parse to the exact structured value.
+-}
+validParseTests : Test.Test
+validParseTests =
+    Test.describe "valid parses"
+        [ Test.test "a simple dot-string over a dot-atom domain"
+            (\_ ->
+                Parser.parse "alice@example.com"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = DotAtom [ "alice" ]
+                            , domain = Labels [ "example", "com" ]
+                            }
+                        )
+            )
+        , Test.test "a multi-atom local part over a multi-label domain"
+            (\_ ->
+                Parser.parse "a.b.c@sub.domain.example"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = DotAtom [ "a", "b", "c" ]
+                            , domain = Labels [ "sub", "domain", "example" ]
+                            }
+                        )
+            )
+        , Test.test "a quoted-string local part preserves its raw text"
+            (\_ ->
+                Parser.parse "\"hello world\"@example.com"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = QuotedString { raw = "\"hello world\"" }
+                            , domain = Labels [ "example", "com" ]
+                            }
+                        )
+            )
+        , Test.test "a quoted-string with an escaped quote round-trips the escape"
+            (\_ ->
+                Parser.parse "\"a\\\"b\"@example.com"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = QuotedString { raw = "\"a\\\"b\"" }
+                            , domain = Labels [ "example", "com" ]
+                            }
+                        )
+            )
+        , Test.test "a quoted local part may contain an at-sign"
+            (\_ ->
+                Parser.parse "\"a@b\"@example.com"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = QuotedString { raw = "\"a@b\"" }
+                            , domain = Labels [ "example", "com" ]
+                            }
+                        )
+            )
+        , Test.test "an IPv4 address literal is classified and validated"
+            (\_ ->
+                Parser.parse "user@[192.168.0.1]"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = DotAtom [ "user" ]
+                            , domain = Literal (Ipv4 "192.168.0.1")
+                            }
+                        )
+            )
+        , Test.test "an IPv6 address literal is classified and validated"
+            (\_ ->
+                Parser.parse "user@[IPv6:2001:db8::1]"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = DotAtom [ "user" ]
+                            , domain = Literal (Ipv6 "2001:db8::1")
+                            }
+                        )
+            )
+        , Test.test "a general tagged literal is captured structurally"
+            (\_ ->
+                Parser.parse "user@[tag:value]"
+                    |> Expect.equal
+                        (Ok
+                            { localPart = DotAtom [ "user" ]
+                            , domain = Literal (General { tag = "tag", value = "value" })
+                            }
+                        )
+            )
+        ]
+
+
+
+{-| `parse >> Result.map toString` is the identity for every valid form.
+-}
+roundTripTests : Test.Test
+roundTripTests =
+    Test.describe "round-trip"
+        [ roundTrip "alice@example.com"
+        , roundTrip "a.b.c@sub.domain.example"
+        , roundTrip "\"hello world\"@example.com"
+        , roundTrip "\"a\\\"b\"@example.com"
+        , roundTrip "\"a@b\"@example.com"
+        , roundTrip "user@[192.168.0.1]"
+        , roundTrip "user@[IPv6:2001:db8::1]"
+        , roundTrip "user@[tag:value]"
+        , roundTrip "user@[tag:with:colons]"
+        ]
+
+
+roundTrip : String -> Test.Test
+roundTrip input =
+    Test.test ("round-trip " ++ input)
+        (\_ ->
+            Parser.parse input
+                |> Result.map Parser.toString
+                |> Expect.equal (Ok input)
+        )
+
+
+
+{-| Each `Error` variant has a dedicated case.
+-}
+errorTests : Test.Test
+errorTests =
+    Test.describe "errors"
+        [ Test.test "empty input"
+            (\_ ->
+                Parser.parse "" |> Expect.equal (Err Parser.EmptyInput)
+            )
+        , Test.test "no at-sign"
+            (\_ ->
+                Parser.parse "noat" |> Expect.equal (Err Parser.MissingAtSign)
+            )
+        , Test.test "empty local part"
+            (\_ ->
+                Parser.parse "@example.com" |> Expect.equal (Err Parser.EmptyLocalPart)
+            )
+        , Test.test "empty domain"
+            (\_ ->
+                Parser.parse "a@" |> Expect.equal (Err Parser.EmptyDomain)
+            )
+        , Test.test "a space in an unquoted local part reports the offending char"
+            (\_ ->
+                Parser.parse "a b@b.com" |> Expect.equal (Err (Parser.InvalidLocalPartChar ' '))
+            )
+        , Test.test "a leading dot in the local part"
+            (\_ ->
+                Parser.parse ".a@b.com" |> Expect.equal (Err Parser.DotAtLocalStart)
+            )
+        , Test.test "a trailing dot in the local part"
+            (\_ ->
+                Parser.parse "a.@b.com" |> Expect.equal (Err Parser.DotAtLocalEnd)
+            )
+        , Test.test "consecutive dots in the local part"
+            (\_ ->
+                Parser.parse "a..b@b.com" |> Expect.equal (Err Parser.ConsecutiveDotInLocal)
+            )
+        , Test.test "an unclosed quote"
+            (\_ ->
+                Parser.parse "\"abc@b.com" |> Expect.equal (Err Parser.UnclosedQuote)
+            )
+        , Test.test "a control character inside a quoted string reports the char"
+            (\_ ->
+                Parser.parse "\"a\r\"@b.com" |> Expect.equal (Err (Parser.InvalidQuotedChar '\r'))
+            )
+        , Test.test "a bad escape (backslash before a control char) reports the char"
+            (\_ ->
+                Parser.parse "\"a\\\r\"@b.com" |> Expect.equal (Err (Parser.BadEscape '\r'))
+            )
+        , Test.test "a leading dot in the domain is an empty label"
+            (\_ ->
+                Parser.parse "a@.b.com" |> Expect.equal (Err Parser.EmptyDomainLabel)
+            )
+        , Test.test "consecutive dots in the domain is an empty label"
+            (\_ ->
+                Parser.parse "a@b..com" |> Expect.equal (Err Parser.EmptyDomainLabel)
+            )
+        , Test.test "an invalid domain label character reports the char"
+            (\_ ->
+                Parser.parse "a@_b.com" |> Expect.equal (Err (Parser.InvalidDomainLabelChar '_'))
+            )
+        , Test.test "a label that starts with a hyphen"
+            (\_ ->
+                Parser.parse "a@-b.com" |> Expect.equal (Err (Parser.LabelStartsOrEndsWithHyphen "-b"))
+            )
+        , Test.test "a label that ends with a hyphen"
+            (\_ ->
+                Parser.parse "a@b-.com" |> Expect.equal (Err (Parser.LabelStartsOrEndsWithHyphen "b-"))
+            )
+        , Test.test "an unclosed domain literal"
+            (\_ ->
+                Parser.parse "a@[192.168.0.1" |> Expect.equal (Err Parser.UnclosedDomainLiteral)
+            )
+        , Test.test "an empty domain literal"
+            (\_ ->
+                Parser.parse "a@[]" |> Expect.equal (Err Parser.EmptyDomainLiteral)
+            )
+        , Test.test "an out-of-range IPv4 octet"
+            (\_ ->
+                Parser.parse "a@[999.0.0.1]" |> Expect.equal (Err (Parser.InvalidIpv4 "999.0.0.1"))
+            )
+        , Test.test "a leading-zero IPv4 octet"
+            (\_ ->
+                Parser.parse "a@[192.168.00.1]" |> Expect.equal (Err (Parser.InvalidIpv4 "192.168.00.1"))
+            )
+        , Test.test "an invalid IPv6 group"
+            (\_ ->
+                Parser.parse "a@[IPv6:zzz]" |> Expect.equal (Err (Parser.InvalidIpv6 "zzz"))
+            )
+        , Test.test "too many IPv6 groups without compression"
+            (\_ ->
+                Parser.parse "a@[IPv6:1:2:3:4:5:6:7:8:9]"
+                    |> Expect.equal (Err (Parser.InvalidIpv6 "1:2:3:4:5:6:7:8:9"))
+            )
+        , Test.test "a stray triple colon in IPv6 is rejected"
+            (\_ ->
+                Parser.parse "a@[IPv6:1:::2]"
+                    |> Expect.equal (Err (Parser.InvalidIpv6 "1:::2"))
+            )
+        ]
+
+
+
+{-| The RFC 5321 octet limits: local-part ≤ 64, each label ≤ 63, domain ≤ 255,
+total ≤ 254. Boundary cases pass at the limit and fail one octet over.
+-}
+lengthLimitTests : Test.Test
+lengthLimitTests =
+    Test.describe "RFC 5321 length limits"
+        [ Test.test "a 64-octet local part is accepted"
+            (\_ ->
+                Parser.parse (String.repeat 64 "a" ++ "@b.com")
+                    |> Result.map (\_ -> {})
+                    |> Expect.equal (Ok {})
+            )
+        , Test.test "a 65-octet local part is rejected"
+            (\_ ->
+                Parser.parse (String.repeat 65 "a" ++ "@b.com")
+                    |> Expect.equal (Err (Parser.LocalPartTooLong 65))
+            )
+        , Test.test "a 63-octet domain label is accepted"
+            (\_ ->
+                Parser.parse ("a@" ++ String.repeat 63 "b" ++ ".com")
+                    |> Result.map (\_ -> {})
+                    |> Expect.equal (Ok {})
+            )
+        , Test.test "a 64-octet domain label is rejected"
+            (\_ ->
+                Parser.parse ("a@" ++ String.repeat 64 "b" ++ ".com")
+                    |> Expect.equal (Err (Parser.LabelTooLong (String.repeat 64 "b")))
+            )
+        , Test.test "a 254-octet email is accepted"
+            (\_ ->
+                let
+                    local =
+                        String.repeat 64 "a"
+
+                    label63 =
+                        String.repeat 63 "b"
+
+                    label61 =
+                        String.repeat 61 "c"
+
+                    domain =
+                        label63 ++ "." ++ label63 ++ "." ++ label61
+                in
+                Parser.parse (local ++ "@" ++ domain)
+                    |> Result.map (\_ -> {})
+                    |> Expect.equal (Ok {})
+            )
+        , Test.test "a 255-octet email is rejected"
+            (\_ ->
+                let
+                    local =
+                        String.repeat 64 "a"
+
+                    label63 =
+                        String.repeat 63 "b"
+
+                    label62 =
+                        String.repeat 62 "c"
+
+                    domain =
+                        label63 ++ "." ++ label63 ++ "." ++ label62
+                in
+                Parser.parse (local ++ "@" ++ domain)
+                    |> Expect.equal (Err (Parser.EmailTooLong 255))
+            )
+        ]
