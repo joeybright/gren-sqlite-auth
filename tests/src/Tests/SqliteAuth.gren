@@ -611,12 +611,6 @@ emailOtpTests database secureContext suffix =
         noThrottle =
             { Otp.defaultOptions | issueThrottleMillis = 0 }
 
-        lockOptions : Otp.Options
-        lockOptions =
-            { Otp.defaultOptions
-            | issueThrottleMillis = 0
-            , maxFailedAttempts = 1
-            }
     in
     await
         "Register an account and attach an email"
@@ -628,48 +622,59 @@ emailOtpTests database secureContext suffix =
                         Just email ->
                             Email.new database { email = email } user
                                 |> Task.mapError StorageError
-                                |> Task.map (\_ -> user)
+                                |> Task.map (\_ -> { user = user, email = email })
 
                         Nothing ->
                             Task.fail InvalidUsername
                 )
         )
-        (\user ->
+        (\{ user, email } ->
             await
-                "Request a one-time passcode"
-                (Otp.request database secureContext noThrottle user)
-                (\requestOutcome ->
-                    when requestOutcome is
-                        Otp.Issued { code } ->
-                            await
-                                "Verify the passcode and issue a session"
-                                (Otp.verify database secureContext noThrottle (Just user) { code = code }
-                                    |> Task.mapError
-                                        (\e ->
-                                            when e is
-                                                Otp.StorageError err -> StorageError err
-                                        )
-                                    |> Task.andThen
-                                        (\outcome ->
-                                            when outcome is
-                                                Otp.Verified proof ->
-                                                    Session.issue database secureContext Session.defaultOptions proof
-                                                        |> Task.mapError StorageError
+                "Resolve the attached email"
+                (Email.user database { email = email })
+                (\maybeUser ->
+                    concat
+                        [ test "the attached email resolves to the account"
+                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeUser))
+                        , when maybeUser is
+                            Just resolvedUser ->
+                                await
+                                    "Request a one-time passcode"
+                                    (Otp.request database secureContext noThrottle resolvedUser)
+                                    (\requestOutcome ->
+                                        when requestOutcome is
+                                            Otp.Issued { code } ->
+                                                await
+                                                    "Verify the passcode"
+                                                    (Otp.verify database secureContext noThrottle maybeUser { code = code })
+                                                    (\outcome ->
+                                                        when outcome is
+                                                            Otp.Verified proof ->
+                                                                await
+                                                                    "Issue a session from the OTP proof"
+                                                                    (Session.issue database secureContext Session.defaultOptions proof)
+                                                                    (\issued ->
+                                                                        test "a verified OTP issues a session for the right user"
+                                                                            (\_ -> Expect.equal (User.id user) issued.session.userId)
+                                                                    )
 
-                                                Otp.Rejected ->
-                                                    Task.fail NotVerified
+                                                            Otp.Rejected ->
+                                                                test "OTP verification should not reject the issued code"
+                                                                    (\_ -> Expect.fail "expected Otp.Verified")
 
-                                                Otp.Locked ->
-                                                    Task.fail NotVerified
-                                        )
-                                )
-                                (\issued ->
-                                    test "a verified OTP issues a session for the right user"
-                                        (\_ -> Expect.equal (User.id user) issued.session.userId)
-                                )
+                                                            Otp.Locked ->
+                                                                test "OTP verification should not lock the issued code"
+                                                                    (\_ -> Expect.fail "expected Otp.Verified")
+                                                    )
 
-                        _ ->
-                            test "request returned a non-Issued outcome"
-                                (\_ -> Expect.fail "expected Otp.Issued")
+                                            _ ->
+                                                test "request returned a non-Issued outcome"
+                                                    (\_ -> Expect.fail "expected Otp.Issued")
+                                    )
+
+                            Nothing ->
+                                test "email lookup should find the attached email"
+                                    (\_ -> Expect.fail "expected Email.user to return Just")
+                        ]
                 )
         )

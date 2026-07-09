@@ -25,7 +25,7 @@ import Sqlite.Decode
 import Sqlite.Encode
 import Sqlite.Migrate
 import Task exposing ( Task )
-import Test.Runner.Effectful exposing ( await, concat, test )
+import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
 import Tests.Sqlite.Auth.Helpers exposing (countRowsByUserId, verifiedFor)
 
 
@@ -57,10 +57,12 @@ tests fsPermission secureContext =
                             concat
                                 [ issueAndVerifyTests database secureContext suffix
                                 , throttleTests database secureContext suffix
+                                , optionsValidationTests database secureContext suffix
                                 , distinctCodeTests database secureContext suffix
                                 , singleUseTests database secureContext suffix
                                 , lockoutCounterTests database secureContext suffix
                                 , lockoutBlocksRequestTests database secureContext suffix
+                                , expiredLockoutBlocksRequestTests database secureContext suffix
                                 , expiryTests database secureContext suffix
                                 , unknownUserTests database secureContext suffix
                                 , sweepTests database secureContext suffix
@@ -178,6 +180,41 @@ distinctCodeTests database secureContext suffix =
                         )
                 )
         )
+
+
+{-| Invalid options fail before issuing or verifying, preventing empty codes and
+other invalid policy from becoming live behavior.
+-}
+optionsValidationTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+optionsValidationTests database secureContext suffix =
+    let
+        emptyCodeOptions : Otp.Options
+        emptyCodeOptions =
+            { Otp.defaultOptions | codeLength = 0 }
+
+        badMaxOptions : Otp.Options
+        badMaxOptions =
+            { Otp.defaultOptions | maxFailedAttempts = 0 }
+    in
+    concat
+        [ withUserAndEmail database secureContext ("options-" ++ suffix ++ "@example.com")
+            (\user ->
+                awaitError
+                    "Request with an invalid code length"
+                    (Otp.request database secureContext emptyCodeOptions user)
+                    (\error ->
+                        test "request rejects an invalid code length"
+                            (\_ -> Expect.equal (Otp.InvalidRequestOptions (Otp.CodeLengthTooSmall 0)) error)
+                    )
+            )
+        , awaitError
+            "Verify with an invalid failure limit"
+            (Otp.verify database secureContext badMaxOptions Nothing { code = "ANYTHING" })
+            (\error ->
+                test "verify rejects an invalid failure limit"
+                    (\_ -> Expect.equal (Otp.InvalidVerifyOptions (Otp.MaxFailedAttemptsTooSmall 0)) error)
+            )
+        ]
 
 
 {-| A successfully verified code's row is gone — single use at the row level.
@@ -317,6 +354,52 @@ lockoutBlocksRequestTests database secureContext suffix =
         )
 
 
+{-| A locked row must stay locked even if the code expiry passes before the
+lockout does. Otherwise `request` could sweep the row and issue a bypass code.
+-}
+expiredLockoutBlocksRequestTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+expiredLockoutBlocksRequestTests database secureContext suffix =
+    let
+        lockOptions : Otp.Options
+        lockOptions =
+            { Otp.defaultOptions
+            | issueThrottleMillis = 0
+            , maxFailedAttempts = 1
+            }
+    in
+    withUserAndEmail database secureContext ("expired-lock-" ++ suffix ++ "@example.com")
+        (\user ->
+            await
+                "Issue a code before forcing expiry"
+                (Otp.request database secureContext lockOptions user)
+                (\issued ->
+                    when issued is
+                        Otp.Issued _ ->
+                            await
+                                "Engage the lock before forcing expiry"
+                                (Otp.verify database secureContext lockOptions (Just user) { code = "WRONGCODE" })
+                                (\_ ->
+                                    await
+                                        "Force the locked code to be expired"
+                                        (expireStoredCode database user)
+                                        (\_ ->
+                                            await
+                                                "Request while the expired row is still locked"
+                                                (Otp.request database secureContext lockOptions user)
+                                                (\requestOutcome ->
+                                                    test "an expired but locked row still blocks request"
+                                                        (\_ -> Expect.equal Otp.RequestLocked requestOutcome)
+                                                )
+                                        )
+                                )
+
+                        _ ->
+                            test "issue returned a non-Issued outcome"
+                                (\_ -> Expect.fail "expected Otp.Issued")
+                )
+        )
+
+
 {-| A code issued with a zero lifetime is already expired, so verify answers
 `Rejected` (just like an unknown user), not `Verified` even for the right code.
 -}
@@ -438,6 +521,24 @@ getStoredCode database user =
         , rowDecoder =
             Sqlite.Decode.string "code" Sqlite.Decode.succeed
         }
+
+
+{-| Force the stored code row to be expired while leaving its lock metadata
+intact.
+-}
+expireStoredCode : Sqlite.Database -> Internal.User -> Task Sqlite.Error {}
+expireStoredCode database user =
+    Sqlite.execute database
+        { statement =
+            """
+            UPDATE login_otp_codes
+            SET expires_at = 0
+            WHERE user_id = :user_id
+            """
+        , parameters =
+            [ Sqlite.Encode.string "user_id" (User.id user) ]
+        }
+        |> Task.map (\_ -> {})
 
 
 {-| Create a fresh user, attach a unique normalized email, and run `toTest`

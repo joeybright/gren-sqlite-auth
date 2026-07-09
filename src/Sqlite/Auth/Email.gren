@@ -99,7 +99,7 @@ migrationV1 : { name : String, statements : Array String }
 migrationV1 =
     { name = "`Sqlite.Auth.Email.migrationV1` - Add emails table"
     , statements =
-        [ addEmailsTableMigrationSQL 
+        [ addEmailsTableMigrationSQL
         ]
     }
 
@@ -141,9 +141,9 @@ type Email state
 {-| Turn a `String` into a raw [`Email`](#Email), ready to
 [`normalize`](#normalize).
 
-Run any application content policy — format validation, disposable-provider
-rejection, invisible-character stripping — on the raw string before calling
-this. [`normalize`](#normalize) only trims, rejects empty, and lowercases.
+Run any application content policy — disposable-provider rejection,
+invisible-character stripping, lookalike handling — on the raw string before
+calling this. [`normalize`](#normalize) only trims, parses, and lowercases.
 -}
 fromString : String -> Email Raw
 fromString =

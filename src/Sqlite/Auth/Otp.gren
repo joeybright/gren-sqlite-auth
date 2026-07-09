@@ -1,6 +1,7 @@
 module Sqlite.Auth.Otp exposing
     ( migrationV1
     , Options
+    , OptionsError(..)
     , defaultOptions
     , request
     , RequestOutcome(..)
@@ -66,7 +67,7 @@ The minimum required table schema for this module to work is below:
 
 # Working with one-time passcodes
 
-@docs Options, defaultOptions
+@docs Options, OptionsError, defaultOptions
 
 ## Issuing codes
 
@@ -156,6 +157,21 @@ type alias Options =
     }
 
 
+{-| A caller supplied invalid [`Options`](#Options).
+
+- `CodeLengthTooSmall` means `codeLength` was less than `1`.
+- `MaxFailedAttemptsTooSmall` means `maxFailedAttempts` was less than `1`.
+- `NegativeLifetimeMillis`, `NegativeIssueThrottleMillis`, and
+  `NegativeLockoutDurationMillis` mean a duration was negative.
+-}
+type OptionsError
+    = CodeLengthTooSmall Int
+    | MaxFailedAttemptsTooSmall Int
+    | NegativeLifetimeMillis Int
+    | NegativeIssueThrottleMillis Int
+    | NegativeLockoutDurationMillis Int
+
+
 {-| The default, recommended, options: an 8-character code, a 5-minute
 lifetime, a 60-second issue throttle, lockout after 5 failed attempts, and a
 15-minute lock duration.
@@ -175,6 +191,29 @@ defaultOptions =
     , maxFailedAttempts = 5
     , lockoutDurationMillis = 15 * 60 * 1000
     }
+
+
+{-| Validate caller-supplied options before any OTP side effect runs.
+-}
+validateOptions : Options -> Maybe OptionsError
+validateOptions options =
+    if options.codeLength < 1 then
+        Just (CodeLengthTooSmall options.codeLength)
+
+    else if options.maxFailedAttempts < 1 then
+        Just (MaxFailedAttemptsTooSmall options.maxFailedAttempts)
+
+    else if options.lifetimeMillis < 0 then
+        Just (NegativeLifetimeMillis options.lifetimeMillis)
+
+    else if options.issueThrottleMillis < 0 then
+        Just (NegativeIssueThrottleMillis options.issueThrottleMillis)
+
+    else if options.lockoutDurationMillis < 0 then
+        Just (NegativeLockoutDurationMillis options.lockoutDurationMillis)
+
+    else
+        Nothing
 
 
 
@@ -200,14 +239,15 @@ type RequestOutcome
     | RequestLocked
 
 
-{-| The ways [`request`](#request) can fault: a database error, only. The
-expected outcomes — `TooEarly` and `RequestLocked` — travel as values inside
-[`RequestOutcome`](#RequestOutcome), not as errors. `RequestStorageError` is
-spelled apart from [`VerifyError`](#VerifyError)'s `StorageError` so the two
+{-| The ways [`request`](#request) can fault: invalid options, or a database
+error. The expected outcomes — `TooEarly` and `RequestLocked` — travel as values
+inside [`RequestOutcome`](#RequestOutcome), not as errors. `RequestStorageError`
+is spelled apart from [`VerifyError`](#VerifyError)'s `StorageError` so the two
 do not clash at unqualified use sites.
 -}
 type RequestError
     = RequestStorageError Sqlite.Error
+    | InvalidRequestOptions OptionsError
 
 
 {-| Mint a one-time passcode for the given user, returning the raw code exactly
@@ -245,41 +285,46 @@ once for the application to email. Only its SHA-256 hash is stored.
                       Task.succeed {}
           )
 
-Expired and consumed code rows are swept at the start of every successful
-`request`, so the table tends itself during normal use.
+Expired unlocked rows are swept at the start of every successful `request`, so
+the table tends itself during normal use without deleting an active lockout.
 -}
 request : Sqlite.Database -> Crypto.SecureContext -> Options -> Internal.User -> Task RequestError RequestOutcome
 request database secureContext options ((Internal.User { userId }) as user) =
-    sweepExpired database
-        |> Task.mapError RequestStorageError
-        |> Task.andThen
-            (\_ ->
-                Utils.Time.nowMillis
-                    |> Task.andThen
-                        (\now ->
-                            getCodeRow database { userId = userId }
-                                |> Task.mapError RequestStorageError
-                                |> Task.andThen
-                                    (\maybeRow ->
-                                        when maybeRow is
-                                            Just row ->
-                                                when row.lockedUntil is
-                                                    Just lockedUntil ->
-                                                        if lockedUntil > now then
-                                                            Task.succeed RequestLocked
-                                                        else
-                                                            throttleOrIssue database secureContext options { now = now, userId = userId, row = row }
+    when validateOptions options is
+        Just error ->
+            Task.fail (InvalidRequestOptions error)
+
+        Nothing ->
+            sweepExpired database
+                |> Task.mapError RequestStorageError
+                |> Task.andThen
+                    (\_ ->
+                        Utils.Time.nowMillis
+                            |> Task.andThen
+                                (\now ->
+                                    getCodeRow database { userId = userId }
+                                        |> Task.mapError RequestStorageError
+                                        |> Task.andThen
+                                            (\maybeRow ->
+                                                when maybeRow is
+                                                    Just row ->
+                                                        when row.lockedUntil is
+                                                            Just lockedUntil ->
+                                                                if lockedUntil > now then
+                                                                    Task.succeed RequestLocked
+                                                                else
+                                                                    throttleOrIssue database secureContext options { now = now, userId = userId, row = row }
+
+                                                            Nothing ->
+                                                                throttleOrIssue database secureContext options { now = now, userId = userId, row = row }
 
                                                     Nothing ->
-                                                        throttleOrIssue database secureContext options { now = now, userId = userId, row = row }
-
-                                            Nothing ->
-                                                issueRow database secureContext options { now = now, userId = userId }
-                                                    |> Task.mapError RequestStorageError
-                                                    |> Task.map Issued
-                                    )
+                                                        issueRow database secureContext options { now = now, userId = userId }
+                                                            |> Task.mapError RequestStorageError
+                                                            |> Task.map Issued
+                                            )
+                            )
                     )
-            )
 
 
 {-| Decide between `TooEarly` and a fresh re-issue for an existing
@@ -350,12 +395,13 @@ type VerifyOutcome
     | Locked
 
 
-{-| The ways [`verify`](#verify) can fault: a database error, only. Expected
-rejections — unknown user, wrong code, expired code, locked row — travel as
-values inside [`VerifyOutcome`](#VerifyOutcome).
+{-| The ways [`verify`](#verify) can fault: invalid options, or a database
+error. Expected rejections — unknown user, wrong code, expired code, locked row
+— travel as values inside [`VerifyOutcome`](#VerifyOutcome).
 -}
 type VerifyError
     = StorageError Sqlite.Error
+    | InvalidVerifyOptions OptionsError
 
 
 {-| Verify a submitted one-time passcode. The user argument is the `Maybe` that
@@ -388,38 +434,43 @@ A successful verify deletes the row, so a code redeems at most once.
 -}
 verify : Sqlite.Database -> Crypto.SecureContext -> Options -> Maybe Internal.User -> { code : String } -> Task VerifyError VerifyOutcome
 verify database secureContext options maybeUser input =
-    when maybeUser is
+    when validateOptions options is
+        Just error ->
+            Task.fail (InvalidVerifyOptions error)
+
         Nothing ->
-            burnCandidate secureContext input
-                |> Task.map (\_ -> Rejected)
+            when maybeUser is
+                Nothing ->
+                    burnCandidate secureContext input
+                        |> Task.map (\_ -> Rejected)
 
-        Just (Internal.User { userId }) ->
-            Utils.Time.nowMillis
-                |> Task.andThen
-                    (\now ->
-                        getCodeRow database { userId = userId }
-                            |> Task.mapError StorageError
-                            |> Task.andThen
-                                (\maybeRow ->
-                                    when maybeRow is
-                                        Nothing ->
-                                            burnCandidate secureContext input
-                                                |> Task.map (\_ -> Rejected)
-
-                                        Just row ->
-                                            when row.lockedUntil is
-                                                Just lockedUntil ->
-                                                    if lockedUntil > now then
-                                                        burnCandidate secureContext input
-                                                            |> Task.map (\_ -> Locked)
-
-                                                    else
-                                                        verifyAgainstRow database secureContext options { now = now, candidate = input.code, row = row }
-
+                Just (Internal.User { userId }) ->
+                    Utils.Time.nowMillis
+                        |> Task.andThen
+                            (\now ->
+                                getCodeRow database { userId = userId }
+                                    |> Task.mapError StorageError
+                                    |> Task.andThen
+                                        (\maybeRow ->
+                                            when maybeRow is
                                                 Nothing ->
-                                                    verifyAgainstRow database secureContext options { now = now, candidate = input.code, row = row }
-                                )
-                    )
+                                                    burnCandidate secureContext input
+                                                        |> Task.map (\_ -> Rejected)
+
+                                                Just row ->
+                                                    when row.lockedUntil is
+                                                        Just lockedUntil ->
+                                                            if lockedUntil > now then
+                                                                burnCandidate secureContext input
+                                                                    |> Task.map (\_ -> Locked)
+
+                                                            else
+                                                                verifyAgainstRow database secureContext options { now = now, candidate = input.code, row = row }
+
+                                                        Nothing ->
+                                                            verifyAgainstRow database secureContext options { now = now, candidate = input.code, row = row }
+                                        )
+                            )
 
 
 {-| Compare the hashed candidate against an unlocked, non-locked row. A
@@ -455,7 +506,7 @@ verifyAgainstRow database secureContext options { now, candidate, row } =
                                 )
 
                     else
-                        recordFailedAttempt database options { now = now, userId = row.userId }
+                        recordFailedAttempt database options { now = now, userId = row.userId, code = row.code }
                             |> Task.mapError StorageError
                             |> Task.map (\_ -> Rejected)
                 )
@@ -489,13 +540,13 @@ consumeCode database { userId, code, now } =
         )
 
 
-{-| Record a failed verify for `userId`: bump the failure counter and, when
-the new count reaches `options.maxFailedAttempts`, engage the lock. The
-increment and the lock decision happen in one statement, so concurrent
-failures cannot read the same count and under-count toward the lockout.
+{-| Record a failed verify for the observed row: bump the failure counter and,
+when the new count reaches `options.maxFailedAttempts`, engage the lock. The row
+hash and liveness guards prevent a stale failure from mutating a replaced,
+expired, or locked code.
 -}
-recordFailedAttempt : Sqlite.Database -> Options -> { now : Int, userId : String } -> Task Sqlite.Error Sqlite.ExecutionSummary
-recordFailedAttempt database options { now, userId } =
+recordFailedAttempt : Sqlite.Database -> Options -> { now : Int, userId : String, code : String } -> Task Sqlite.Error Sqlite.ExecutionSummary
+recordFailedAttempt database options { now, userId, code } =
     Sqlite.execute database
         { statement =
             """
@@ -507,11 +558,16 @@ recordFailedAttempt database options { now, userId } =
                     ELSE NULL
                 END
             WHERE user_id = :user_id
+                AND code = :code
+                AND expires_at > :now
+                AND (locked_until IS NULL OR locked_until <= :now)
             """
         , parameters =
             [ Sqlite.Encode.int "max_failed_attempts" options.maxFailedAttempts
             , Sqlite.Encode.int "locked_until" (now + options.lockoutDurationMillis)
             , Sqlite.Encode.string "user_id" userId
+            , Sqlite.Encode.string "code" code
+            , Sqlite.Encode.int "now" now
             ]
         }
 
@@ -780,8 +836,9 @@ getCodeRow database { userId } =
         }
 
 
-{-| Delete every expired OTP row as of `now`. Run by [`request`](#request), so
-the table tends itself during normal use.
+{-| Delete every expired OTP row whose lockout is not still active. Run by
+[`request`](#request), so the table tends itself during normal use without
+letting expiry bypass a longer lockout.
 -}
 sweepExpired : Sqlite.Database -> Task Sqlite.Error {}
 sweepExpired database =
@@ -793,6 +850,7 @@ sweepExpired database =
                         """
                         DELETE FROM login_otp_codes
                         WHERE expires_at <= :now
+                            AND (locked_until IS NULL OR locked_until <= :now)
                         """
                     , parameters =
                         [ Sqlite.Encode.int "now" now ]

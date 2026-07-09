@@ -15,9 +15,8 @@ This module's job is *string → structured data*. It performs the full
 structural parse — local-part (dot-string or quoted-string), domain (dot-atom
 of labels or an `[address-literal]`), and `@` separator — and the RFC 5321
 octet limits (local-part ≤ 64, each domain label ≤ 63, domain ≤ 255, total
-≤ 254). IPv4 and IPv6 address literals are validated; a `[tag:value]` form that
-is neither is captured structurally as a `General` literal without deep
-validation.
+≤ 254). IPv4 and IPv6 address literals are validated; general `[tag:value]`
+address literals are rejected rather than partially accepted.
 
 Two things are deliberately out of scope and left to the caller:
 
@@ -89,15 +88,13 @@ type Domain
 {-| The content of an `[address-literal]`.
 
 `Ipv4` and `Ipv6` carry the validated address text (without the surrounding
-brackets; for `Ipv6` the `IPv6:` tag has been consumed). `General` captures a
-`[tag:value]` form that is neither, keeping the `tag` and `value` without deep
-validation.
+brackets; for `Ipv6` the `IPv6:` tag has been consumed). General `[tag:value]`
+address literals are deliberately rejected.
 
 -}
 type AddressLiteral
     = Ipv4 String
     | Ipv6 String
-    | General { tag : String, value : String }
 
 
 {-| Reasons `parse` can fail.
@@ -123,6 +120,8 @@ type AddressLiteral
     wrapped `String` is the offending label.
   - `UnclosedDomainLiteral` — a `[` was never closed by `]`.
   - `EmptyDomainLiteral` — the brackets were empty (`[]`).
+  - `InvalidDomainLiteral` — a general `[tag:value]` address literal was used;
+    the wrapped `String` is the offending content.
   - `InvalidIpv4` / `InvalidIpv6` — an address literal did not validate; the
     wrapped `String` is the offending content.
   - `LocalPartTooLong` / `DomainTooLong` / `EmailTooLong` / `LabelTooLong` —
@@ -149,6 +148,7 @@ type Error
     | LabelStartsOrEndsWithHyphen String
     | UnclosedDomainLiteral
     | EmptyDomainLiteral
+    | InvalidDomainLiteral String
     | InvalidIpv4 String
     | InvalidIpv6 String
     | LocalPartTooLong Int
@@ -452,7 +452,7 @@ domainParser =
 
 
 {-| Parse a `[address-literal]`. The brackets are consumed; the body is
-classified as IPv4, IPv6, or a general tagged literal.
+classified as IPv4 or IPv6.
 -}
 literalParser : EmailParser Domain
 literalParser =
@@ -470,8 +470,9 @@ literalBodyParser =
         |> Parser.andThen validateLiteral
 
 
-{-| Classify a chomped literal body as IPv4, IPv6 (by its `IPv6:` tag), or a
-general `[tag:value]` literal, validating IPv4 and IPv6 fully.
+{-| Classify a chomped literal body as IPv4 or IPv6, validating both fully.
+General `[tag:value]` literals are rejected because partial syntax acceptance is
+too loose for a login identifier.
 -}
 validateLiteral : String -> EmailParser AddressLiteral
 validateLiteral body =
@@ -490,21 +491,7 @@ validateLiteral body =
             hardFail (InvalidIpv6 address)
 
     else if String.contains ":" body then
-        let
-            parts =
-                String.split ":" body
-        in
-        when Array.first parts is
-            Just tag ->
-                Parser.succeed
-                    (General
-                        { tag = tag
-                        , value = String.join ":" (Array.dropFirst 1 parts)
-                        }
-                    )
-
-            Nothing ->
-                hardFail (InvalidIpv4 body)
+        hardFail (InvalidDomainLiteral body)
 
     else if isValidIpv4 body then
         Parser.succeed (Ipv4 body)
@@ -707,8 +694,6 @@ literalLiteralOctets literal =
                 Ipv6 address ->
                     "IPv6:" ++ address
 
-                General { tag, value } ->
-                    tag ++ ":" ++ value
     in
     String.count inner + 2
 
@@ -950,6 +935,3 @@ literalToString literal =
 
         Ipv6 address ->
             "IPv6:" ++ address
-
-        General { tag, value } ->
-            tag ++ ":" ++ value

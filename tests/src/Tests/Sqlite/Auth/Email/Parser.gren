@@ -104,16 +104,6 @@ validParseTests =
                             }
                         )
             )
-        , Test.test "a general tagged literal is captured structurally"
-            (\_ ->
-                Parser.parse "user@[tag:value]"
-                    |> Expect.equal
-                        (Ok
-                            { localPart = DotAtom [ "user" ]
-                            , domain = Literal (General { tag = "tag", value = "value" })
-                            }
-                        )
-            )
         ]
 
 
@@ -130,8 +120,6 @@ roundTripTests =
         , roundTrip "\"a@b\"@example.com"
         , roundTrip "user@[192.168.0.1]"
         , roundTrip "user@[IPv6:2001:db8::1]"
-        , roundTrip "user@[tag:value]"
-        , roundTrip "user@[tag:with:colons]"
         ]
 
 
@@ -234,6 +222,14 @@ errorTests =
         , Test.test "an invalid IPv6 group"
             (\_ ->
                 Parser.parse "a@[IPv6:zzz]" |> Expect.equal (Err (Parser.InvalidIpv6 "zzz"))
+            )
+        , Test.test "a general tagged literal is rejected"
+            (\_ ->
+                Parser.parse "a@[tag:value]" |> Expect.equal (Err (Parser.InvalidDomainLiteral "tag:value"))
+            )
+        , Test.test "a malformed general tagged literal is rejected"
+            (\_ ->
+                Parser.parse "a@[tag:\n]" |> Expect.equal (Err (Parser.InvalidDomainLiteral "tag:\n"))
             )
         , Test.test "too many IPv6 groups without compression"
             (\_ ->
