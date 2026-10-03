@@ -8,7 +8,7 @@ import FileSystem.Path
 import Init
 import Node
 import Task exposing ( Task )
-import Test.Runner.Effectful exposing ( await, concat )
+import Test.Runner.Effectful exposing ( await, concat, initialize, run )
 import Tests.EmailParser
 import Tests.PhcString
 import Tests.Sqlite.Auth.Email
@@ -20,29 +20,33 @@ import Tests.SqliteAuth
 
 
 {-|-}
-main : Test.Runner.Effectful.Program a
+main : Node.SimpleProgram {}
 main =
     Node.defineSimpleProgram
         (\env ->
-            Init.await FileSystem.initialize
-                (\fsPermission ->
-                    await "Get secure context for Crypto functions" Crypto.getSecureContext
-                        (\secureContext ->
-                            await "Remove test databases left by a previous run" (removeTestDatabases fsPermission)
-                                (\_ ->
-                                    concat
-                                        [ Test.Runner.Effectful.wrap Tests.PhcString.tests
-                                        , Test.Runner.Effectful.wrap Tests.EmailParser.tests
-                                        , Tests.Sqlite.Auth.User.tests fsPermission secureContext
-                                        , Tests.Sqlite.Auth.Password.tests fsPermission secureContext
-                                        , Tests.Sqlite.Auth.Username.tests fsPermission secureContext
-                                        , Tests.Sqlite.Auth.Email.tests fsPermission secureContext
-                                        , Tests.Sqlite.Auth.Session.tests fsPermission secureContext
-                                        , Tests.SqliteAuth.tests fsPermission secureContext
-                                        ]
+            initialize env
+                (\config ->
+                    Init.await FileSystem.initialize
+                        (\fsPermission ->
+                            await "Get secure context for Crypto functions" Crypto.getSecureContext
+                                (\secureContext ->
+                                    await "Remove test databases left by a previous run" (removeTestDatabases fsPermission)
+                                        (\_ ->
+                                            concat
+                                                [ Test.Runner.Effectful.wrap Tests.PhcString.tests
+                                                , Test.Runner.Effectful.wrap Tests.EmailParser.tests
+                                                , Tests.Sqlite.Auth.User.tests fsPermission secureContext
+                                                , Tests.Sqlite.Auth.Password.tests fsPermission secureContext
+                                                , Tests.Sqlite.Auth.Username.tests fsPermission secureContext
+                                                , Tests.Sqlite.Auth.Email.tests fsPermission secureContext
+                                                , Tests.Sqlite.Auth.Session.tests fsPermission secureContext
+                                                , Tests.SqliteAuth.tests fsPermission secureContext
+                                                ]
+                                        )
                                 )
+                                |> run config
+                                |> Node.endSimpleProgram
                         )
-                        |> Test.Runner.Effectful.run env
                 )
         )
 
