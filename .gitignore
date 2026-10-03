@@ -2,6 +2,7 @@
 tests/app
 tests/test.sqlite
 tests/test-sqlite-auth.sqlite
+tests/test-sqlite-auth-email.sqlite
 tests/test-sqlite-auth-password.sqlite
 tests/test-sqlite-auth-session.sqlite
 tests/test-sqlite-auth-user.sqlite
