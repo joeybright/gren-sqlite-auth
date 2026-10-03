@@ -23,7 +23,9 @@ import Sqlite.Auth.Internal as Internal
 import Sqlite.Auth.Session as Session
 import Sqlite.Auth.User as User
 import Sqlite.Decode
+import Sqlite.Decode.Row
 import Sqlite.Encode
+import Sqlite.Encode.Row
 import Sqlite.Migrate
 import Task exposing ( Task )
 import Test
@@ -52,7 +54,7 @@ tests fsPermission secureContext =
     in
     await
         "Open the on-disk test database (Sqlite.Auth.Session)"
-        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth-session.sqlite"))
+        (Sqlite.open fsPermission Sqlite.defaultOptions (Sqlite.File (FileSystem.Path.fromPosixString "test-sqlite-auth-session.sqlite")))
         (\database ->
             await
                 "Apply migrations (Sqlite.Auth.Session)"
@@ -391,10 +393,10 @@ countSessionRows database { userId } =
             WHERE user_id = :user_id
             """
         , parameters =
-            [ Sqlite.Encode.string "user_id" userId
+            [ Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
             ]
         , rowDecoder =
-            Sqlite.Decode.int "row_count" Sqlite.Decode.succeed
+            Sqlite.Decode.Row.column "row_count" Sqlite.Decode.int Sqlite.Decode.Row.succeed
         }
 
 

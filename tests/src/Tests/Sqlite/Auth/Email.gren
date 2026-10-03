@@ -26,7 +26,9 @@ import Sqlite.Auth.Email.Parser as Parser
 import Sqlite.Auth.Internal as Internal
 import Sqlite.Auth.User as User
 import Sqlite.Decode
+import Sqlite.Decode.Row
 import Sqlite.Encode
+import Sqlite.Encode.Row
 import Sqlite.Migrate
 import Task exposing ( Task )
 import Test
@@ -62,7 +64,7 @@ tests fsPermission secureContext =
     in
     await
         "Open the on-disk test database (Sqlite.Auth.Email)"
-        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth-email.sqlite"))
+        (Sqlite.open fsPermission Sqlite.defaultOptions (Sqlite.File (FileSystem.Path.fromPosixString "test-sqlite-auth-email.sqlite")))
         (\database ->
             await
                 "Apply migrations (Sqlite.Auth.Email)"
@@ -643,8 +645,8 @@ countVerificationTokenRows database { email } =
             WHERE email = :email
             """
         , parameters =
-            [ Sqlite.Encode.string "email" email
+            [ Sqlite.Encode.Row.column "email" (Sqlite.Encode.string email)
             ]
         , rowDecoder =
-            Sqlite.Decode.int "row_count" Sqlite.Decode.succeed
+            Sqlite.Decode.Row.column "row_count" Sqlite.Decode.int Sqlite.Decode.Row.succeed
         }

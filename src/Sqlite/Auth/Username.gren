@@ -69,7 +69,9 @@ username.
 import Sqlite
 import Sqlite.Auth.Internal as Internal
 import Sqlite.Decode
+import Sqlite.Decode.Row
 import Sqlite.Encode
+import Sqlite.Encode.Row
 import Task exposing ( Task )
 import Utils.Time
 
@@ -172,10 +174,10 @@ new database { username } ((Internal.User { userId }) as userWitness) =
                         VALUES (:username, :user_id, :created_at, :updated_at)
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "username" (toString username)
-                        , Sqlite.Encode.string "user_id" userId
-                        , Sqlite.Encode.int "created_at" now
-                        , Sqlite.Encode.int "updated_at" now
+                        [ Sqlite.Encode.Row.column "username" (Sqlite.Encode.string (toString username))
+                        , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+                        , Sqlite.Encode.Row.column "created_at" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
                         ]
                     }
                     |> Task.map (\_ -> userWitness)
@@ -203,9 +205,9 @@ change database { newUsername } ((Internal.Verified { userId }) as verified) =
                         WHERE user_id = :user_id
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "to" (toString newUsername)
-                        , Sqlite.Encode.int "updated_at" now
-                        , Sqlite.Encode.string "user_id" userId
+                        [ Sqlite.Encode.Row.column "to" (Sqlite.Encode.string (toString newUsername))
+                        , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
                         ]
                     }
                     |> Task.map (\_ -> verified)
@@ -225,9 +227,8 @@ user database { username } =
             WHERE username = :username
             """
         , parameters =
-            [ Sqlite.Encode.string "username" (toString username)
+            [ Sqlite.Encode.Row.column "username" (Sqlite.Encode.string (toString username))
             ]
         , rowDecoder =
-            Sqlite.Decode.string "user_id"
-                (\userId -> Sqlite.Decode.succeed (Internal.User { userId = userId }))
+            Sqlite.Decode.Row.column "user_id" Sqlite.Decode.string <| \userId -> Sqlite.Decode.Row.succeed (Internal.User { userId = userId })
         }

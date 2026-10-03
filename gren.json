@@ -17,6 +17,6 @@
     "dependencies": {
         "blaix/gren-base64": "2.0.0 <= v < 3.0.0",
         "gren-lang/core": "local:../gren-core",
-        "gren-lang/node": "local:../node"
+        "gren-lang/node": "6.2.0 <= v < 7.0.0"
     }
 }

@@ -57,7 +57,7 @@ tests fsPermission secureContext =
     in
     await
         "Open the on-disk test database (Sqlite.Auth.Username)"
-        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth-username.sqlite"))
+        (Sqlite.open fsPermission Sqlite.defaultOptions (Sqlite.File (FileSystem.Path.fromPosixString "test-sqlite-auth-username.sqlite")))
         (\database ->
             await
                 "Apply migrations (Sqlite.Auth.Username)"

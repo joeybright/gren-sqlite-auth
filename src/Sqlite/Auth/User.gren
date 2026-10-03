@@ -40,7 +40,9 @@ import Crypto
 import Sqlite
 import Sqlite.Auth.Internal as Internal
 import Sqlite.Decode
+import Sqlite.Decode.Row
 import Sqlite.Encode
+import Sqlite.Encode.Row
 import Task exposing ( Task )
 import Utils.Time
 
@@ -102,9 +104,9 @@ new database secureContext =
                                     VALUES (:id, :created_at, :updated_at)
                                     """
                                 , parameters =
-                                    [ Sqlite.Encode.string "id" userId
-                                    , Sqlite.Encode.int "created_at" now
-                                    , Sqlite.Encode.int "updated_at" now
+                                    [ Sqlite.Encode.Row.column "id" (Sqlite.Encode.string userId)
+                                    , Sqlite.Encode.Row.column "created_at" (Sqlite.Encode.int now)
+                                    , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
                                     ]
                                 }
                                 |> Task.map (\_ -> Internal.User { userId = userId })
@@ -125,11 +127,10 @@ get database input =
             WHERE id = :id
             """
         , parameters =
-            [ Sqlite.Encode.string "id" input.id
+            [ Sqlite.Encode.Row.column "id" (Sqlite.Encode.string input.id)
             ]
         , rowDecoder =
-            Sqlite.Decode.string "id"
-                (\userId -> Sqlite.Decode.succeed (Internal.User { userId = userId }))
+            Sqlite.Decode.Row.column "id" Sqlite.Decode.string <| \userId -> Sqlite.Decode.Row.succeed (Internal.User { userId = userId })
         }
 
 

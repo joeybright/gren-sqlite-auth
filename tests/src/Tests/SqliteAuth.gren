@@ -42,6 +42,7 @@ import Sqlite.Auth.Session as Session
 import Sqlite.Auth.User as User
 import Sqlite.Auth.Username as Username
 import Sqlite.Decode
+import Sqlite.Decode.Row
 import Sqlite.Migrate
 import Task exposing ( Task )
 import Test.Runner.Effectful exposing ( await, awaitError, concat, test )
@@ -101,8 +102,7 @@ countUsers database =
             """
         , parameters = []
         , rowDecoder =
-            Sqlite.Decode.int "user_count"
-                (\count -> Sqlite.Decode.succeed count)
+            Sqlite.Decode.Row.column "user_count" Sqlite.Decode.int <| \count -> Sqlite.Decode.Row.succeed count
         }
 
 
@@ -326,7 +326,7 @@ tests fsPermission secureContext =
     in
     await
         "Open the on-disk test database (Sqlite.Auth)"
-        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth.sqlite"))
+        (Sqlite.open fsPermission Sqlite.defaultOptions (Sqlite.File (FileSystem.Path.fromPosixString "test-sqlite-auth.sqlite")))
         (\database ->
             await
                 "Apply migrations (Sqlite.Auth)"

@@ -112,7 +112,9 @@ import Sqlite
 import Sqlite.Auth.Email.Parser as Parser
 import Sqlite.Auth.Internal as Internal
 import Sqlite.Decode
+import Sqlite.Decode.Row
 import Sqlite.Encode
+import Sqlite.Encode.Row
 import Task exposing ( Task )
 import Utils.Base64
 import Utils.Crypto
@@ -244,10 +246,10 @@ new database { email } ((Internal.User { userId }) as userWitness) =
                         VALUES (:email, :user_id, NULL, :created_at, :updated_at)
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "email" (toString email)
-                        , Sqlite.Encode.string "user_id" userId
-                        , Sqlite.Encode.int "created_at" now
-                        , Sqlite.Encode.int "updated_at" now
+                        [ Sqlite.Encode.Row.column "email" (Sqlite.Encode.string (toString email))
+                        , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+                        , Sqlite.Encode.Row.column "created_at" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
                         ]
                     }
                     |> Task.map (\_ -> userWitness)
@@ -285,9 +287,9 @@ change database { newEmail } ((Internal.Verified { userId }) as verified) =
                                         WHERE user_id = :user_id
                                         """
                                     , parameters =
-                                        [ Sqlite.Encode.string "to" (toString newEmail)
-                                        , Sqlite.Encode.int "updated_at" now
-                                        , Sqlite.Encode.string "user_id" userId
+                                        [ Sqlite.Encode.Row.column "to" (Sqlite.Encode.string (toString newEmail))
+                                        , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
+                                        , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
                                         ]
                                     }
                             )
@@ -310,25 +312,21 @@ user database { email } =
             WHERE email = :email
             """
         , parameters =
-            [ Sqlite.Encode.string "email" (toString email)
+            [ Sqlite.Encode.Row.column "email" (Sqlite.Encode.string (toString email))
             ]
         , rowDecoder =
-            Sqlite.Decode.string "user_id"
-                (\userId ->
-                    Sqlite.Decode.maybe Sqlite.Decode.int "verified_at"
-                        (\maybeVerifiedAt ->
-                            Sqlite.Decode.succeed
-                                { user = Internal.User { userId = userId }
-                                , verification =
-                                    when maybeVerifiedAt is
-                                        Just verifiedAt ->
-                                            Verified { verifiedAt = verifiedAt }
+            Sqlite.Decode.Row.column "user_id" Sqlite.Decode.string <| \userId ->
+            Sqlite.Decode.Row.column "verified_at" (Sqlite.Decode.maybe Sqlite.Decode.int) <| \maybeVerifiedAt ->
+                Sqlite.Decode.Row.succeed
+                    { user = Internal.User { userId = userId }
+                    , verification =
+                        when maybeVerifiedAt is
+                            Just verifiedAt ->
+                                Verified { verifiedAt = verifiedAt }
 
-                                        Nothing ->
-                                            Unverified
-                                }
-                        )
-                )
+                            Nothing ->
+                                Unverified
+                    }
         }
 
 
@@ -536,10 +534,10 @@ insertVerificationTokenRow database { verificationToken, email, createdAt, expir
             VALUES (:verification_token, :email, :created_at, :expires_at)
             """
         , parameters =
-            [ Sqlite.Encode.string "verification_token" verificationToken
-            , Sqlite.Encode.string "email" email
-            , Sqlite.Encode.int "created_at" createdAt
-            , Sqlite.Encode.int "expires_at" expiresAt
+            [ Sqlite.Encode.Row.column "verification_token" (Sqlite.Encode.string verificationToken)
+            , Sqlite.Encode.Row.column "email" (Sqlite.Encode.string email)
+            , Sqlite.Encode.Row.column "created_at" (Sqlite.Encode.int createdAt)
+            , Sqlite.Encode.Row.column "expires_at" (Sqlite.Encode.int expiresAt)
             ]
         }
 
@@ -559,23 +557,17 @@ getVerificationTokenRow database { verificationToken } =
             WHERE email_verification_tokens.verification_token = :verification_token
             """
         , parameters =
-            [ Sqlite.Encode.string "verification_token" verificationToken
+            [ Sqlite.Encode.Row.column "verification_token" (Sqlite.Encode.string verificationToken)
             ]
         , rowDecoder =
-            Sqlite.Decode.string "email"
-                (\email ->
-                    Sqlite.Decode.int "expires_at"
-                        (\expiresAt ->
-                            Sqlite.Decode.string "user_id"
-                                (\userId ->
-                                    Sqlite.Decode.succeed
-                                        { email = email
-                                        , expiresAt = expiresAt
-                                        , userId = userId
-                                        }
-                                )
-                        )
-                )
+            Sqlite.Decode.Row.column "email" Sqlite.Decode.string <| \email ->
+            Sqlite.Decode.Row.column "expires_at" Sqlite.Decode.int <| \expiresAt ->
+            Sqlite.Decode.Row.column "user_id" Sqlite.Decode.string <| \userId ->
+                Sqlite.Decode.Row.succeed
+                    { email = email
+                    , expiresAt = expiresAt
+                    , userId = userId
+                    }
         }
 
 
@@ -593,7 +585,7 @@ deleteVerificationTokenRowByToken database { verificationToken } =
             WHERE verification_token = :verification_token
             """
         , parameters =
-            [ Sqlite.Encode.string "verification_token" verificationToken
+            [ Sqlite.Encode.Row.column "verification_token" (Sqlite.Encode.string verificationToken)
             ]
         }
 
@@ -611,7 +603,7 @@ deleteVerificationTokenRowsForUser database { userId } =
             WHERE email IN (SELECT email FROM emails WHERE user_id = :user_id)
             """
         , parameters =
-            [ Sqlite.Encode.string "user_id" userId
+            [ Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
             ]
         }
 
@@ -629,8 +621,8 @@ markVerifiedRow database { email, now } =
             WHERE email = :email
             """
         , parameters =
-            [ Sqlite.Encode.int "now" now
-            , Sqlite.Encode.string "email" email
+            [ Sqlite.Encode.Row.column "now" (Sqlite.Encode.int now)
+            , Sqlite.Encode.Row.column "email" (Sqlite.Encode.string email)
             ]
         }
 
@@ -651,7 +643,7 @@ sweepVerificationTokens database =
                         WHERE expires_at <= :now
                         """
                     , parameters =
-                        [ Sqlite.Encode.int "now" now
+                        [ Sqlite.Encode.Row.column "now" (Sqlite.Encode.int now)
                         ]
                     }
             )

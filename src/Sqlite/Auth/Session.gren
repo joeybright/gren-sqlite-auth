@@ -68,7 +68,9 @@ import Crypto
 import Sqlite
 import Sqlite.Auth.Internal as Internal
 import Sqlite.Decode
+import Sqlite.Decode.Row
 import Sqlite.Encode
+import Sqlite.Encode.Row
 import Task exposing ( Task )
 import Utils.Base64
 import Utils.Crypto
@@ -346,8 +348,8 @@ revoke database secureContext options { token } =
                                     WHERE session_token = :session_token
                                     """
                                 , parameters =
-                                    [ Sqlite.Encode.int "revoked_at" now
-                                    , Sqlite.Encode.string "session_token" hashedToken
+                                    [ Sqlite.Encode.Row.column "revoked_at" (Sqlite.Encode.int now)
+                                    , Sqlite.Encode.Row.column "session_token" (Sqlite.Encode.string hashedToken)
                                     ]
                                 }
                         )
@@ -373,8 +375,8 @@ revokeAll database { userId } =
                         WHERE user_id = :user_id AND revoked_at IS NULL
                         """
                     , parameters =
-                        [ Sqlite.Encode.int "revoked_at" now
-                        , Sqlite.Encode.string "user_id" userId
+                        [ Sqlite.Encode.Row.column "revoked_at" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
                         ]
                     }
             )
@@ -383,34 +385,22 @@ revokeAll database { userId } =
 
 {-| Decode a single `sessions` row into a [`Session`](#Session).
 -}
-decoder : Sqlite.Decode.Decoder Session
+decoder : Sqlite.Decode.Row.Decoder Session
 decoder =
-    Sqlite.Decode.string "session_token"
-        (\sessionToken ->
-            Sqlite.Decode.string "user_id"
-                (\userId ->
-                    Sqlite.Decode.int "created_at"
-                        (\createdAt ->
-                            Sqlite.Decode.int "expires_at"
-                                (\expiresAt ->
-                                    Sqlite.Decode.int "last_used_at"
-                                        (\lastUsedAt ->
-                                            Sqlite.Decode.maybe Sqlite.Decode.int "revoked_at"
-                                                (\revokedAt ->
-                                                    Sqlite.Decode.succeed
-                                                        { sessionToken = sessionToken
-                                                        , userId = userId
-                                                        , createdAt = createdAt
-                                                        , expiresAt = expiresAt
-                                                        , lastUsedAt = lastUsedAt
-                                                        , revokedAt = revokedAt
-                                                        }
-                                                )
-                                        )
-                                )
-                        )
-                )
-        )
+    Sqlite.Decode.Row.column "session_token" Sqlite.Decode.string <| \sessionToken ->
+    Sqlite.Decode.Row.column "user_id" Sqlite.Decode.string <| \userId ->
+    Sqlite.Decode.Row.column "created_at" Sqlite.Decode.int <| \createdAt ->
+    Sqlite.Decode.Row.column "expires_at" Sqlite.Decode.int <| \expiresAt ->
+    Sqlite.Decode.Row.column "last_used_at" Sqlite.Decode.int <| \lastUsedAt ->
+    Sqlite.Decode.Row.column "revoked_at" (Sqlite.Decode.maybe Sqlite.Decode.int) <| \revokedAt ->
+        Sqlite.Decode.Row.succeed
+            { sessionToken = sessionToken
+            , userId = userId
+            , createdAt = createdAt
+            , expiresAt = expiresAt
+            , lastUsedAt = lastUsedAt
+            , revokedAt = revokedAt
+            }
 
 
 {-| Insert a session row into the `sessions` table.
@@ -424,12 +414,12 @@ insert database { sessionToken, userId, createdAt, expiresAt, lastUsedAt, revoke
             VALUES (:session_token, :user_id, :created_at, :expires_at, :last_used_at, :revoked_at)
             """
         , parameters =
-            [ Sqlite.Encode.string "session_token" sessionToken
-            , Sqlite.Encode.string "user_id" userId
-            , Sqlite.Encode.int "created_at" createdAt
-            , Sqlite.Encode.int "expires_at" expiresAt
-            , Sqlite.Encode.int "last_used_at" lastUsedAt
-            , Sqlite.Encode.maybe Sqlite.Encode.int "revoked_at" revokedAt
+            [ Sqlite.Encode.Row.column "session_token" (Sqlite.Encode.string sessionToken)
+            , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+            , Sqlite.Encode.Row.column "created_at" (Sqlite.Encode.int createdAt)
+            , Sqlite.Encode.Row.column "expires_at" (Sqlite.Encode.int expiresAt)
+            , Sqlite.Encode.Row.column "last_used_at" (Sqlite.Encode.int lastUsedAt)
+            , Sqlite.Encode.Row.column "revoked_at" (Sqlite.Encode.maybe Sqlite.Encode.int revokedAt)
             ]
         }
 
@@ -451,7 +441,7 @@ getByToken database secureContext { token } =
                         WHERE session_token = :session_token
                         """
                     , parameters =
-                        [ Sqlite.Encode.string "session_token" hashedToken
+                        [ Sqlite.Encode.Row.column "session_token" (Sqlite.Encode.string hashedToken)
                         ]
                     , rowDecoder = decoder
                     }
@@ -478,9 +468,9 @@ touch database options { sessionToken, now } =
                 AND last_used_at > :idle_cutoff
             """
         , parameters =
-            [ Sqlite.Encode.int "now" now
-            , Sqlite.Encode.string "session_token" sessionToken
-            , Sqlite.Encode.int "idle_cutoff" (now - options.idleTimeoutMillis)
+            [ Sqlite.Encode.Row.column "now" (Sqlite.Encode.int now)
+            , Sqlite.Encode.Row.column "session_token" (Sqlite.Encode.string sessionToken)
+            , Sqlite.Encode.Row.column "idle_cutoff" (Sqlite.Encode.int (now - options.idleTimeoutMillis))
             ]
         }
 
@@ -501,8 +491,8 @@ sweep database options =
                         WHERE revoked_at IS NOT NULL OR expires_at <= :now OR last_used_at <= :idle_cutoff
                         """
                     , parameters =
-                        [ Sqlite.Encode.int "now" now
-                        , Sqlite.Encode.int "idle_cutoff" (now - options.idleTimeoutMillis)
+                        [ Sqlite.Encode.Row.column "now" (Sqlite.Encode.int now)
+                        , Sqlite.Encode.Row.column "idle_cutoff" (Sqlite.Encode.int (now - options.idleTimeoutMillis))
                         ]
                     }
             )

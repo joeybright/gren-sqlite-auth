@@ -20,7 +20,9 @@ import Sqlite
 import Sqlite.Auth.Internal as Internal
 import Sqlite.Auth.User as User
 import Sqlite.Decode
+import Sqlite.Decode.Row
 import Sqlite.Encode
+import Sqlite.Encode.Row
 import Sqlite.Migrate
 import Task exposing ( Task )
 import Test
@@ -49,23 +51,17 @@ userRow database userId =
             WHERE id = :id
             """
         , parameters =
-            [ Sqlite.Encode.string "id" userId
+            [ Sqlite.Encode.Row.column "id" (Sqlite.Encode.string userId)
             ]
         , rowDecoder =
-            Sqlite.Decode.string "id"
-                (\id ->
-                    Sqlite.Decode.int "created_at"
-                        (\createdAt ->
-                            Sqlite.Decode.int "updated_at"
-                                (\updatedAt ->
-                                    Sqlite.Decode.succeed
-                                        { id = id
-                                        , createdAt = createdAt
-                                        , updatedAt = updatedAt
-                                        }
-                                )
-                        )
-                )
+            Sqlite.Decode.Row.column "id" Sqlite.Decode.string <| \id ->
+            Sqlite.Decode.Row.column "created_at" Sqlite.Decode.int <| \createdAt ->
+            Sqlite.Decode.Row.column "updated_at" Sqlite.Decode.int <| \updatedAt ->
+                Sqlite.Decode.Row.succeed
+                    { id = id
+                    , createdAt = createdAt
+                    , updatedAt = updatedAt
+                    }
         }
 
 
@@ -82,7 +78,7 @@ tests fsPermission secureContext =
     in
     await
         "Open the on-disk test database (Sqlite.Auth.User)"
-        (Sqlite.open fsPermission Sqlite.defaultOptions (FileSystem.Path.fromPosixString "test-sqlite-auth-user.sqlite"))
+        (Sqlite.open fsPermission Sqlite.defaultOptions (Sqlite.File (FileSystem.Path.fromPosixString "test-sqlite-auth-user.sqlite")))
         (\database ->
             await
                 "Apply migrations (Sqlite.Auth.User)"
