@@ -23,7 +23,7 @@ import Tests.SqliteAuth
 main : Node.SimpleProgram {}
 main =
     Node.defineSimpleProgram <| \env ->
-    initialize env <|\config ->
+    initialize env <| \config ->
     Init.await FileSystem.initialize <| \fsPermission ->
         await "Get secure context for Crypto functions" Crypto.getSecureContext
             (\secureContext ->
