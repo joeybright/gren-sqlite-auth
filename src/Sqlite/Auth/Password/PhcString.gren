@@ -276,7 +276,7 @@ follows) or end of input (id-only string).
 -}
 parseId : PhcParser (Step LoopState PhcString)
 parseId =
-    Parser.getChompedString (Parser.chompUntilEndOr "$")
+    Parser.getChompedString (Parser.chompWhile (\c -> c /= '$'))
         |> Parser.andThen
             (\id ->
                 Parser.oneOf
