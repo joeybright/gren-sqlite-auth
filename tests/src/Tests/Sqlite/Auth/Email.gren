@@ -79,6 +79,7 @@ tests fsPermission secureContext =
                                 , userLookupTests database secureContext suffix
                                 , newDuplicateTests database secureContext suffix
                                 , changeRenameTests database secureContext suffix
+                                , changeMultipleTests database secureContext suffix
                                 , changeScopingTests database secureContext suffix
                                 , changeTakenTests database secureContext suffix
                                 , changeWithoutEmailTests database secureContext suffix
@@ -219,7 +220,7 @@ changeRenameTests database secureContext suffix =
                                 (\_ ->
                                     await
                                         "Rename with the owner's proof"
-                                        (Email.change database { newEmail = to } (Internal.Verified { userId = User.id user }))
+                                        (Email.change database { from = from, newEmail = to } (Internal.Verified { userId = User.id user }))
                                         (\_ ->
                                             await
                                                 "Look up the old email after renaming"
@@ -267,7 +268,7 @@ changeScopingTests database secureContext suffix =
                                         (\_ ->
                                             await
                                                 "Rename with a mismatched proof"
-                                                (Email.change database { newEmail = to } (Internal.Verified { userId = User.id userB }))
+                                                (Email.change database { from = from, newEmail = to } (Internal.Verified { userId = User.id userB }))
                                                 (\_ ->
                                                     await
                                                         "Look up the original email after the mismatched rename"
@@ -284,6 +285,65 @@ changeScopingTests database secureContext suffix =
                                                                             (\_ -> Expect.equal Nothing (Maybe.map (\row -> User.id row.user) maybeTo))
                                                                         ]
                                                                 )
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
+{-| A user can hold several addresses, and a change scoped by `from` renames
+only that one, leaving the others intact.
+-}
+changeMultipleTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeMultipleTests database secureContext suffix =
+    normalizeEmail ("multi-a-" ++ suffix ++ "@example.com")
+        (\one ->
+            normalizeEmail ("multi-b-" ++ suffix ++ "@example.com")
+                (\two ->
+                    normalizeEmail ("multi-c-" ++ suffix ++ "@example.com")
+                        (\three ->
+                            await
+                                "Create a user (multiple)"
+                                (User.new database secureContext)
+                                (\user ->
+                                    await
+                                        "Insert the first email"
+                                        (Email.new database { email = one } user)
+                                        (\_ ->
+                                            await
+                                                "Insert the second email"
+                                                (Email.new database { email = two } user)
+                                                (\_ ->
+                                                    await
+                                                        "Rename the second email"
+                                                        (Email.change database { from = two, newEmail = three } (Internal.Verified { userId = User.id user }))
+                                                        (\_ ->
+                                                            concat
+                                                                [ await
+                                                                    "Look up the first email after the rename"
+                                                                    (Email.user database { email = one })
+                                                                    (\maybeOne ->
+                                                                        test "the first email is untouched"
+                                                                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map (\row -> User.id row.user) maybeOne))
+                                                                    )
+                                                                , await
+                                                                    "Look up the renamed-from email"
+                                                                    (Email.user database { email = two })
+                                                                    (\maybeTwo ->
+                                                                        test "the renamed-from email no longer resolves"
+                                                                            (\_ -> Expect.equal Nothing (Maybe.map (\row -> User.id row.user) maybeTwo))
+                                                                    )
+                                                                , await
+                                                                    "Look up the new email"
+                                                                    (Email.user database { email = three })
+                                                                    (\maybeThree ->
+                                                                        test "the new email resolves to the user"
+                                                                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map (\row -> User.id row.user) maybeThree))
+                                                                    )
+                                                                ]
                                                         )
                                                 )
                                         )
@@ -315,7 +375,7 @@ changeTakenTests database secureContext suffix =
                                         (\_ ->
                                             awaitError
                                                 "Rename the second email to the first"
-                                                (Email.change database { newEmail = one } (Internal.Verified { userId = User.id user }))
+                                                (Email.change database { from = two, newEmail = one } (Internal.Verified { userId = User.id user }))
                                                 (\_ ->
                                                     test "renaming to a taken email fails on the primary key"
                                                         (\_ -> Expect.pass)
@@ -332,22 +392,25 @@ succeeds, and the target address is not created. Surprising, so pinned here.
 -}
 changeWithoutEmailTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
 changeWithoutEmailTests database secureContext suffix =
-    normalizeEmail ("orphan-" ++ suffix ++ "@example.com")
-        (\target ->
-            await
-                "Create a user with no email (no-op)"
-                (User.new database secureContext)
-                (\user ->
+    normalizeEmail ("orphan-from-" ++ suffix ++ "@example.com")
+        (\from ->
+            normalizeEmail ("orphan-to-" ++ suffix ++ "@example.com")
+                (\target ->
                     await
-                        "Rename the user who has no email row"
-                        (Email.change database { newEmail = target } (Internal.Verified { userId = User.id user }))
-                        (\_ ->
+                        "Create a user with no email (no-op)"
+                        (User.new database secureContext)
+                        (\user ->
                             await
-                                "Look up the target email after the no-op rename"
-                                (Email.user database { email = target })
-                                (\maybeOwner ->
-                                    test "renaming without an email row creates nothing"
-                                        (\_ -> Expect.equal Nothing (Maybe.map (\row -> User.id row.user) maybeOwner))
+                                "Rename the user who has no email row"
+                                (Email.change database { from = from, newEmail = target } (Internal.Verified { userId = User.id user }))
+                                (\_ ->
+                                    await
+                                        "Look up the target email after the no-op rename"
+                                        (Email.user database { email = target })
+                                        (\maybeOwner ->
+                                            test "renaming without an email row creates nothing"
+                                                (\_ -> Expect.equal Nothing (Maybe.map (\row -> User.id row.user) maybeOwner))
+                                        )
                                 )
                         )
                 )
@@ -551,7 +614,7 @@ changeInvalidatesVerificationTests database secureContext suffix =
                                         (\{ token } ->
                                             await
                                                 "Change the email"
-                                                (Email.change database { newEmail = to } (Internal.Verified { userId = User.id user }))
+                                                (Email.change database { from = from, newEmail = to } (Internal.Verified { userId = User.id user }))
                                                 (\_ ->
                                                     concat
                                                         [ awaitError

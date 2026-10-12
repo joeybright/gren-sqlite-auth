@@ -72,6 +72,7 @@ tests fsPermission secureContext =
                                 , userLookupTests database secureContext suffix
                                 , newDuplicateTests database secureContext suffix
                                 , changeRenameTests database secureContext suffix
+                                , changeMultipleTests database secureContext suffix
                                 , changeScopingTests database secureContext suffix
                                 , changeTakenTests database secureContext suffix
                                 , changeWithoutUsernameTests database secureContext suffix
@@ -208,7 +209,7 @@ changeRenameTests database secureContext suffix =
                                 (\_ ->
                                     await
                                         "Rename with the owner's proof"
-                                        (Username.change database { newUsername = to } (Internal.Verified { userId = User.id user }))
+                                        (Username.change database { from = from, newUsername = to } (Internal.Verified { userId = User.id user }))
                                         (\_ ->
                                             await
                                                 "Look up the old username after renaming"
@@ -256,7 +257,7 @@ changeScopingTests database secureContext suffix =
                                         (\_ ->
                                             await
                                                 "Rename with a mismatched proof"
-                                                (Username.change database { newUsername = to } (Internal.Verified { userId = User.id userB }))
+                                                (Username.change database { from = from, newUsername = to } (Internal.Verified { userId = User.id userB }))
                                                 (\_ ->
                                                     await
                                                         "Look up the original username after the mismatched rename"
@@ -282,27 +283,89 @@ changeScopingTests database secureContext suffix =
         )
 
 
+{-| A user can hold several usernames, and a change scoped by `from` renames
+only that one, leaving the others intact.
+-}
+changeMultipleTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
+changeMultipleTests database secureContext suffix =
+    normalizeUsername ("multi-a-" ++ suffix)
+        (\one ->
+            normalizeUsername ("multi-b-" ++ suffix)
+                (\two ->
+                    normalizeUsername ("multi-c-" ++ suffix)
+                        (\three ->
+                            await
+                                "Create a user (multiple)"
+                                (User.new database secureContext)
+                                (\user ->
+                                    await
+                                        "Insert the first username"
+                                        (Username.new database { username = one } user)
+                                        (\_ ->
+                                            await
+                                                "Insert the second username"
+                                                (Username.new database { username = two } user)
+                                                (\_ ->
+                                                    await
+                                                        "Rename the second username"
+                                                        (Username.change database { from = two, newUsername = three } (Internal.Verified { userId = User.id user }))
+                                                        (\_ ->
+                                                            concat
+                                                                [ await
+                                                                    "Look up the first username after the rename"
+                                                                    (Username.user database { username = one })
+                                                                    (\maybeOne ->
+                                                                        test "the first username is untouched"
+                                                                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeOne))
+                                                                    )
+                                                                , await
+                                                                    "Look up the renamed-from username"
+                                                                    (Username.user database { username = two })
+                                                                    (\maybeTwo ->
+                                                                        test "the renamed-from username no longer resolves"
+                                                                            (\_ -> Expect.equal Nothing (Maybe.map User.id maybeTwo))
+                                                                    )
+                                                                , await
+                                                                    "Look up the new username"
+                                                                    (Username.user database { username = three })
+                                                                    (\maybeThree ->
+                                                                        test "the new username resolves to the user"
+                                                                            (\_ -> Expect.equal (Just (User.id user)) (Maybe.map User.id maybeThree))
+                                                                    )
+                                                                ]
+                                                        )
+                                                )
+                                        )
+                                )
+                        )
+                )
+        )
+
+
 {-| Renaming a user who holds no username row is a silent no-op: the task
 succeeds, and the target name is not created. Surprising, so pinned here.
 -}
 changeWithoutUsernameTests : Sqlite.Database -> Crypto.SecureContext -> String -> Test.Runner.Effectful.Test
 changeWithoutUsernameTests database secureContext suffix =
-    normalizeUsername ("orphan-" ++ suffix)
-        (\target ->
-            await
-                "Create a user with no username (no-op)"
-                (User.new database secureContext)
-                (\user ->
+    normalizeUsername ("orphan-from-" ++ suffix)
+        (\from ->
+            normalizeUsername ("orphan-to-" ++ suffix)
+                (\target ->
                     await
-                        "Rename the user who has no username row"
-                        (Username.change database { newUsername = target } (Internal.Verified { userId = User.id user }))
-                        (\_ ->
+                        "Create a user with no username (no-op)"
+                        (User.new database secureContext)
+                        (\user ->
                             await
-                                "Look up the target username after the no-op rename"
-                                (Username.user database { username = target })
-                                (\maybeOwner ->
-                                    test "renaming without a username row creates nothing"
-                                        (\_ -> Expect.equal Nothing (Maybe.map User.id maybeOwner))
+                                "Rename the user who has no username row"
+                                (Username.change database { from = from, newUsername = target } (Internal.Verified { userId = User.id user }))
+                                (\_ ->
+                                    await
+                                        "Look up the target username after the no-op rename"
+                                        (Username.user database { username = target })
+                                        (\maybeOwner ->
+                                            test "renaming without a username row creates nothing"
+                                                (\_ -> Expect.equal Nothing (Maybe.map User.id maybeOwner))
+                                        )
                                 )
                         )
                 )
@@ -331,7 +394,7 @@ changeTakenTests database secureContext suffix =
                                         (\_ ->
                                             awaitError
                                                 "Rename the second username to the first"
-                                                (Username.change database { newUsername = one } (Internal.Verified { userId = User.id user }))
+                                                (Username.change database { from = two, newUsername = one } (Internal.Verified { userId = User.id user }))
                                                 (\_ ->
                                                     test "renaming to a taken username fails on the primary key"
                                                         (\_ -> Expect.pass)

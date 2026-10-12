@@ -184,16 +184,17 @@ new database { username } ((Internal.User { userId }) as userWitness) =
             )
 
 
-{-| Change a user's username. Which user's username changes depends on the
-given `Verified` type.
+{-| Change one of a user's usernames to a new one. `from` names the username
+being replaced and `newUsername` the replacement — a user may hold several
+usernames, so only the row matching both the user and `from` changes.
 
 A password check with
 [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) creates the
 `Verified` type, and so does verifying a live session through
 [`Sqlite.Auth.Session.verify`](Sqlite.Auth.Session#verify).
 -}
-change : Sqlite.Database -> { newUsername : Username Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
-change database { newUsername } ((Internal.Verified { userId }) as verified) =
+change : Sqlite.Database -> { from : Username Normalized, newUsername : Username Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
+change database { from, newUsername } ((Internal.Verified { userId }) as verified) =
     Utils.Time.nowMillis
         |> Task.andThen
             (\now ->
@@ -202,12 +203,13 @@ change database { newUsername } ((Internal.Verified { userId }) as verified) =
                         """
                         UPDATE usernames
                         SET username = :to, updated_at = :updated_at
-                        WHERE user_id = :user_id
+                        WHERE user_id = :user_id AND username = :from
                         """
                     , parameters =
                         [ Sqlite.Encode.Row.column "to" (Sqlite.Encode.string (toString newUsername))
                         , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
                         , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+                        , Sqlite.Encode.Row.column "from" (Sqlite.Encode.string (toString from))
                         ]
                     }
                     |> Task.map (\_ -> verified)

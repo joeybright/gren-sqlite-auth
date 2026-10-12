@@ -238,7 +238,7 @@ The `verified` field lets a live session authorize actions that require
     Session.verify database secureContext options { token = token }
         |> Task.andThen
             (\{ verified } ->
-                Username.change database { newUsername = new } verified
+                Username.change database { from = old, newUsername = new } verified
             )
 
 This functionality opens stolen tokens up to being able to complete any action that

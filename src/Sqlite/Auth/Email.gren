@@ -256,8 +256,9 @@ new database { email } ((Internal.User { userId }) as userWitness) =
             )
 
 
-{-| Change a user's email address. Which user's address changes depends on
-the given `Verified` type.
+{-| Change one of a user's email addresses to a new one. `from` names the
+address being replaced and `newEmail` the replacement — a user may hold several
+addresses, so only the row matching both the user and `from` changes.
 
 A password check with
 [`Sqlite.Auth.Password.validate`](Sqlite.Auth.Password#validate) creates the
@@ -270,8 +271,8 @@ link mailed to the old address must not be able to confirm the new one.
 All operations are completed in a SQLite transaction, preventing data
 corruption.
 -}
-change : Sqlite.Database -> { newEmail : Email Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
-change database { newEmail } ((Internal.Verified { userId }) as verified) =
+change : Sqlite.Database -> { from : Email Normalized, newEmail : Email Normalized } -> Internal.Verified -> Task Sqlite.Error Internal.Verified
+change database { from, newEmail } ((Internal.Verified { userId }) as verified) =
     Utils.Time.nowMillis
         |> Task.andThen
             (\now ->
@@ -284,12 +285,13 @@ change database { newEmail } ((Internal.Verified { userId }) as verified) =
                                         """
                                         UPDATE emails
                                         SET email = :to, verified_at = NULL, updated_at = :updated_at
-                                        WHERE user_id = :user_id
+                                        WHERE user_id = :user_id AND email = :from
                                         """
                                     , parameters =
                                         [ Sqlite.Encode.Row.column "to" (Sqlite.Encode.string (toString newEmail))
                                         , Sqlite.Encode.Row.column "updated_at" (Sqlite.Encode.int now)
                                         , Sqlite.Encode.Row.column "user_id" (Sqlite.Encode.string userId)
+                                        , Sqlite.Encode.Row.column "from" (Sqlite.Encode.string (toString from))
                                         ]
                                     }
                             )
