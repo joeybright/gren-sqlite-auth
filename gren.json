@@ -4,7 +4,7 @@
     "name": "joeybright/gren-sqlite-auth",
     "summary": "Simple authentication primitives for SQLite-backed Gren apps.",
     "license": "BSD-3-Clause",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "exposed-modules": [
         "Sqlite.Auth.User",
         "Sqlite.Auth.Username",

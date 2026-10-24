@@ -1,8 +1,10 @@
 # Changelog
 
-## 1.0.0
+## 1.0.1
 
-### Added
+- No changes
+
+## 1.0.0
 
 - Initial release of `Sqlite.Auth`: username and password authentication for
   SQLite-backed Gren apps.
